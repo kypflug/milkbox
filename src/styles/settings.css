@@ -32,6 +32,8 @@
 .settings-body {
   flex: 1;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline) transparent;
   padding: 4px 20px 32px;
   display: flex;
   flex-direction: column;

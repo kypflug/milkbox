@@ -39,76 +39,79 @@
   }
 
   .scene {
+    width: 100%;
+    height: 100%;
     display: flex;
     align-items: center;
-    gap: 72px;
+    justify-content: space-between;
+    padding: 0 96px;
   }
 
   /* Left: wordmark lockup */
   .lockup { text-align: left; }
   .lockup svg { color: var(--accent); }
   .lockup h1 {
-    font-size: 64px;
+    font-size: 92px;
     font-weight: 700;
-    letter-spacing: -0.02em;
-    margin-top: 18px;
+    letter-spacing: -0.025em;
+    margin-top: 22px;
   }
   .lockup p {
-    font-size: 22px;
-    line-height: 1.45;
+    font-size: 30px;
+    line-height: 1.42;
     color: var(--ink-2);
-    margin-top: 10px;
-    max-width: 17ch;
+    margin-top: 14px;
+    max-width: 18ch;
   }
   .lockup .stamp {
     display: inline-block;
-    margin-top: 22px;
+    margin-top: 30px;
     font-family: 'Commit Mono', monospace;
-    font-size: 13px;
+    font-size: 15px;
     letter-spacing: 0.14em;
     color: var(--ink-3);
   }
 
   /* Right: a miniature feed on the sheet */
   .phone {
-    width: 380px;
+    width: 460px;
     background: var(--surface);
     border: 1px solid var(--hairline);
-    border-radius: 18px;
-    padding: 22px 20px 18px;
+    border-radius: 20px;
+    padding: 26px 24px 22px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 14px;
   }
   .day {
     align-self: center;
     font-family: 'Commit Mono', monospace;
-    font-size: 12px;
+    font-size: 13.5px;
     letter-spacing: 0.14em;
     color: var(--ink-3);
     padding-bottom: 2px;
   }
   .bubble {
     align-self: flex-end;
-    max-width: 86%;
+    max-width: 88%;
     background: var(--surface-sunk);
     border: 1px solid var(--hairline);
-    border-radius: 12px;
-    border-bottom-right-radius: 5px;
-    padding: 11px 14px 9px;
+    border-radius: 14px;
+    border-bottom-right-radius: 6px;
+    padding: 13px 17px 11px;
   }
-  .bubble .t { font-size: 16.5px; line-height: 1.45; }
+  .bubble .t { font-size: 19.5px; line-height: 1.45; }
   .bubble .m {
     font-family: 'Commit Mono', monospace;
-    font-size: 10.5px;
+    font-size: 12px;
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--ink-3);
-    margin-top: 7px;
+    margin-top: 8px;
   }
   .bubble.image .pic {
-    width: 268px;
-    height: 150px;
+    width: 320px;
+    height: 178px;
     border-radius: 8px;
     background: linear-gradient(135deg, var(--accent) 0%, var(--accent-soft) 240%);
     display: grid;
@@ -116,46 +119,46 @@
     color: var(--on-accent);
     opacity: 0.92;
   }
-  .bubble.link .row { display: flex; align-items: center; gap: 11px; }
+  .bubble.link .row { display: flex; align-items: center; gap: 13px; }
   .bubble.link .fav {
-    width: 30px; height: 30px; border-radius: 7px;
+    width: 36px; height: 36px; border-radius: 8px;
     background: var(--accent-soft); color: var(--accent);
     display: grid; place-items: center;
   }
-  .bubble.link .title { font-size: 15.5px; font-weight: 600; color: var(--accent); }
+  .bubble.link .title { font-size: 18px; font-weight: 600; color: var(--accent); }
   .bubble.link .dom {
     font-family: 'Commit Mono', monospace;
-    font-size: 11.5px; color: var(--ink-3); margin-top: 3px;
+    font-size: 13px; color: var(--ink-3); margin-top: 3px;
   }
   .composer {
     display: flex;
     align-items: center;
-    gap: 9px;
+    gap: 10px;
     border: 1px solid var(--hairline);
-    border-radius: 11px;
-    padding: 9px 9px 9px 14px;
+    border-radius: 12px;
+    padding: 11px 11px 11px 16px;
     margin-top: 6px;
     color: var(--ink-3);
-    font-size: 15px;
+    font-size: 17px;
   }
   .composer .send {
     margin-left: auto;
-    width: 32px; height: 32px;
-    border-radius: 8px;
+    width: 36px; height: 36px;
+    border-radius: 9px;
     background: var(--accent);
     color: var(--on-accent);
     display: grid;
     place-items: center;
   }
 
-  /* OG variant: tighter frame, bigger lockup */
-  body[data-size='og'] .scene { gap: 60px; transform: scale(1.02); }
+  /* OG variant (1200x630): shallower frame — pull the gutters in a touch */
+  body[data-size='og'] .scene { padding: 0 84px; }
 </style>
 </head>
 <body>
   <div class="scene">
     <div class="lockup">
-      <svg viewBox="0 0 24 24" width="72" height="72" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M9.5 3v3l-2 3.5V19a2 2 0 0 0 2 2h5a2 2 0 0 0 2-2V9.5l-2-3.5V3"/><path d="M7.5 13h9"/></svg>
+      <svg viewBox="0 0 24 24" width="88" height="88" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M9.5 3v3l-2 3.5V19a2 2 0 0 0 2 2h5a2 2 0 0 0 2-2V9.5l-2-3.5V3"/><path d="M7.5 13h9"/></svg>
       <h1>Milkbox</h1>
       <p>A chat with yourself. Drop it once; it lands everywhere.</p>
       <span class="stamp">BACKED BY YOUR ONEDRIVE</span>

@@ -50,7 +50,8 @@
 :root {
   color-scheme: light;
 
-  /* ── surfaces: ground → surface → hairline ── */
+  /* ── surfaces: desk → ground → surface → hairline ── */
+  --desk:         #ded9cf;  /* the porch behind the pane (tall viewports) */
   --ground:       #e8e4dd;  /* warm putty stoop */
   --surface:      #faf8f4;  /* the milk-white sheet */
   --surface-sunk: #efece5;  /* composer well, chips, sunk fields */
@@ -106,6 +107,7 @@
 :root[data-theme='dark'] {
   color-scheme: dark;
 
+  --desk:         #0d0c11;
   --ground:       #131218;
   --surface:      #1c1b23;
   --surface-sunk: #24222e;
@@ -149,7 +151,31 @@ body {
   overscroll-behavior-y: none;
 }
 
-#app { height: 100%; }
+#app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/*
+ * Tall, wide viewports: the app becomes a floating pane on the desk rather
+ * than a full-height sheet — a milkbox sitting on the porch, not wallpaper.
+ * The pane keeps --ground inside; the page behind steps down to --desk.
+ */
+@media (min-height: 900px) and (min-width: 768px) {
+  body { background: var(--desk); }
+  .feed-screen,
+  .settings-screen {
+    height: min(800px, calc(100dvh - 96px));
+    width: min(720px, calc(100vw - 48px));
+    margin: auto;
+    background: var(--ground);
+    border: 1px solid var(--hairline);
+    border-radius: 14px;
+    box-shadow: var(--shadow-sheet), var(--card-highlight);
+    overflow: hidden;
+  }
+}
 
 a { color: var(--accent); }
 a:hover { color: var(--accent-hover); }

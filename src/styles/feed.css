@@ -75,12 +75,23 @@
 
 .feed-scroll {
   flex: 1;
+  display: flex;
+  flex-direction: column;
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0 20px;
+  /* Quiet scrollbar: no track paint, hairline thumb, only when needed. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline) transparent;
+}
+.feed-scroll::-webkit-scrollbar { width: 8px; }
+.feed-scroll::-webkit-scrollbar-track { background: transparent; }
+.feed-scroll::-webkit-scrollbar-thumb {
+  background: var(--hairline);
+  border-radius: 4px;
 }
 
-.feed-sentinel { height: 1px; }
+.feed-sentinel { height: 1px; flex: none; }
 
 .feed-list {
   display: flex;
@@ -88,15 +99,16 @@
   align-items: flex-end;   /* self-chat: your own drops hang right */
   gap: 8px;
   padding: 12px 0 20px;
-  min-height: 100%;
-  justify-content: flex-end;
+  /* Pin the conversation to the bottom without forcing overflow —
+   * min-height: 100% here kept a scrollbar alive on empty feeds. */
+  margin-top: auto;
 }
+.feed-list:has(.feed-empty) { margin: auto 0; }
 
 /* ── empty state ── */
 
 .feed-empty {
   align-self: center;
-  margin: auto;
   text-align: center;
   max-width: 40ch;
   padding: 48px 0;
