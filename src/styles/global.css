@@ -131,6 +131,10 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/* The hidden attribute must win over any display rule (e.g. the drag
+ * overlay's grid, the chip row's flex). */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
