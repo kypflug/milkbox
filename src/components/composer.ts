@@ -171,5 +171,7 @@ export function mountComposer(
 }
 
 function isTouchDevice(): boolean {
-  return matchMedia('(pointer: coarse)').matches;
+  // Coarse pointer alone misfires on touch-screen laptops; requiring
+  // hover:none limits newline-Enter to true touch-first devices.
+  return matchMedia('(hover: none) and (pointer: coarse)').matches;
 }
