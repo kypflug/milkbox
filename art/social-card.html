@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Milkbox social card</title>
+<style>
+  /* Milk run tokens, inlined so this renders standalone (file:// or served). */
+  @font-face {
+    font-family: 'Schibsted Grotesk';
+    src: url('../public/fonts/schibsted-grotesk-latin-wght-normal.woff2') format('woff2');
+    font-weight: 400 900;
+  }
+  @font-face {
+    font-family: 'Commit Mono';
+    src: url('../public/fonts/commit-mono-latin-400-normal.woff2') format('woff2');
+    font-weight: 400;
+  }
+
+  :root {
+    --ground: #e8e4dd; --surface: #faf8f4; --surface-sunk: #efece5;
+    --hairline: #d8d3c9; --ink: #211f2b; --ink-2: #4d4a5a; --ink-3: #67637a;
+    --accent: #4c4577; --accent-soft: #e6e2f0; --on-accent: #faf8f4;
+  }
+  [data-theme='dark'] {
+    --ground: #131218; --surface: #1c1b23; --surface-sunk: #24222e;
+    --hairline: #322f3e; --ink: #e8e6ee; --ink-2: #b3b0c0; --ink-3: #918da3;
+    --accent: #aca4dd; --accent-soft: #2c2940; --on-accent: #16151c;
+  }
+
+  * { margin: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; }
+  body {
+    background: var(--ground);
+    font-family: 'Schibsted Grotesk', sans-serif;
+    color: var(--ink);
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+  }
+
+  .scene {
+    display: flex;
+    align-items: center;
+    gap: 72px;
+  }
+
+  /* Left: wordmark lockup */
+  .lockup { text-align: left; }
+  .lockup svg { color: var(--accent); }
+  .lockup h1 {
+    font-size: 64px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-top: 18px;
+  }
+  .lockup p {
+    font-size: 22px;
+    line-height: 1.45;
+    color: var(--ink-2);
+    margin-top: 10px;
+    max-width: 17ch;
+  }
+  .lockup .stamp {
+    display: inline-block;
+    margin-top: 22px;
+    font-family: 'Commit Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 0.14em;
+    color: var(--ink-3);
+  }
+
+  /* Right: a miniature feed on the sheet */
+  .phone {
+    width: 380px;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 18px;
+    padding: 22px 20px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .day {
+    align-self: center;
+    font-family: 'Commit Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    color: var(--ink-3);
+    padding-bottom: 2px;
+  }
+  .bubble {
+    align-self: flex-end;
+    max-width: 86%;
+    background: var(--surface-sunk);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    border-bottom-right-radius: 5px;
+    padding: 11px 14px 9px;
+  }
+  .bubble .t { font-size: 16.5px; line-height: 1.45; }
+  .bubble .m {
+    font-family: 'Commit Mono', monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-top: 7px;
+  }
+  .bubble.image .pic {
+    width: 268px;
+    height: 150px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-soft) 240%);
+    display: grid;
+    place-items: center;
+    color: var(--on-accent);
+    opacity: 0.92;
+  }
+  .bubble.link .row { display: flex; align-items: center; gap: 11px; }
+  .bubble.link .fav {
+    width: 30px; height: 30px; border-radius: 7px;
+    background: var(--accent-soft); color: var(--accent);
+    display: grid; place-items: center;
+  }
+  .bubble.link .title { font-size: 15.5px; font-weight: 600; color: var(--accent); }
+  .bubble.link .dom {
+    font-family: 'Commit Mono', monospace;
+    font-size: 11.5px; color: var(--ink-3); margin-top: 3px;
+  }
+  .composer {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    border: 1px solid var(--hairline);
+    border-radius: 11px;
+    padding: 9px 9px 9px 14px;
+    margin-top: 6px;
+    color: var(--ink-3);
+    font-size: 15px;
+  }
+  .composer .send {
+    margin-left: auto;
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--on-accent);
+    display: grid;
+    place-items: center;
+  }
+
+  /* OG variant: tighter frame, bigger lockup */
+  body[data-size='og'] .scene { gap: 60px; transform: scale(1.02); }
+</style>
+</head>
+<body>
+  <div class="scene">
+    <div class="lockup">
+      <svg viewBox="0 0 24 24" width="72" height="72" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M9.5 3v3l-2 3.5V19a2 2 0 0 0 2 2h5a2 2 0 0 0 2-2V9.5l-2-3.5V3"/><path d="M7.5 13h9"/></svg>
+      <h1>Milkbox</h1>
+      <p>A chat with yourself. Drop it once; it lands everywhere.</p>
+      <span class="stamp">BACKED BY YOUR ONEDRIVE</span>
+    </div>
+    <div class="phone">
+      <div class="day">TODAY</div>
+      <div class="bubble">
+        <div class="t">Pick up the duvet cover before Thursday</div>
+        <div class="m">09:41 · PHONE</div>
+      </div>
+      <div class="bubble image">
+        <div class="pic">
+          <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m5 17 4.5-4.5 3 3L16 12l3 3"/></svg>
+        </div>
+        <div class="m">12:07 · LAPTOP</div>
+      </div>
+      <div class="bubble link">
+        <div class="row">
+          <div class="fav">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a4 4 0 0 0 6 0l3-3a4 4 0 0 0-6-6l-1.5 1.5"/><path d="M14 10a4 4 0 0 0-6 0l-3 3a4 4 0 0 0 6 6l1.5-1.5"/></svg>
+          </div>
+          <div>
+            <div class="title">That recipe you wanted</div>
+            <div class="dom">seriouseats.com</div>
+          </div>
+        </div>
+        <div class="m">18:22 · WORK PC</div>
+      </div>
+      <div class="composer">
+        Drop something…
+        <div class="send">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12 20 4l-4 16-5.2-5.2L4 12Z"/><path d="M10.8 14.8 20 4"/></svg>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const q = new URLSearchParams(location.search);
+    if (q.get('theme') === 'dark') document.documentElement.dataset.theme = 'dark';
+    if (q.get('size') === 'og') document.body.dataset.size = 'og';
+  </script>
+</body>
+</html>
