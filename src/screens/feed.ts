@@ -101,28 +101,48 @@ export async function renderFeed(app: HTMLElement): Promise<void> {
     if (stick) scrollToBottom();
   }
 
-  /** Load thumbnail bytes for image drops: memory → IDB → Graph. */
+  /**
+   * Load preview bytes for image drops: memory → IDB → Graph thumbnail →
+   * (fallback) the full image itself. Graph may not have generated a
+   * thumbnail yet for a fresh upload, so a miss schedules one retry rather
+   * than leaving the card blank forever.
+   */
+  const FULL_IMAGE_PREVIEW_LIMIT = 10 * 1024 * 1024;
+  const thumbRetried = new Set<string>();
+
   function hydrateImages(): void {
     listEl.querySelectorAll<HTMLImageElement>('img[data-thumb-id]').forEach(async img => {
       const id = img.dataset.thumbId!;
       const cached = thumbUrls.get(id);
       if (cached) {
         img.src = cached;
+        img.classList.add('loaded');
         return;
       }
       let blob = (await db.getThumb(id).catch(() => undefined))
         || (await db.getCachedBlob(id).catch(() => undefined));
       if (!blob) {
         const record = feed.find(r => r.meta.id === id);
-        const itemId = record?.meta.file?.itemId;
-        if (!itemId) return;
+        const file = record?.meta.file;
+        if (!file?.itemId) return;
         try {
-          const fetched = await fetchThumbnail(itemId);
+          const fetched = await fetchThumbnail(file.itemId);
           if (fetched) {
             blob = fetched;
             await db.putThumb(id, fetched).catch(() => {});
+          } else if (file.size <= FULL_IMAGE_PREVIEW_LIMIT) {
+            // No thumbnail (not generated yet, or unsupported format) —
+            // the image itself is small enough to be its own preview.
+            blob = await downloadDropFile(file.itemId);
+            await db.putCachedBlob(id, blob).catch(() => {});
           }
-        } catch { /* offline — placeholder stays */ }
+        } catch { /* offline or transient — retry below */ }
+        if (!blob && !thumbRetried.has(id)) {
+          thumbRetried.add(id);
+          setTimeout(() => {
+            if (listEl.isConnected) hydrateImages();
+          }, 4000);
+        }
       }
       if (blob) {
         const url = URL.createObjectURL(blob);
