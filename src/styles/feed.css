@@ -5,13 +5,14 @@
  * never a shadow.
  */
 
+/* Edge-to-edge by default; the floating-pane media query in global.css
+ * takes over sizing on tall viewports. */
 .feed-screen {
   height: 100%;
   height: 100dvh;
   display: flex;
   flex-direction: column;
-  max-width: 720px;
-  margin: 0 auto;
+  width: 100%;
 }
 
 /* ── header ── */
@@ -220,7 +221,8 @@
 
 .drop-image {
   display: block;
-  width: min(380px, 78vw);
+  width: 100%;
+  max-width: 380px;
   max-height: 420px;
   overflow: hidden;
   border-radius: var(--radius-thumb);
