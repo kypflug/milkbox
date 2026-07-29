@@ -1,0 +1,60 @@
+/*
+ * Sign-in — the doorstep. One sheet centered on the stoop; this is the one
+ * place the reserved sheet shadow appears (dark mode swaps it for the
+ * inset highlight, per family law).
+ */
+
+.sign-in-screen {
+  height: 100%;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.sign-in-sheet {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 10px;
+  max-width: 380px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-sheet), var(--card-highlight);
+  padding: 44px 36px 32px;
+}
+
+.sign-in-glyph { color: var(--accent); }
+
+.sign-in-title {
+  font: var(--type-title);
+  letter-spacing: -0.015em;
+  margin: 0;
+}
+
+.sign-in-dek {
+  font: var(--type-body);
+  color: var(--ink-2);
+  margin: 0 0 12px;
+}
+
+.sign-in-button {
+  background: var(--accent);
+  color: var(--on-accent);
+  padding: 11px 22px;
+  border-radius: var(--radius-input);
+  transition: background var(--ease);
+}
+.sign-in-button:hover { background: var(--accent-hover); }
+
+.sign-in-fine {
+  font: var(--type-mono-sm);
+  line-height: 1.6;
+  color: var(--ink-3);
+  margin: 14px 0 0;
+  max-width: 34ch;
+}

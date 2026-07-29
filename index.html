@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#faf8f4">
+  <meta name="description" content="A chat with yourself. Drop text, links, and files; they land on every device.">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <link rel="preload" href="/fonts/schibsted-grotesk-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/commit-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <title>Milkbox</title>
+  <script>
+    // Pre-CSS theme stamp so dark launches don't flash paper (badgy convention).
+    (function () {
+      try {
+        var t = localStorage.getItem('milkbox:theme') || 'system';
+        var resolved = t === 'system'
+          ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+          : t;
+        document.documentElement.setAttribute('data-theme', resolved);
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta && resolved === 'dark') meta.setAttribute('content', '#1c1b23');
+      } catch (e) { /* storage unavailable — default to light */ }
+    })();
+  </script>
+  <link rel="stylesheet" href="/src/styles/global.css">
+</head>
+<body>
+  <div id="app">
+    <div class="boot-loading">
+      <div class="boot-titlebar" aria-hidden="true"></div>
+      <div class="boot-loading-content"><div class="spinner" role="status" aria-label="Loading"></div></div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

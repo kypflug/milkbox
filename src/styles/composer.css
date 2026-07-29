@@ -1,0 +1,125 @@
+/*
+ * Composer — a sunk well at the foot of the feed, like the slot in the
+ * milkbox door. The send button is the only filled-accent element on the
+ * screen; everything else earns attention with hairlines.
+ */
+
+.composer-mount {
+  flex: none;
+  padding: 8px 20px calc(14px + env(safe-area-inset-bottom, 0px));
+  background: var(--ground);
+}
+
+.composer {
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-input);
+  box-shadow: var(--card-highlight);
+  padding: 8px;
+}
+
+.composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.composer-input {
+  flex: 1;
+  font: var(--type-composer);
+  color: var(--ink);
+  background: none;
+  border: none;
+  resize: none;
+  padding: 7px 4px;
+  max-height: 192px;
+  outline: none;
+}
+.composer-input::placeholder { color: var(--ink-3); }
+
+.composer-attach {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-chip);
+  color: var(--ink-3);
+  transition: color var(--ease), background var(--ease);
+}
+.composer-attach:hover { color: var(--ink); background: var(--surface-sunk); }
+
+.composer-send {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-chip);
+  background: var(--accent);
+  color: var(--on-accent);
+  transition: background var(--ease);
+}
+.composer-send:hover { background: var(--accent-hover); }
+
+/* ── attachment chips ── */
+
+.composer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 4px 8px;
+}
+
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  background: var(--surface-sunk);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-chip);
+  padding: 5px 6px 5px 8px;
+  font: var(--type-label);
+}
+.composer-chip-glyph { color: var(--ink-3); display: inline-flex; }
+.composer-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 24ch;
+}
+.composer-chip-size {
+  font: var(--type-mono-sm);
+  color: var(--ink-3);
+}
+.composer-chip-remove {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  color: var(--ink-3);
+}
+.composer-chip-remove:hover { color: var(--danger); background: var(--danger-soft); }
+
+/* ── drag overlay ── */
+
+.drag-overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--ground) 65%, transparent);
+  backdrop-filter: blur(2px);
+  z-index: 50;
+  pointer-events: none;
+}
+.drag-overlay-card {
+  font: var(--type-title);
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius-card);
+  padding: 32px 48px;
+}

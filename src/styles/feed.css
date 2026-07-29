@@ -1,0 +1,368 @@
+/*
+ * Feed screen — the conversation with yourself. The whole screen is one
+ * column: header, scrolling feed, pinned composer. Cards sit on --surface
+ * over the --ground stoop; separation is the value step plus a hairline,
+ * never a shadow.
+ */
+
+.feed-screen {
+  height: 100%;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+/* ── header ── */
+
+.feed-header {
+  flex: none;
+  background: var(--ground);
+}
+
+/* Draggable strip for window-controls-overlay installs. */
+.feed-titlebar {
+  height: env(titlebar-area-height, 0px);
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.feed-header-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px 10px;
+}
+
+.feed-wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font: var(--type-wordmark);
+  letter-spacing: -0.01em;
+}
+.feed-wordmark svg { color: var(--accent); }
+
+.sync-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.45;
+  transition: opacity var(--ease);
+}
+.sync-dot.syncing {
+  opacity: 1;
+  animation: sync-pulse 900ms ease-in-out infinite;
+}
+.sync-dot.error { background: var(--danger); opacity: 1; }
+@keyframes sync-pulse {
+  50% { opacity: 0.35; }
+}
+
+.feed-settings {
+  margin-left: auto;
+  display: inline-flex;
+  padding: 6px;
+  color: var(--ink-3);
+  border-radius: var(--radius-chip);
+  transition: color var(--ease);
+}
+.feed-settings:hover { color: var(--ink); }
+
+/* ── scroll area ── */
+
+.feed-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 20px;
+}
+
+.feed-sentinel { height: 1px; }
+
+.feed-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;   /* self-chat: your own drops hang right */
+  gap: 8px;
+  padding: 12px 0 20px;
+  min-height: 100%;
+  justify-content: flex-end;
+}
+
+/* ── empty state ── */
+
+.feed-empty {
+  align-self: center;
+  margin: auto;
+  text-align: center;
+  max-width: 40ch;
+  padding: 48px 0;
+  color: var(--ink-2);
+}
+.feed-empty-glyph { color: var(--ink-3); margin-bottom: 14px; }
+.feed-empty-title { font: var(--type-link-title); color: var(--ink); margin: 0 0 6px; }
+.feed-empty-dek { font: var(--type-body); margin: 0; }
+
+/* ── day dividers ── */
+
+.day-divider {
+  align-self: center;
+  padding: 14px 0 6px;
+}
+.day-divider-chip {
+  font: var(--type-divider);
+  letter-spacing: var(--track-divider);
+  color: var(--ink-3);
+}
+
+/* ── drop cards ── */
+
+.drop-card {
+  position: relative;
+  max-width: min(560px, 92%);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-bubble);
+  border-bottom-right-radius: var(--radius-chip); /* the bubble points home */
+  box-shadow: var(--card-highlight);
+  padding: 10px 14px 8px;
+  transition: border-color var(--ease);
+}
+.drop-card:hover { border-color: var(--ink-3); }
+
+.drop-card--sending { opacity: 0.62; }
+.drop-card--failed { border-color: var(--danger); }
+
+.drop-text {
+  font: var(--type-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.drop-caption { margin-top: 6px; color: var(--ink-2); }
+
+.drop-meta {
+  font: var(--type-meta);
+  letter-spacing: var(--track-meta);
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-top: 7px;
+}
+.drop-card--failed .drop-meta { color: var(--danger); }
+
+/* ── link drops ── */
+
+.drop-link {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  text-decoration: none;
+  color: inherit;
+}
+.drop-link-favicon-frame {
+  position: relative;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  background: var(--surface-sunk);
+  border-radius: var(--radius-chip);
+  color: var(--ink-3);
+}
+.drop-link-favicon {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 18px;
+  height: 18px;
+  opacity: 0;
+  transition: opacity var(--ease);
+}
+.drop-link-favicon.loaded { opacity: 1; }
+
+.drop-link-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.drop-link-title {
+  font: var(--type-link-title);
+  color: var(--accent);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.drop-link:hover .drop-link-title { color: var(--accent-hover); }
+.drop-link-domain {
+  font: var(--type-mono-sm);
+  color: var(--ink-3);
+}
+
+/* ── image drops ── */
+
+.drop-image {
+  display: block;
+  width: min(380px, 78vw);
+  max-height: 420px;
+  overflow: hidden;
+  border-radius: var(--radius-thumb);
+  background: var(--surface-sunk);
+  padding: 0;
+  position: relative;
+}
+.drop-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity 220ms var(--ease-curve);
+}
+.drop-image img.loaded { opacity: 1; }
+
+.drop-image-progress {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  height: 3px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.drop-image-progress-fill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: var(--on-accent);
+  transition: width 300ms linear;
+}
+
+/* ── file drops ── */
+
+.drop-file {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  text-align: left;
+  color: inherit;
+  max-width: 100%;
+}
+.drop-file-glyph {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: var(--radius-chip);
+}
+.drop-file-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.drop-file-name {
+  font: var(--type-link-title);
+  overflow-wrap: anywhere;
+}
+.drop-file-size {
+  font: var(--type-mono-sm);
+  color: var(--ink-3);
+}
+
+/* ── actions row ── */
+
+.drop-actions {
+  position: absolute;
+  top: -13px;
+  right: 10px;
+  display: none;
+  gap: 2px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-chip);
+  padding: 2px;
+}
+.drop-card:hover .drop-actions,
+.drop-card:focus-within .drop-actions,
+.drop-card--failed .drop-actions {
+  display: inline-flex;
+}
+.drop-action {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  color: var(--ink-3);
+  transition: color var(--ease), background var(--ease);
+}
+.drop-action:hover { color: var(--ink); background: var(--surface-sunk); }
+.drop-action-danger:hover { color: var(--danger); background: var(--danger-soft); }
+
+/* Touch devices have no hover — keep actions visible on tap/focus instead. */
+@media (pointer: coarse) {
+  .drop-actions { top: auto; bottom: -13px; }
+}
+
+/* ── inline edit ── */
+
+.drop-edit { display: flex; flex-direction: column; gap: 8px; }
+.drop-edit-input {
+  font: var(--type-body);
+  color: var(--ink);
+  background: var(--surface-sunk);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-chip);
+  padding: 8px 10px;
+  min-height: 60px;
+  resize: vertical;
+}
+.drop-edit-row { display: flex; justify-content: flex-end; gap: 8px; }
+.drop-edit-cancel { color: var(--ink-2); padding: 6px 10px; }
+.drop-edit-save {
+  background: var(--accent);
+  color: var(--on-accent);
+  padding: 6px 14px;
+  border-radius: var(--radius-chip);
+}
+
+/* ── lightbox ── */
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(19, 18, 24, 0.88);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  z-index: 60;
+}
+.lightbox-img {
+  max-width: 100%;
+  max-height: calc(100% - 60px);
+  border-radius: var(--radius-thumb);
+}
+.lightbox-caption {
+  font: var(--type-mono-sm);
+  color: #b3b0c0;
+}
+.lightbox-close {
+  position: absolute;
+  top: calc(16px + env(titlebar-area-height, 0px));
+  right: 16px;
+  color: #e8e6ee;
+  padding: 8px;
+}

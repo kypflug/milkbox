@@ -1,0 +1,256 @@
+/*
+ * Milkbox — "Milk run" design tokens.
+ *
+ * The scene: a note tucked into the milkbox on a neighbor's stoop. The ground
+ * is warm putty — a poured-concrete step at dusk — and everything you drop
+ * lands on a milk-white sheet. Ink is violet-black, like an airmail stamp
+ * pressed too hard; the one accent is that same violet-slate, and it means
+ * "this goes somewhere." Metadata is set in a small tracked mono, the way a
+ * dairy stamped its bottle caps.
+ *
+ * Family law (shared with aldenblog and badgy): elevation is a hairline,
+ * never a shadow. Separation comes from the ground → surface value step plus
+ * a 1px hairline. Exactly one shadow exists — the sheet the whole app sits
+ * on — and dark mode replaces even that with an inset top highlight, because
+ * a drop shadow on a dark surface reads as a stain, not a lift.
+ *
+ * The dark palette is designed, not inverted: the stoop after the porch
+ * light goes off. Every ink step and the accent were checked against
+ * --surface and --surface-sunk for WCAG 4.5:1 (see the contrast notes
+ * inline where a value was nudged).
+ */
+
+@import './feed.css';
+@import './composer.css';
+@import './sign-in.css';
+@import './settings.css';
+
+@font-face {
+  font-family: 'Schibsted Grotesk';
+  src: url('/fonts/schibsted-grotesk-latin-wght-normal.woff2') format('woff2');
+  font-weight: 400 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Commit Mono';
+  src: url('/fonts/commit-mono-latin-400-normal.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Commit Mono';
+  src: url('/fonts/commit-mono-latin-500-normal.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light;
+
+  /* ── surfaces: ground → surface → hairline ── */
+  --ground:       #e8e4dd;  /* warm putty stoop */
+  --surface:      #faf8f4;  /* the milk-white sheet */
+  --surface-sunk: #efece5;  /* composer well, chips, sunk fields */
+  --hairline:     #d8d3c9;
+
+  /* ── ink ramp, three steps ── */
+  --ink:          #211f2b;  /* violet-black — 15.3:1 on --surface */
+  --ink-2:        #4d4a5a;  /* 8.1:1 */
+  --ink-3:        #67637a;  /* mono metadata — 5.4:1 on --surface, 4.9:1 on --surface-sunk */
+
+  /* ── accent: airmail violet-slate ── */
+  --accent:       #4c4577;  /* 8.2:1 on --surface */
+  --accent-hover: #3d3763;
+  --accent-soft:  #e6e2f0;  /* selection wash, drag-over tint */
+  --on-accent:    #faf8f4;
+  --danger:       #8c3f33;  /* failed sends, destructive — 6.3:1 */
+  --danger-soft:  #f2e3e0;
+
+  /* ── elevation ── */
+  --card-highlight: none;
+  --shadow-sheet: 0 18px 50px rgba(33, 31, 43, 0.14);  /* the one shadow */
+
+  /* ── type ── */
+  --font-ui:   'Schibsted Grotesk', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: 'Commit Mono', ui-monospace, Consolas, 'SF Mono', monospace;
+
+  --type-wordmark:   700 19px/1 var(--font-ui);
+  --type-title:      700 24px/1.2 var(--font-ui);
+  --type-body:       400 15.5px/1.55 var(--font-ui);
+  --type-link-title: 600 15px/1.35 var(--font-ui);
+  --type-composer:   400 15.5px/1.5 var(--font-ui);
+  --type-button:     600 14px/1 var(--font-ui);
+  --type-label:      600 13px/1.3 var(--font-ui);
+  --type-meta:       400 11px/1 var(--font-mono);   /* time · device */
+  --type-divider:    500 11.5px/1 var(--font-mono); /* day chips */
+  --type-mono-sm:    400 12px/1 var(--font-mono);   /* file sizes, domains */
+  --track-meta:    0.06em;
+  --track-divider: 0.14em;
+
+  /* ── radius — the milkbox door, not a pill ── */
+  --radius-card:   8px;
+  --radius-bubble: 10px;
+  --radius-input:  8px;
+  --radius-chip:   6px;
+  --radius-thumb:  6px;
+
+  /* ── motion ── */
+  --dur: 140ms;
+  --ease-curve: cubic-bezier(0.2, 0.7, 0.3, 1);
+  --ease: var(--dur) var(--ease-curve);
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --ground:       #131218;
+  --surface:      #1c1b23;
+  --surface-sunk: #24222e;
+  --hairline:     #322f3e;
+
+  --ink:          #e8e6ee;  /* 13.8:1 on --surface */
+  --ink-2:        #b3b0c0;  /* 8.0:1 */
+  --ink-3:        #918da3;  /* nudged up from #8d8a9d — 4.9:1 on --surface-sunk */
+
+  --accent:       #aca4dd;  /* 7.4:1 on --surface */
+  --accent-hover: #bfb8e8;
+  --accent-soft:  #2c2940;
+  --on-accent:    #16151c;
+  --danger:       #e0897c;  /* 6.0:1 */
+  --danger-soft:  #392527;
+
+  /* Never a drop shadow on a dark surface. */
+  --card-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --shadow-sheet: none;
+}
+
+/* ── reset & base ── */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font: var(--type-body);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior-y: none;
+}
+
+#app { height: 100%; }
+
+a { color: var(--accent); }
+a:hover { color: var(--accent-hover); }
+
+button {
+  font: var(--type-button);
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+::selection { background: var(--accent-soft); }
+
+/* ── boot screen ── */
+
+.boot-loading {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Placeholder drag strip so window-controls-overlay doesn't shift layout. */
+.boot-titlebar { height: env(titlebar-area-height, 0px); }
+
+.boot-loading-content {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.spinner {
+  width: 26px;
+  height: 26px;
+  border: 2px solid var(--hairline);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 700ms linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.boot-error-screen {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.boot-error-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+}
+.boot-error-title { font: var(--type-link-title); margin: 0; }
+.boot-error-details { font: var(--type-body); color: var(--ink-2); margin: 0; max-width: 42ch; }
+.boot-error-reload {
+  margin-top: 12px;
+  padding: 9px 18px;
+  background: var(--accent);
+  color: var(--on-accent);
+  border-radius: var(--radius-input);
+}
+
+/* ── toast ── */
+
+.toast {
+  position: fixed;
+  bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+  left: 50%;
+  translate: -50% 8px;
+  max-width: min(420px, calc(100vw - 40px));
+  padding: 10px 16px;
+  background: var(--surface);
+  color: var(--ink);
+  font: var(--type-label);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-card);
+  box-shadow: var(--card-highlight);
+  opacity: 0;
+  transition: opacity var(--ease), translate var(--ease);
+  z-index: 100;
+}
+.toast.visible { opacity: 1; translate: -50% 0; }
+.toast-error { border-color: var(--danger); color: var(--danger); }
+
+/* Toast with an inline undo button. */
+.toast-action {
+  margin-left: 12px;
+  color: var(--accent);
+  font: var(--type-button);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

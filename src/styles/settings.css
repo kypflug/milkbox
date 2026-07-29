@@ -1,0 +1,114 @@
+/*
+ * Settings — a short list of labeled sections on the sheet. Mono labels,
+ * hairline separations, one danger button.
+ */
+
+.settings-screen {
+  height: 100%;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+.settings-header {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  padding: 18px 20px 12px;
+}
+
+.settings-back {
+  font: var(--type-button);
+  text-decoration: none;
+}
+
+.settings-title {
+  font: var(--type-title);
+  margin: 0;
+}
+
+.settings-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 20px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-section {
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-card);
+  box-shadow: var(--card-highlight);
+  padding: 16px 18px 18px;
+  margin-top: 12px;
+}
+
+.settings-label {
+  font: var(--type-meta);
+  letter-spacing: var(--track-meta);
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 10px;
+}
+
+.settings-hint {
+  font: var(--type-label);
+  font-weight: 400;
+  color: var(--ink-2);
+  margin: 0 0 10px;
+}
+
+.settings-mono { font: var(--type-mono-sm); }
+
+.settings-account {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0 0 12px;
+}
+.settings-account-name { font: var(--type-link-title); }
+.settings-account-email { font: var(--type-mono-sm); color: var(--ink-3); }
+
+.settings-button {
+  padding: 8px 16px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-chip);
+  transition: border-color var(--ease), color var(--ease);
+}
+.settings-button-danger:hover { color: var(--danger); border-color: var(--danger); }
+
+.settings-input {
+  width: 100%;
+  max-width: 320px;
+  font: var(--type-body);
+  color: var(--ink);
+  background: var(--surface-sunk);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-chip);
+  padding: 8px 12px;
+}
+
+/* Segmented control: a 1px gap over a hairline background (badgy idiom). */
+.settings-segment {
+  display: inline-flex;
+  gap: 1px;
+  background: var(--hairline);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-chip);
+  overflow: hidden;
+}
+.settings-segment-option {
+  padding: 7px 16px;
+  background: var(--surface);
+  color: var(--ink-2);
+  transition: background var(--ease), color var(--ease);
+}
+.settings-segment-option:hover { color: var(--ink); }
+.settings-segment-option.selected {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
