@@ -191,17 +191,43 @@ body {
     -webkit-app-region: no-drag;
     app-region: no-drag;
   }
+  /* The overlay rect stops where the window controls begin, so centring
+   * inside it lands the wordmark off-window-centre — visibly left on Windows,
+   * right on macOS. Span the whole window instead and centre there. The rails
+   * reserve whichever side the controls occupy, so the wordmark still cannot
+   * slide under them on a narrow window, and the bottle keeps its corner
+   * because it is pinned to the rail's outer edge, not its full width. */
   .feed-header-row {
+    --wco-controls-inset: max(
+      env(titlebar-area-x, 0px),
+      calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw))
+    );
     position: fixed;
     top: env(titlebar-area-y, 0px);
-    left: env(titlebar-area-x, 0px);
-    width: env(titlebar-area-width, 100%);
+    left: 0;
+    width: 100%;
     height: var(--wco-title-strip-height);
     min-height: var(--wco-title-strip-height);
+    grid-template-columns:
+      minmax(var(--wco-controls-inset), 1fr)
+      auto
+      minmax(var(--wco-controls-inset), 1fr);
     padding: 0 20px;
     z-index: 40;
     -webkit-app-region: drag;
     app-region: drag;
+  }
+  /* app-region doesn't inherit, and selectable text swallows the gesture
+   * before a drag can start — grabbing the wordmark selects it instead of
+   * moving the window. Tag the strip's contents too and switch selection off.
+   * Neither changes how anything looks. Anything interactive added here must
+   * opt back out with no-drag, as the composer and flyout do below. */
+  .feed-header-row,
+  .feed-header-row * {
+    -webkit-app-region: drag;
+    app-region: drag;
+    -webkit-user-select: none;
+    user-select: none;
   }
   .composer-region,
   .settings-flyout {
