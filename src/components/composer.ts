@@ -6,7 +6,7 @@
  * with the text and files and lets the feed screen queue drops.
  */
 
-import { iconAttach, iconSend, iconClose, iconFile } from './icons';
+import { iconAttach, iconSend, iconClose, iconFile, iconRefresh } from './icons';
 import { escapeHtml } from '../utils/storage';
 import { formatBytes } from '../utils/format';
 
@@ -20,11 +20,13 @@ export interface ComposerApi {
 }
 
 const MAX_ATTACH_BYTES = 250 * 1024 * 1024;
+const MAX_INPUT_LINES = 3;
 
 export function mountComposer(
   container: HTMLElement,
   onSend: (text: string, files: File[]) => void,
   onOversize: (name: string) => void,
+  onRefresh: () => Promise<void>,
 ): ComposerApi {
   container.innerHTML = `
     <div class="composer">
@@ -32,6 +34,7 @@ export function mountComposer(
       <div class="composer-row">
         <button class="composer-attach" title="Attach files" aria-label="Attach files">${iconAttach('1.25em')}</button>
         <textarea class="composer-input" rows="1" placeholder="Drop something…" aria-label="Message"></textarea>
+        <button class="composer-refresh" title="Refresh" aria-label="Refresh">${iconRefresh('1.15em')}</button>
         <button class="composer-send" title="Send" aria-label="Send">${iconSend('1.2em')}</button>
       </div>
       <input type="file" class="composer-file-input" multiple hidden>
@@ -44,6 +47,7 @@ export function mountComposer(
   const chipsEl = container.querySelector<HTMLElement>('.composer-chips')!;
   const inputEl = container.querySelector<HTMLTextAreaElement>('.composer-input')!;
   const sendBtn = container.querySelector<HTMLButtonElement>('.composer-send')!;
+  const refreshBtn = container.querySelector<HTMLButtonElement>('.composer-refresh')!;
   const attachBtn = container.querySelector<HTMLButtonElement>('.composer-attach')!;
   const fileInput = container.querySelector<HTMLInputElement>('.composer-file-input')!;
   const dragOverlay = container.querySelector<HTMLElement>('.drag-overlay')!;
@@ -51,8 +55,16 @@ export function mountComposer(
   let pendingFiles: File[] = [];
 
   function autoGrow(): void {
+    const style = getComputedStyle(inputEl);
+    const maxHeight =
+      parseFloat(style.lineHeight) * MAX_INPUT_LINES +
+      parseFloat(style.paddingTop) +
+      parseFloat(style.paddingBottom);
     inputEl.style.height = 'auto';
-    inputEl.style.height = `${Math.min(inputEl.scrollHeight, 8 * 24)}px`;
+    inputEl.style.overflowY = 'hidden';
+    const height = Math.min(inputEl.scrollHeight, maxHeight);
+    inputEl.style.height = `${height}px`;
+    inputEl.style.overflowY = inputEl.scrollHeight > maxHeight ? 'auto' : 'hidden';
   }
 
   function renderChips(): void {
@@ -100,6 +112,18 @@ export function mountComposer(
   }
 
   sendBtn.addEventListener('click', send);
+  refreshBtn.addEventListener('click', async () => {
+    refreshBtn.disabled = true;
+    refreshBtn.classList.add('refreshing');
+    refreshBtn.setAttribute('aria-busy', 'true');
+    try {
+      await onRefresh();
+    } finally {
+      refreshBtn.disabled = false;
+      refreshBtn.classList.remove('refreshing');
+      refreshBtn.removeAttribute('aria-busy');
+    }
+  });
   inputEl.addEventListener('input', autoGrow);
   inputEl.addEventListener('keydown', e => {
     // Enter sends on desktop; Shift+Enter inserts a newline. On touch
@@ -152,6 +176,7 @@ export function mountComposer(
   window.addEventListener('dragover', onDragOver);
   window.addEventListener('dragleave', onDragLeave);
   window.addEventListener('drop', onDrop);
+  autoGrow();
 
   return {
     setText(text: string) {

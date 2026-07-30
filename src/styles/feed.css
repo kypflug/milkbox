@@ -20,13 +20,8 @@
 .feed-header {
   flex: none;
   background: var(--ground);
-}
-
-/* Draggable strip for window-controls-overlay installs. */
-.feed-titlebar {
-  height: env(titlebar-area-height, 0px);
-  -webkit-app-region: drag;
-  app-region: drag;
+  position: relative;
+  z-index: 2;
 }
 
 .feed-header-row {
@@ -44,6 +39,12 @@
   letter-spacing: -0.01em;
 }
 .feed-wordmark svg { color: var(--accent); }
+.feed-header-controls {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
 
 .sync-dot {
   width: 7px;
@@ -63,7 +64,6 @@
 }
 
 .feed-settings {
-  margin-left: auto;
   display: inline-flex;
   padding: 6px;
   color: var(--ink-3);
@@ -76,6 +76,7 @@
 
 .feed-scroll {
   flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   overflow-y: auto;
@@ -135,6 +136,7 @@
 
 .drop-card {
   position: relative;
+  align-self: flex-end;
   max-width: min(560px, 92%);
   background: var(--surface);
   border: 1px solid var(--hairline);
@@ -144,6 +146,14 @@
   padding: 10px 14px 8px;
   transition: border-color var(--ease);
 }
+.drop-card--received {
+  align-self: flex-start;
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--hairline));
+  border-bottom-right-radius: var(--radius-bubble);
+  border-bottom-left-radius: var(--radius-chip);
+}
+.drop-card--received .drop-meta { color: var(--ink-2); }
 .drop-card:hover { border-color: var(--ink-3); }
 
 .drop-card--sending { opacity: 0.62; }

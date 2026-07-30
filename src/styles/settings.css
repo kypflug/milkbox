@@ -13,20 +13,27 @@
 
 .settings-header {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 16px;
   padding: 18px 20px 12px;
-}
-
-.settings-back {
-  font: var(--type-button);
-  text-decoration: none;
 }
 
 .settings-title {
   font: var(--type-title);
   margin: 0;
 }
+
+.settings-close {
+  margin-left: auto;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  color: var(--ink-3);
+  border-radius: var(--radius-chip);
+  transition: color var(--ease), background var(--ease);
+}
+.settings-close:hover { color: var(--ink); background: var(--surface-sunk); }
 
 .settings-body {
   flex: 1;

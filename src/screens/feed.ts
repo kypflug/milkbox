@@ -4,11 +4,11 @@
  * PAGE_SIZE drops; a sentinel at the top pages older ones in from IDB.
  */
 
-import type { DropMeta, DropRecord, SharePayload } from '../types';
+import type { DeviceProfile, DropMeta, DropRecord, SharePayload } from '../types';
 import { ulid } from '../utils/ulid';
 import { dayKey } from '../utils/format';
 import { escapeHtml } from '../utils/storage';
-import { getDeviceInfo } from '../services/device';
+import { getDeviceId, getDeviceInfo } from '../services/device';
 import { isBareUrl, domainOf } from '../services/link-meta';
 import * as coordinator from '../services/sync-coordinator';
 import * as db from '../services/db';
@@ -41,11 +41,12 @@ export async function renderFeed(app: HTMLElement): Promise<void> {
   app.innerHTML = `
     <div class="feed-screen">
       <header class="feed-header">
-        <div class="feed-titlebar" aria-hidden="true"></div>
         <div class="feed-header-row">
           <span class="feed-wordmark">${iconBottle('1.15em')}<span>Milkbox</span></span>
-          <span class="sync-dot" id="syncDot" title="Synced"></span>
-          <a class="feed-settings" href="#settings" title="Settings" aria-label="Settings">${iconSettings('1.2em')}</a>
+          <span class="feed-header-controls">
+            <span class="sync-dot" id="syncDot" title="Synced"></span>
+            <a class="feed-settings" href="#settings" title="Settings" aria-label="Settings">${iconSettings('1.2em')}</a>
+          </span>
         </div>
       </header>
       <div class="feed-scroll" id="feedScroll">
@@ -73,7 +74,13 @@ export async function renderFeed(app: HTMLElement): Promise<void> {
 
   async function refresh(opts: { stick?: boolean } = {}): Promise<void> {
     const stick = opts.stick ?? nearBottom();
-    feed = await coordinator.loadFeed();
+    const [loadedFeed, profiles] = await Promise.all([
+      coordinator.loadFeed(),
+      coordinator.loadDeviceProfiles(),
+    ]);
+    feed = loadedFeed;
+    const deviceLabels = buildDeviceLabels(profiles);
+    const currentDeviceId = getDeviceId();
     const visible = feed.slice(-visibleCount).filter(r => !pendingDeletes.has(r.meta.id));
 
     let html = '';
@@ -92,7 +99,11 @@ export async function renderFeed(app: HTMLElement): Promise<void> {
           html += renderDayDivider(record.meta.createdAt);
           lastDay = day;
         }
-        html += renderDropCard(record);
+        const profileId = record.meta.device.id;
+        html += renderDropCard(record, {
+          side: profileId === currentDeviceId ? 'sent' : 'received',
+          deviceLabel: (profileId && deviceLabels.get(profileId)) || record.meta.device.name,
+        });
       }
     }
     listEl.innerHTML = html;
@@ -237,6 +248,7 @@ export async function renderFeed(app: HTMLElement): Promise<void> {
     document.getElementById('composerMount')!,
     (text, files) => void send(text, files),
     name => showToast(`"${name}" is over 250 MB — too big for the milkbox`, 'error'),
+    () => coordinator.requestSync({ force: true }),
   );
 
   // ── card actions (event delegation) ──
@@ -481,4 +493,23 @@ export function applySharePayload(payload: SharePayload): void {
 function sanitizeName(name: string): string {
   // OneDrive disallows a handful of characters in item names
   return name.replace(/[\\/:*?"<>|#%]/g, '_').slice(0, 180) || 'file';
+}
+
+function buildDeviceLabels(profiles: DeviceProfile[]): Map<string, string> {
+  const byName = new Map<string, DeviceProfile[]>();
+  for (const profile of profiles) {
+    const key = profile.name.trim().toLocaleLowerCase();
+    const group = byName.get(key) || [];
+    group.push(profile);
+    byName.set(key, group);
+  }
+
+  const labels = new Map<string, string>();
+  for (const group of byName.values()) {
+    group.sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+    group.forEach((profile, index) => {
+      labels.set(profile.id, index === 0 ? profile.name : `${profile.name} #${index + 1}`);
+    });
+  }
+  return labels;
 }

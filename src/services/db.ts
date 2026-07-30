@@ -10,10 +10,10 @@
  * - settings: small key/value pairs (delta token, folder cTag)
  */
 
-import type { DropRecord, OutboxRecord } from '../types';
+import type { DeviceProfile, DropRecord, OutboxRecord } from '../types';
 
 const DB_NAME = 'milkbox-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -21,6 +21,7 @@ function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
+    let blocked = false;
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains('drops')) {
@@ -36,11 +37,25 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains('outbox')) {
         db.createObjectStore('outbox', { keyPath: 'id' });
       }
+      if (!db.objectStoreNames.contains('devices')) {
+        db.createObjectStore('devices', { keyPath: 'id' });
+      }
       if (!db.objectStoreNames.contains('settings')) {
         db.createObjectStore('settings');
       }
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onblocked = () => {
+      blocked = true;
+      reject(new Error('Milkbox storage upgrade is blocked. Close other Milkbox windows and reload.'));
+    };
+    req.onsuccess = () => {
+      if (blocked) {
+        req.result.close();
+        return;
+      }
+      req.result.onversionchange = () => req.result.close();
+      resolve(req.result);
+    };
     req.onerror = () => reject(req.error);
   });
   return dbPromise;
@@ -169,6 +184,32 @@ export function deleteOutboxRecord(id: string): Promise<void> {
   return tx('outbox', 'readwrite', s => { s.delete(id); });
 }
 
+// ─── device profiles ───
+
+export function getAllDeviceProfiles(): Promise<DeviceProfile[]> {
+  return tx('devices', 'readonly', s => s.getAll() as IDBRequest<DeviceProfile[]>);
+}
+
+export function getDeviceProfile(id: string): Promise<DeviceProfile | undefined> {
+  return tx('devices', 'readonly', s => s.get(id) as IDBRequest<DeviceProfile | undefined>);
+}
+
+export function putDeviceProfile(profile: DeviceProfile): Promise<void> {
+  return tx('devices', 'readwrite', s => { s.put(profile); });
+}
+
+export async function replaceAllDeviceProfiles(profiles: DeviceProfile[]): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const t = db.transaction('devices', 'readwrite');
+    const s = t.objectStore('devices');
+    s.clear();
+    for (const profile of profiles) s.put(profile);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+  });
+}
+
 // ─── settings (kv) ───
 
 export function getSetting<T>(key: string): Promise<T | undefined> {
@@ -186,7 +227,7 @@ export function deleteSetting(key: string): Promise<void> {
 /** Wipe all local data (sign-out). */
 export async function clearAllData(): Promise<void> {
   const db = await openDb();
-  const stores = ['drops', 'thumbs', 'blobs', 'outbox', 'settings'];
+  const stores = ['drops', 'thumbs', 'blobs', 'outbox', 'devices', 'settings'];
   return new Promise((resolve, reject) => {
     const t = db.transaction(stores, 'readwrite');
     for (const s of stores) t.objectStore(s).clear();
