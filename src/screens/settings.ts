@@ -204,6 +204,7 @@ export function mountSettingsFlyout(
     toggle,
     teardown() {
       resizeObserver.disconnect();
+      trigger.removeEventListener('click', toggle);
       document.removeEventListener('pointerdown', onDocumentPointerDown);
       document.removeEventListener('keydown', onDocumentKeyDown);
       window.removeEventListener('resize', onWindowResize);
