@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <!-- Milkbox icon master: a milk bottle, violet on warm paper. -->
-  <rect width="512" height="512" rx="96" fill="#faf8f4"/>
-  <g fill="none" stroke="#4c4577" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Milkbox icon master: a milk bottle, creamery blue on milk-white. -->
+  <rect width="512" height="512" rx="96" fill="#fafbfd"/>
+  <g fill="none" stroke="#2d5c8a" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
     <path d="M204 118h104"/>
     <path d="M214 118v56l-40 66v154a34 34 0 0 0 34 34h96a34 34 0 0 0 34-34V240l-40-66v-56"/>
   </g>
   <!-- the milk line -->
-  <path d="M174 306h164" stroke="#4c4577" stroke-width="26" stroke-linecap="round"/>
-  <path d="M174 306v88a34 34 0 0 0 34 34h96a34 34 0 0 0 34-34v-88z" fill="#4c4577" opacity="0.18"/>
+  <path d="M174 306h164" stroke="#2d5c8a" stroke-width="26" stroke-linecap="round"/>
+  <path d="M174 306v88a34 34 0 0 0 34 34h96a34 34 0 0 0 34-34v-88z" fill="#2d5c8a" opacity="0.18"/>
 </svg>

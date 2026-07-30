@@ -4,10 +4,15 @@
  * screen; everything else earns attention with hairlines.
  */
 
-.composer-mount {
+.composer-region {
+  position: relative;
   flex: none;
-  padding: 8px 20px calc(14px + env(safe-area-inset-bottom, 0px));
   background: var(--ground);
+  z-index: 3;
+}
+
+.composer-mount {
+  padding: 8px 20px calc(14px + env(safe-area-inset-bottom, 0px));
 }
 
 .composer {
@@ -39,7 +44,15 @@
 }
 .composer-input::placeholder { color: var(--ink-3); }
 
+.composer-tools {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+}
+
 .composer-attach,
+.composer-settings,
 .composer-refresh {
   flex: none;
   display: grid;
@@ -51,10 +64,22 @@
   transition: color var(--ease), background var(--ease);
 }
 .composer-attach:hover,
+.composer-settings:hover,
 .composer-refresh:hover { color: var(--ink); background: var(--surface-sunk); }
 .composer-refresh:disabled { cursor: default; opacity: 0.55; }
-.composer-refresh.refreshing svg { animation: composer-refresh-spin 700ms linear infinite; }
+.composer-refresh.syncing svg {
+  transform-origin: 50% 50%;
+  animation: composer-refresh-spin 700ms linear infinite;
+}
+.composer-refresh.sync-error { color: var(--danger); }
 @keyframes composer-refresh-spin { to { transform: rotate(360deg); } }
+
+.settings-flyout-mount {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+}
 
 .composer-send {
   flex: none;

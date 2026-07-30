@@ -6,7 +6,7 @@
  * with the text and files and lets the feed screen queue drops.
  */
 
-import { iconAttach, iconSend, iconClose, iconFile, iconRefresh } from './icons';
+import { iconAttach, iconSend, iconClose, iconFile, iconRefresh, iconSettings } from './icons';
 import { escapeHtml } from '../utils/storage';
 import { formatBytes } from '../utils/format';
 
@@ -16,6 +16,7 @@ export interface ComposerApi {
   /** Add attachments (share target, drag-drop). */
   addFiles(files: File[]): void;
   focus(): void;
+  setSyncState(state: 'syncing' | 'synced' | 'error'): void;
   teardown(): void;
 }
 
@@ -34,7 +35,11 @@ export function mountComposer(
       <div class="composer-row">
         <button class="composer-attach" title="Attach files" aria-label="Attach files">${iconAttach('1.25em')}</button>
         <textarea class="composer-input" rows="1" placeholder="Drop something…" aria-label="Message"></textarea>
-        <button class="composer-refresh" title="Refresh" aria-label="Refresh">${iconRefresh('1.15em')}</button>
+        <span class="composer-tools">
+          <button class="composer-refresh" title="Refresh" aria-label="Refresh">${iconRefresh('1.15em')}</button>
+          <button class="composer-settings" title="Settings" aria-label="Settings"
+                  aria-haspopup="dialog">${iconSettings('1.15em')}</button>
+        </span>
         <button class="composer-send" title="Send" aria-label="Send">${iconSend('1.2em')}</button>
       </div>
       <input type="file" class="composer-file-input" multiple hidden>
@@ -53,6 +58,24 @@ export function mountComposer(
   const dragOverlay = container.querySelector<HTMLElement>('.drag-overlay')!;
 
   let pendingFiles: File[] = [];
+
+  function setSyncState(state: 'syncing' | 'synced' | 'error'): void {
+    refreshBtn.classList.toggle('syncing', state === 'syncing');
+    refreshBtn.classList.toggle('sync-error', state === 'error');
+    if (state === 'syncing') {
+      refreshBtn.title = 'Syncing';
+      refreshBtn.setAttribute('aria-label', 'Syncing');
+      refreshBtn.setAttribute('aria-busy', 'true');
+    } else if (state === 'error') {
+      refreshBtn.title = 'Sync failed — refresh to retry';
+      refreshBtn.setAttribute('aria-label', 'Sync failed — refresh to retry');
+      refreshBtn.removeAttribute('aria-busy');
+    } else {
+      refreshBtn.title = 'Synced — refresh';
+      refreshBtn.setAttribute('aria-label', 'Synced — refresh');
+      refreshBtn.removeAttribute('aria-busy');
+    }
+  }
 
   function autoGrow(): void {
     const style = getComputedStyle(inputEl);
@@ -114,14 +137,10 @@ export function mountComposer(
   sendBtn.addEventListener('click', send);
   refreshBtn.addEventListener('click', async () => {
     refreshBtn.disabled = true;
-    refreshBtn.classList.add('refreshing');
-    refreshBtn.setAttribute('aria-busy', 'true');
     try {
       await onRefresh();
     } finally {
       refreshBtn.disabled = false;
-      refreshBtn.classList.remove('refreshing');
-      refreshBtn.removeAttribute('aria-busy');
     }
   });
   inputEl.addEventListener('input', autoGrow);
@@ -185,6 +204,7 @@ export function mountComposer(
     },
     addFiles,
     focus: () => inputEl.focus(),
+    setSyncState,
     teardown() {
       document.removeEventListener('paste', onPaste);
       window.removeEventListener('dragenter', onDragEnter);

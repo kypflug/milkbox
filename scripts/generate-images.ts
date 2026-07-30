@@ -27,7 +27,7 @@ async function main(): Promise<void> {
   // down onto a full-bleed paper background so nothing clips.
   const inner = await sharp(master).resize(410, 410).png().toBuffer();
   await sharp({
-    create: { width: 512, height: 512, channels: 4, background: '#faf8f4' },
+    create: { width: 512, height: 512, channels: 4, background: '#fafbfd' },
   })
     .composite([{ input: inner, gravity: 'center' }])
     .png()
@@ -37,10 +37,10 @@ async function main(): Promise<void> {
   // Apple touch icon: 180px, opaque background (iOS composites its own radius)
   const appleInner = await sharp(master).resize(180, 180).png().toBuffer();
   await sharp({
-    create: { width: 180, height: 180, channels: 4, background: '#faf8f4' },
+    create: { width: 180, height: 180, channels: 4, background: '#fafbfd' },
   })
     .composite([{ input: appleInner }])
-    .flatten({ background: '#faf8f4' })
+    .flatten({ background: '#fafbfd' })
     .png()
     .toFile(join(outDir, 'apple-touch-icon.png'));
   console.log('apple-touch-icon.png');
