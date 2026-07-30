@@ -4,7 +4,6 @@ import { initBroadcast, postBroadcast } from './services/broadcast';
 import { drainShareInbox } from './services/share-inbox';
 import { renderSignIn } from './screens/sign-in';
 import { renderFeed, applySharePayload, teardownScreenListeners } from './screens/feed';
-import { renderSettings } from './screens/settings';
 import { applyTheme } from './theme';
 import { escapeHtml } from './utils/storage';
 import { registerSW } from 'virtual:pwa-register';
@@ -69,6 +68,7 @@ boot(app).catch(err => {
 
 async function boot(app: HTMLElement): Promise<void> {
   applyTheme();
+  trackWindowControlsSide();
 
   // Restore MSAL cache from IndexedDB if iOS wiped localStorage
   const cacheRestored = await restoreMsalCacheIfNeeded();
@@ -116,6 +116,27 @@ async function boot(app: HTMLElement): Promise<void> {
 }
 
 // ─── Auto-redirect helpers (iOS session recovery) ───
+
+/**
+ * Flag which side the window controls occupy in a window-controls-overlay
+ * install. The overlay rect starts after the controls, so a non-zero x means
+ * they sit on the left — macOS traffic lights, or a right-to-left Windows
+ * install — and the feed header moves its bottle to the opposite rail rather
+ * than tucking it against them. Asking for the geometry beats sniffing the
+ * platform: it answers the question we actually care about.
+ */
+function trackWindowControlsSide(): void {
+  const overlay = navigator.windowControlsOverlay;
+  if (!overlay) return;
+
+  const apply = () => {
+    const controlsOnLeft = overlay.visible && overlay.getTitlebarAreaRect().x > 0;
+    document.documentElement.toggleAttribute('data-controls-left', controlsOnLeft);
+  };
+
+  apply();
+  overlay.addEventListener('geometrychange', apply);
+}
 
 const AUTO_REDIRECT_KEY = 'milkbox:auto-redirect';
 
@@ -183,11 +204,7 @@ async function enterApp(app: HTMLElement): Promise<void> {
 async function route(app: HTMLElement): Promise<void> {
   teardownScreenListeners();
   const hash = location.hash.slice(1);
-  if (hash === 'settings') {
-    renderSettings(app);
-  } else {
-    await renderFeed(app);
-  }
+  await renderFeed(app, { openSettings: hash === 'settings' });
 }
 
 /**

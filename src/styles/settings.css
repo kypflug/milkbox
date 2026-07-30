@@ -1,25 +1,55 @@
 /*
- * Settings — a short list of labeled sections on the sheet. Mono labels,
- * hairline separations, one danger button.
+ * Settings — the milkbox door swung open above the composer. This is the one
+ * lifted panel in the app, so it takes --shadow-pop and an accent-tinted
+ * edge; the milk-white sheet steps up off the --ground behind it and the
+ * sections inside step back down to --surface-sunk.
  */
 
-.settings-screen {
-  height: 100%;
-  height: 100dvh;
+.settings-flyout {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 50%;
+  width: min(380px, calc(100% - 40px));
   display: flex;
   flex-direction: column;
-  width: 100%;
+  overflow: hidden;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--hairline));
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-pop), var(--card-highlight);
+  pointer-events: auto;
+  transform: translateX(-50%);
+  transform-origin: bottom center;
+  animation: settings-flyout-in 180ms var(--ease-curve);
+}
+
+.settings-flyout.closing {
+  animation: settings-flyout-out 120ms var(--ease-curve) forwards;
+  pointer-events: none;
+}
+
+@keyframes settings-flyout-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+}
+
+@keyframes settings-flyout-out {
+  from { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+  to { opacity: 0; transform: translateX(-50%) translateY(6px) scale(0.98); }
 }
 
 .settings-header {
   display: flex;
   align-items: center;
   gap: 16px;
-  padding: 18px 20px 12px;
+  padding: 16px 18px 10px;
+  flex: none;
 }
 
 .settings-title {
-  font: var(--type-title);
+  font: var(--type-wordmark);
+  color: var(--accent);
   margin: 0;
 }
 
@@ -36,23 +66,23 @@
 .settings-close:hover { color: var(--ink); background: var(--surface-sunk); }
 
 .settings-body {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--hairline) transparent;
-  padding: 4px 20px 32px;
+  padding: 2px 14px 14px;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
 .settings-section {
-  background: var(--surface);
+  background: var(--surface-sunk);
   border: 1px solid var(--hairline);
   border-radius: var(--radius-card);
-  box-shadow: var(--card-highlight);
-  padding: 16px 18px 18px;
-  margin-top: 12px;
+  padding: 14px 16px 16px;
+  margin-top: 10px;
 }
 
 .settings-label {
@@ -83,6 +113,7 @@
 
 .settings-button {
   padding: 8px 16px;
+  background: var(--surface);
   border: 1px solid var(--hairline);
   border-radius: var(--radius-chip);
   transition: border-color var(--ease), color var(--ease);
@@ -94,10 +125,18 @@
   max-width: 320px;
   font: var(--type-body);
   color: var(--ink);
-  background: var(--surface-sunk);
+  background: var(--surface);
   border: 1px solid var(--hairline);
   border-radius: var(--radius-chip);
   padding: 8px 12px;
+}
+
+@media (max-width: 479px) {
+  .settings-flyout {
+    width: calc(100% - 24px);
+  }
+  .settings-body { padding-inline: 10px; }
+  .settings-section { padding-inline: 14px; }
 }
 
 /* Segmented control: a 1px gap over a hairline background (badgy idiom). */

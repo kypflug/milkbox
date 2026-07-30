@@ -1,23 +1,25 @@
 /*
- * Milkbox — "Milk run" design tokens.
+ * Milkbox — "Milk glass" design tokens.
  *
- * The scene: a note tucked into the milkbox on a neighbor's stoop. The ground
- * is warm putty — a poured-concrete step at dusk — and everything you drop
- * lands on a milk-white sheet. Ink is violet-black, like an airmail stamp
- * pressed too hard; the one accent is that same violet-slate, and it means
- * "this goes somewhere." Metadata is set in a small tracked mono, the way a
- * dairy stamped its bottle caps.
+ * The scene: a package left in the milkbox on a neighbor's porch at first
+ * light. The ground is cool eggshell — poured concrete under an early sky —
+ * and everything you drop lands on a milk-white sheet. Milk is never warm
+ * white; it goes blue in shadow, so the whole neutral ramp is cast that way
+ * and the ink is a blue-black. The one accent is creamery-cap blue, and it
+ * means "this goes somewhere." Metadata is set in a small tracked mono, the
+ * way a dairy stamped its bottle caps.
  *
- * Family law (shared with aldenblog and badgy): elevation is a hairline,
- * never a shadow. Separation comes from the ground → surface value step plus
- * a 1px hairline. Exactly one shadow exists — the sheet the whole app sits
- * on — and dark mode replaces even that with an inset top highlight, because
- * a drop shadow on a dark surface reads as a stain, not a lift.
+ * Family law: resting surfaces earn separation from the ground → surface
+ * value step plus a 1px hairline, never a shadow. Only things that have
+ * actually been lifted cast one, and there are exactly two tiers:
+ * --shadow-sheet (the pane the app sits on) and --shadow-pop (the settings
+ * flyout — the milkbox door swung open). Dark mode keeps the pane flat and
+ * leans on the inset top highlight, because a drop shadow under a resting
+ * dark surface reads as a stain, not a lift.
  *
- * The dark palette is designed, not inverted: the stoop after the porch
- * light goes off. Every ink step and the accent were checked against
- * --surface and --surface-sunk for WCAG 4.5:1 (see the contrast notes
- * inline where a value was nudged).
+ * The dark palette is designed, not inverted: the porch after the light
+ * goes off. Every ink step and the accent were checked against --surface,
+ * --surface-sunk, --ground, and --accent-soft for WCAG 4.5:1.
  */
 
 @import './feed.css';
@@ -51,34 +53,44 @@
   color-scheme: light;
 
   /* ── surfaces: desk → ground → surface → hairline ── */
-  --desk:         #ded9cf;  /* the porch behind the pane (tall viewports) */
-  --ground:       #e8e4dd;  /* warm putty stoop */
-  --surface:      #faf8f4;  /* the milk-white sheet */
-  --surface-sunk: #efece5;  /* composer well, chips, sunk fields */
-  --hairline:     #d8d3c9;
+  --desk:         #d2d8e0;  /* weathered porch board behind the pane */
+  --ground:       #e3e8ee;  /* cool eggshell step */
+  --surface:      #fafbfd;  /* the milk-white sheet */
+  --surface-sunk: #eef1f6;  /* composer well, chips, sunk fields */
+  --hairline:     #ccd3dd;
 
   /* ── ink ramp, three steps ── */
-  --ink:          #211f2b;  /* violet-black — 15.3:1 on --surface */
-  --ink-2:        #4d4a5a;  /* 8.1:1 */
-  --ink-3:        #67637a;  /* mono metadata — 5.4:1 on --surface, 4.9:1 on --surface-sunk */
+  --ink:          #171d26;  /* milk-shadow blue-black — 16.4:1 on --surface */
+  --ink-2:        #414955;  /* 8.8:1 */
+  --ink-3:        #59626e;  /* mono metadata — 6.0:1 on --surface, 5.0:1 on --ground */
 
-  /* ── accent: airmail violet-slate ── */
-  --accent:       #4c4577;  /* 8.2:1 on --surface */
-  --accent-hover: #3d3763;
-  --accent-soft:  #e6e2f0;  /* selection wash, drag-over tint */
-  --on-accent:    #faf8f4;
-  --danger:       #8c3f33;  /* failed sends, destructive — 6.3:1 */
-  --danger-soft:  #f2e3e0;
+  /* ── accent: creamery-cap blue ── */
+  --accent:       #2d5c8a;  /* 6.7:1 on --surface, 5.7:1 on --ground */
+  --accent-hover: #204a72;
+  --accent-soft:  #dce7f3;  /* selection wash, received drops, drag-over tint */
+  --on-accent:    #fafbfd;
+  --danger:       #8d3f31;  /* failed sends, destructive — 7.0:1 */
+  --danger-soft:  #f4e3e0;
 
-  /* ── elevation ── */
+  /* ── elevation: two lifted tiers, everything else is a hairline ── */
   --card-highlight: none;
-  --shadow-sheet: 0 18px 50px rgba(33, 31, 43, 0.14);  /* the one shadow */
+  --shadow-sheet: 0 18px 50px rgba(23, 29, 38, 0.14);   /* the app pane */
+  --shadow-pop:                                          /* the settings flyout */
+    0 14px 32px rgba(23, 29, 38, 0.18),
+    0 2px 6px rgba(23, 29, 38, 0.09);
 
   /* ── type ── */
   --font-ui:   'Schibsted Grotesk', 'Segoe UI', system-ui, -apple-system, sans-serif;
   --font-mono: 'Commit Mono', ui-monospace, Consolas, 'SF Mono', monospace;
 
-  --type-wordmark:   700 19px/1 var(--font-ui);
+  --wordmark-size:        19px;
+  --wordmark-line-height: 19px;
+  --title-strip-padding:  12px;
+  --title-strip-height:   calc(var(--wordmark-line-height) + 2 * var(--title-strip-padding));
+  --wco-title-strip-height:
+    max(var(--title-strip-height), calc(env(titlebar-area-height, 0px) + var(--title-strip-padding)));
+
+  --type-wordmark:   700 var(--wordmark-size)/1 var(--font-ui);
   --type-title:      700 24px/1.2 var(--font-ui);
   --type-body:       400 15.5px/1.55 var(--font-ui);
   --type-link-title: 600 15px/1.35 var(--font-ui);
@@ -107,26 +119,28 @@
 :root[data-theme='dark'] {
   color-scheme: dark;
 
-  --desk:         #0d0c11;
-  --ground:       #131218;
-  --surface:      #1c1b23;
-  --surface-sunk: #24222e;
-  --hairline:     #322f3e;
+  --desk:         #080a0e;
+  --ground:       #0f1319;
+  --surface:      #171c24;
+  --surface-sunk: #1f252e;
+  --hairline:     #2c333e;
 
-  --ink:          #e8e6ee;  /* 13.8:1 on --surface */
-  --ink-2:        #b3b0c0;  /* 8.0:1 */
-  --ink-3:        #918da3;  /* nudged up from #8d8a9d — 4.9:1 on --surface-sunk */
+  --ink:          #e4e8ee;  /* 13.9:1 on --surface */
+  --ink-2:        #adb4be;  /* 8.2:1 */
+  --ink-3:        #8a929c;  /* 5.4:1 on --surface, 4.9:1 on --surface-sunk */
 
-  --accent:       #aca4dd;  /* 7.4:1 on --surface */
-  --accent-hover: #bfb8e8;
-  --accent-soft:  #2c2940;
-  --on-accent:    #16151c;
-  --danger:       #e0897c;  /* 6.0:1 */
-  --danger-soft:  #392527;
+  --accent:       #86b8e8;  /* milk glass lit from behind — 8.2:1 on --surface */
+  --accent-hover: #a3cbf0;
+  --accent-soft:  #1e2b3a;
+  --on-accent:    #0d1822;
+  --danger:       #e0897c;  /* 6.6:1 */
+  --danger-soft:  #372625;
 
-  /* Never a drop shadow on a dark surface. */
+  /* Never a drop shadow under a resting dark surface. The flyout is the one
+   * lifted thing, so it keeps a shadow — cast into the dark, not onto it. */
   --card-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   --shadow-sheet: none;
+  --shadow-pop: 0 16px 34px rgba(0, 0, 0, 0.55);
 }
 
 /* ── reset & base ── */
@@ -171,7 +185,6 @@ body {
     app-region: drag;
   }
   .feed-screen,
-  .settings-screen,
   .sign-in-sheet,
   .toast,
   .lightbox {
@@ -183,19 +196,20 @@ body {
     top: env(titlebar-area-y, 0px);
     left: env(titlebar-area-x, 0px);
     width: env(titlebar-area-width, 100%);
-    height: env(titlebar-area-height, 0px);
-    min-height: env(titlebar-area-height, 0px);
-    padding: 0 12px;
+    height: var(--wco-title-strip-height);
+    min-height: var(--wco-title-strip-height);
+    padding: 0 20px;
     z-index: 40;
     -webkit-app-region: drag;
     app-region: drag;
   }
-  .feed-settings {
+  .composer-region,
+  .settings-flyout {
     -webkit-app-region: no-drag;
     app-region: no-drag;
   }
   .feed-header {
-    height: env(titlebar-area-height, 0px);
+    height: var(--wco-title-strip-height);
     background: transparent;
   }
 }
@@ -207,8 +221,7 @@ body {
  */
 @media (min-height: 600px) and (min-width: 800px) {
   body { background: var(--desk); }
-  .feed-screen,
-  .settings-screen {
+  .feed-screen {
     height: min(800px, calc(100dvh - 96px));
     width: min(720px, calc(100vw - 48px));
     margin: auto;
@@ -222,6 +235,9 @@ body {
 
 @media (display-mode: window-controls-overlay) and (min-height: 600px) and (min-width: 800px) {
   .feed-header { height: 0; }
+  .feed-screen {
+    max-height: calc(100dvh - 2 * var(--wco-title-strip-height));
+  }
 }
 
 a { color: var(--accent); }
@@ -253,6 +269,10 @@ button {
 
 /* Placeholder drag strip so window-controls-overlay doesn't shift layout. */
 .boot-titlebar { height: env(titlebar-area-height, 0px); }
+
+@media (display-mode: window-controls-overlay) {
+  .boot-titlebar { height: var(--wco-title-strip-height); }
+}
 
 .boot-loading-content {
   flex: 1;

@@ -17,13 +17,15 @@ import { onBroadcast } from '../services/broadcast';
 import { renderDropCard } from '../components/drop-card';
 import { renderDayDivider } from '../components/day-divider';
 import { mountComposer, type ComposerApi } from '../components/composer';
+import { mountSettingsFlyout, type SettingsFlyoutApi } from './settings';
 import { showToast } from '../components/toast';
-import { iconBottle, iconSettings, iconClose } from '../components/icons';
+import { iconBottle, iconClose } from '../components/icons';
 
 const PAGE_SIZE = 100;
 
 let teardownFns: Array<() => void> = [];
 let composerApi: ComposerApi | null = null;
+let settingsFlyoutApi: SettingsFlyoutApi | null = null;
 
 /** Object URLs for thumbnails, keyed by drop id — survive re-renders. */
 const thumbUrls = new Map<string, string>();
@@ -35,31 +37,35 @@ export function teardownScreenListeners(): void {
   teardownFns = [];
   composerApi?.teardown();
   composerApi = null;
+  settingsFlyoutApi?.teardown();
+  settingsFlyoutApi = null;
 }
 
-export async function renderFeed(app: HTMLElement): Promise<void> {
+export async function renderFeed(
+  app: HTMLElement,
+  options: { openSettings?: boolean } = {},
+): Promise<void> {
   app.innerHTML = `
     <div class="feed-screen">
       <header class="feed-header">
         <div class="feed-header-row">
-          <span class="feed-wordmark">${iconBottle('1.15em')}<span>Milkbox</span></span>
-          <span class="feed-header-controls">
-            <span class="sync-dot" id="syncDot" title="Synced"></span>
-            <a class="feed-settings" href="#settings" title="Settings" aria-label="Settings">${iconSettings('1.2em')}</a>
-          </span>
+          <span class="feed-mark">${iconBottle('1.15em')}</span>
+          <span class="feed-wordmark">Milkbox</span>
         </div>
       </header>
       <div class="feed-scroll" id="feedScroll">
         <div class="feed-sentinel" id="feedSentinel"></div>
         <div class="feed-list" id="feedList" role="log" aria-label="Your drops"></div>
       </div>
-      <div class="composer-mount" id="composerMount"></div>
+      <div class="composer-region" id="composerRegion">
+        <div class="settings-flyout-mount"></div>
+        <div class="composer-mount" id="composerMount"></div>
+      </div>
     </div>
   `;
 
   const scrollEl = document.getElementById('feedScroll')!;
   const listEl = document.getElementById('feedList')!;
-  const syncDot = document.getElementById('syncDot')!;
 
   let visibleCount = PAGE_SIZE;
   let feed: DropRecord[] = [];
@@ -250,6 +256,13 @@ export async function renderFeed(app: HTMLElement): Promise<void> {
     name => showToast(`"${name}" is over 250 MB — too big for the milkbox`, 'error'),
     () => coordinator.requestSync({ force: true }),
   );
+  const settingsTrigger = app.querySelector<HTMLButtonElement>('.composer-settings')!;
+  settingsFlyoutApi = mountSettingsFlyout(
+    app.querySelector<HTMLElement>('.settings-flyout-mount')!,
+    settingsTrigger,
+    app.querySelector<HTMLElement>('.feed-header-row')!,
+  );
+  if (options.openSettings) settingsFlyoutApi.open();
 
   // ── card actions (event delegation) ──
 
@@ -426,16 +439,13 @@ export async function renderFeed(app: HTMLElement): Promise<void> {
   const offCoordinator = coordinator.onCoordinatorEvent(event => {
     switch (event.type) {
       case 'sync-start':
-        syncDot.classList.add('syncing');
+        composerApi?.setSyncState('syncing');
         break;
       case 'sync-complete':
-        syncDot.classList.remove('syncing', 'error');
-        syncDot.title = 'Synced';
+        composerApi?.setSyncState('synced');
         break;
       case 'sync-error':
-        syncDot.classList.remove('syncing');
-        syncDot.classList.add('error');
-        syncDot.title = 'Sync failed — will retry';
+        composerApi?.setSyncState('error');
         break;
       case 'feed-updated':
         void refresh();

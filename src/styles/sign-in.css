@@ -1,7 +1,7 @@
 /*
- * Sign-in — the doorstep. One sheet centered on the stoop; this is the one
- * place the reserved sheet shadow appears (dark mode swaps it for the
- * inset highlight, per family law).
+ * Sign-in — the doorstep. One sheet centered on the porch; this sheet and
+ * the app pane are the only things that carry --shadow-sheet (dark mode
+ * swaps it for the inset highlight, per family law).
  */
 
 .sign-in-screen {
