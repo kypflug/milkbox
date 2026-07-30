@@ -17,7 +17,7 @@
     "@fontsource-variable/schibsted-grotesk": "^5.2.0",
     "@fontsource/commit-mono": "^5.2.0",
     "@types/node": "^25.2.2",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vite": "^7.3.1",
