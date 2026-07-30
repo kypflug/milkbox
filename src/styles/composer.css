@@ -26,18 +26,21 @@
 
 .composer-input {
   flex: 1;
+  min-width: 0;
   font: var(--type-composer);
   color: var(--ink);
   background: none;
   border: none;
   resize: none;
   padding: 7px 4px;
-  max-height: 192px;
+  max-height: 84px;
+  overflow-y: hidden;
   outline: none;
 }
 .composer-input::placeholder { color: var(--ink-3); }
 
-.composer-attach {
+.composer-attach,
+.composer-refresh {
   flex: none;
   display: grid;
   place-items: center;
@@ -47,7 +50,11 @@
   color: var(--ink-3);
   transition: color var(--ease), background var(--ease);
 }
-.composer-attach:hover { color: var(--ink); background: var(--surface-sunk); }
+.composer-attach:hover,
+.composer-refresh:hover { color: var(--ink); background: var(--surface-sunk); }
+.composer-refresh:disabled { cursor: default; opacity: 0.55; }
+.composer-refresh.refreshing svg { animation: composer-refresh-spin 700ms linear infinite; }
+@keyframes composer-refresh-spin { to { transform: rotate(360deg); } }
 
 .composer-send {
   flex: none;

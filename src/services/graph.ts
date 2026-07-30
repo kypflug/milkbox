@@ -4,6 +4,7 @@
  *
  * Layout in the user's OneDrive (appears as Apps/Milkbox):
  *   drops/<ulid>.json     — one small JSON per drop; the delta scope
+ *   devices/<uuid>.json   — one current profile per browser installation
  *   files/<ulid>/<name>   — binary payloads, outside the delta scope
  *
  * The split keeps multi-MB uploads out of the delta stream: every delta
@@ -12,12 +13,14 @@
 
 import { getAccessToken } from './auth';
 import { getSetting, putSetting, deleteSetting } from './db';
-import type { DropMeta, DropRecord } from '../types';
+import type { DeviceProfile, DropMeta, DropRecord } from '../types';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 const DROPS_FOLDER = 'drops';
+const DEVICES_FOLDER = 'devices';
 const DELTA_TOKEN_KEY = 'milkbox:delta-token';
 const FOLDER_CTAG_KEY = 'milkbox:drops-ctag';
+const DEVICES_CTAG_KEY = 'milkbox:devices-ctag';
 
 /** Simple PUT limit — Graph requires upload sessions above 4 MB. */
 export const SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024;
@@ -75,6 +78,7 @@ function itemByPathUrl(path: string): string {
 }
 
 const dropJsonPath = (id: string) => `${DROPS_FOLDER}/${id}.json`;
+const deviceJsonPath = (id: string) => `${DEVICES_FOLDER}/${id}.json`;
 
 // ─── drop JSON CRUD ───
 
@@ -129,6 +133,81 @@ export async function deleteDropFiles(id: string): Promise<void> {
     if (isGoneError(err)) return;
     throw err;
   }
+}
+
+// ─── device profiles ───
+
+export async function putDeviceProfile(profile: DeviceProfile): Promise<void> {
+  await graphFetch(contentUrl(deviceJsonPath(profile.id)), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(profile, null, 2),
+  });
+}
+
+interface GraphFileItem {
+  id: string;
+  name?: string;
+  file?: object;
+  '@microsoft.graph.downloadUrl'?: string;
+}
+
+export interface DeviceProfileSnapshot {
+  profiles: DeviceProfile[];
+  cTag?: string;
+}
+
+export async function listDeviceProfiles(): Promise<DeviceProfileSnapshot> {
+  let cTag: string | undefined;
+  try {
+    const folderRes = await graphFetch(`${itemByPathUrl(DEVICES_FOLDER)}?$select=cTag`);
+    const folder = await folderRes.json();
+    cTag = folder.cTag as string | undefined;
+  } catch (err) {
+    if (isGoneError(err)) return { profiles: [] };
+    throw err;
+  }
+
+  let url = `${itemByPathUrl(DEVICES_FOLDER)}:/children?$select=id,name,file,@microsoft.graph.downloadUrl`;
+  const profiles: DeviceProfile[] = [];
+
+  while (url) {
+    let data: { value: GraphFileItem[]; '@odata.nextLink'?: string };
+    try {
+      const res = await graphFetch(url);
+      data = await res.json();
+    } catch (err) {
+      if (isGoneError(err)) return { profiles: [], cTag };
+      throw err;
+    }
+
+    for (const item of data.value) {
+      if (!item.file || !item.name?.endsWith('.json')) continue;
+      const downloadUrl =
+        item['@microsoft.graph.downloadUrl'] ||
+        `${GRAPH_BASE}/me/drive/items/${item.id}/content`;
+      const bodyRes = item['@microsoft.graph.downloadUrl']
+        ? await fetch(downloadUrl)
+        : await graphFetch(downloadUrl);
+      if (!bodyRes.ok) {
+        throw new GraphHttpError(bodyRes.status, downloadUrl, 'Device profile download failed');
+      }
+      const profile = (await bodyRes.json()) as DeviceProfile;
+      if (
+        profile?.v === 1 &&
+        profile.id &&
+        profile.name &&
+        Number.isFinite(profile.createdAt) &&
+        Number.isFinite(profile.updatedAt)
+      ) {
+        profiles.push(profile);
+      }
+    }
+
+    url = data['@odata.nextLink'] || '';
+  }
+
+  return { profiles, cTag };
 }
 
 // ─── file upload ───
@@ -395,4 +474,22 @@ export async function markFeedClean(): Promise<void> {
   } catch {
     // Folder may not exist yet — fine
   }
+}
+
+export async function isDeviceRegistryDirty(): Promise<boolean> {
+  try {
+    const res = await graphFetch(`${itemByPathUrl(DEVICES_FOLDER)}?$select=cTag`);
+    const data = await res.json();
+    const cTag = data.cTag as string | undefined;
+    if (!cTag) return true;
+    const known = await getSetting<string>(DEVICES_CTAG_KEY);
+    return known !== cTag;
+  } catch (err) {
+    if (isGoneError(err)) return false;
+    throw err;
+  }
+}
+
+export function markDeviceRegistryClean(cTag: string): Promise<void> {
+  return putSetting(DEVICES_CTAG_KEY, cTag);
 }

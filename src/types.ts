@@ -2,6 +2,22 @@ export type Theme = 'light' | 'dark' | 'system';
 
 export type DropKind = 'text' | 'link' | 'file' | 'image';
 
+export interface DeviceAttribution {
+  /** Stable installation ID. Absent on drops created before device profiles. */
+  id?: string;
+  name: string;
+  os: string;
+}
+
+export interface DeviceProfile {
+  v: 1;
+  id: string;
+  name: string;
+  os: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 /**
  * One drop in the feed. Stored as `drops/<id>.json` in the OneDrive approot;
  * `id` is a ULID so lexical order is chronological order.
@@ -13,7 +29,7 @@ export interface DropMeta {
   createdAt: number;
   editedAt?: number;
   /** Which device sent it — shown in the metadata line. */
-  device: { name: string; os: string };
+  device: DeviceAttribution;
   /** Body text (text drops) or optional caption (file/image drops). */
   text?: string;
   /** Link drops. */

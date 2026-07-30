@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta name="theme-color" content="#faf8f4">
+  <meta name="theme-color" content="#e8e4dd">
   <meta name="description" content="A chat with yourself. Drop text, links, and files; they land on every device.">
   <meta property="og:title" content="Milkbox">
   <meta property="og:description" content="A chat with yourself. Drop text, links, and files; they land on every device.">
@@ -31,7 +31,11 @@
           : t;
         document.documentElement.setAttribute('data-theme', resolved);
         var meta = document.querySelector('meta[name="theme-color"]');
-        if (meta && resolved === 'dark') meta.setAttribute('content', '#1c1b23');
+        var pane = matchMedia('(min-height: 600px) and (min-width: 800px)').matches;
+        var colors = resolved === 'dark'
+          ? { full: '#131218', pane: '#0d0c11' }
+          : { full: '#e8e4dd', pane: '#ded9cf' };
+        if (meta) meta.setAttribute('content', pane ? colors.pane : colors.full);
       } catch (e) { /* storage unavailable — default to light */ }
     })();
   </script>

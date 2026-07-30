@@ -9,9 +9,10 @@
  * - Event pub/sub — the UI subscribes; this module never touches the DOM
  */
 
-import type { DropMeta, DropRecord, OutboxRecord } from '../types';
+import type { DeviceProfile, DropMeta, DropRecord, OutboxRecord } from '../types';
 import * as db from './db';
 import * as graph from './graph';
+import * as device from './device';
 import { postBroadcast } from './broadcast';
 
 export type CoordinatorEvent =
@@ -24,6 +25,7 @@ export type CoordinatorEvent =
 type Handler = (event: CoordinatorEvent) => void;
 
 const handlers = new Set<Handler>();
+const PENDING_DEVICE_PROFILE_KEY = 'milkbox:pending-device-profile';
 
 export function onCoordinatorEvent(handler: Handler): () => void {
   handlers.add(handler);
@@ -58,6 +60,34 @@ export async function loadFeed(): Promise<DropRecord[]> {
   return [...byId.values()].sort((a, b) => (a.meta.id < b.meta.id ? -1 : 1));
 }
 
+async function ensureCurrentDeviceProfile(): Promise<DeviceProfile> {
+  const current = device.getDeviceProfile();
+  const cached = await db.getDeviceProfile(current.id);
+  if (
+    !cached ||
+    cached.name !== current.name ||
+    cached.os !== current.os ||
+    cached.updatedAt !== current.updatedAt
+  ) {
+    await db.putDeviceProfile(current);
+    await db.putSetting(PENDING_DEVICE_PROFILE_KEY, current);
+  }
+  return current;
+}
+
+export async function loadDeviceProfiles(): Promise<DeviceProfile[]> {
+  await ensureCurrentDeviceProfile();
+  return db.getAllDeviceProfiles();
+}
+
+export async function renameCurrentDevice(name: string): Promise<void> {
+  const profile = device.setDeviceName(name);
+  await db.putDeviceProfile(profile);
+  await db.putSetting(PENDING_DEVICE_PROFILE_KEY, profile);
+  emit({ type: 'feed-updated' });
+  void requestSync({ force: true });
+}
+
 // ─── outbox ───
 
 const MAX_ATTEMPTS = 3;
@@ -74,7 +104,7 @@ export async function enqueueCreate(meta: DropMeta, blob?: Blob): Promise<void> 
     state: 'queued',
   });
   emit({ type: 'feed-updated' });
-  void drainOutbox();
+  void requestSync({ force: true });
 }
 
 /** Queue an edit to an existing text drop. */
@@ -213,52 +243,109 @@ async function performOp(record: OutboxRecord): Promise<void> {
 // ─── sync ───
 
 let syncing = false;
+let syncPromise: Promise<void> | null = null;
+let syncAgain = false;
 let lastSyncAt = 0;
 const SYNC_FLOOR_MS = 5_000;
+
+async function syncDeviceProfiles(): Promise<string | undefined> {
+  const local = await ensureCurrentDeviceProfile();
+  const pending = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
+  if (pending) {
+    await graph.putDeviceProfile(pending);
+    const latest = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
+    if (latest?.updatedAt === pending.updatedAt) {
+      await db.deleteSetting(PENDING_DEVICE_PROFILE_KEY);
+    }
+  }
+
+  const before = await db.getAllDeviceProfiles();
+  const snapshot = await graph.listDeviceProfiles();
+  const remote = snapshot.profiles;
+  const remoteLocal = remote.find(profile => profile.id === local.id);
+  const current = remoteLocal && remoteLocal.updatedAt > local.updatedAt ? remoteLocal : local;
+  const profiles = [...remote.filter(profile => profile.id !== current.id), current];
+  await db.replaceAllDeviceProfiles(profiles);
+
+  const beforeState = before
+    .map(profile => `${profile.id}:${profile.name}:${profile.updatedAt}`)
+    .sort()
+    .join('|');
+  const afterState = profiles
+    .map(profile => `${profile.id}:${profile.name}:${profile.updatedAt}`)
+    .sort()
+    .join('|');
+  if (beforeState !== afterState) {
+    emit({ type: 'feed-updated' });
+    postBroadcast({ type: 'sync-complete' });
+  }
+  return snapshot.cTag;
+}
 
 /**
  * Run a sync pass: drain the outbox, then delta the drops folder into IDB.
  * Serialized and rate-floored; safe to call from every trigger.
  */
-export async function requestSync(opts: { force?: boolean } = {}): Promise<void> {
-  if (syncing) return;
+export function requestSync(opts: { force?: boolean } = {}): Promise<void> {
+  if (syncPromise) {
+    if (opts.force) syncAgain = true;
+    return syncPromise;
+  }
   const now = Date.now();
-  if (!opts.force && now - lastSyncAt < SYNC_FLOOR_MS) return;
+  if (!opts.force && now - lastSyncAt < SYNC_FLOOR_MS) return Promise.resolve();
+  syncPromise = runSync();
+  return syncPromise;
+}
+
+async function runSync(): Promise<void> {
   syncing = true;
-  lastSyncAt = now;
-  emit({ type: 'sync-start' });
-
   try {
-    await drainOutbox();
+    do {
+      syncAgain = false;
+      lastSyncAt = Date.now();
+      emit({ type: 'sync-start' });
 
-    const result = await graph.runDelta();
+      try {
+        let deviceCTag: string | undefined;
+        try {
+          deviceCTag = await syncDeviceProfiles();
+        } catch (err) {
+          console.warn('[Sync] Device profile sync failed; continuing with drops:', err);
+        }
+        await drainOutbox();
 
-    if (result.fullResync) {
-      // Reconcile: the delta pass IS the complete server state. Drop local
-      // records absent from it (except outbox pendings, which overlay anyway).
-      const records = result.upserts;
-      await db.replaceAllDrops(records);
-    } else {
-      for (const record of result.upserts) await db.putDrop(record);
-      for (const id of result.removals) {
-        await db.deleteDrop(id);
-        await db.deleteThumb(id).catch(() => {});
-        await db.deleteCachedBlob(id).catch(() => {});
+        const result = await graph.runDelta();
+
+        if (result.fullResync) {
+          // Reconcile: the delta pass IS the complete server state. Drop local
+          // records absent from it (except outbox pendings, which overlay anyway).
+          const records = result.upserts;
+          await db.replaceAllDrops(records);
+        } else {
+          for (const record of result.upserts) await db.putDrop(record);
+          for (const id of result.removals) {
+            await db.deleteDrop(id);
+            await db.deleteThumb(id).catch(() => {});
+            await db.deleteCachedBlob(id).catch(() => {});
+          }
+        }
+
+        await graph.markFeedClean();
+        if (deviceCTag) await graph.markDeviceRegistryClean(deviceCTag);
+
+        if (result.upserts.length || result.removals.length || result.fullResync) {
+          emit({ type: 'feed-updated' });
+          postBroadcast({ type: 'sync-complete' });
+        }
+        emit({ type: 'sync-complete' });
+      } catch (err) {
+        console.warn('[Sync] Sync pass failed:', err);
+        emit({ type: 'sync-error', error: err });
       }
-    }
-
-    await graph.markFeedClean();
-
-    if (result.upserts.length || result.removals.length || result.fullResync) {
-      emit({ type: 'feed-updated' });
-      postBroadcast({ type: 'sync-complete' });
-    }
-    emit({ type: 'sync-complete' });
-  } catch (err) {
-    console.warn('[Sync] Sync pass failed:', err);
-    emit({ type: 'sync-error', error: err });
+    } while (syncAgain);
   } finally {
     syncing = false;
+    syncPromise = null;
   }
 }
 
@@ -270,11 +357,16 @@ export async function pollTick(): Promise<void> {
   if (syncing) return;
   try {
     const outbox = await db.getOutbox();
-    if (outbox.some(r => r.state !== 'failed')) {
+    const pendingProfile = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
+    if (pendingProfile || outbox.some(r => r.state !== 'failed')) {
       await requestSync({ force: true });
       return;
     }
-    if (await graph.isFeedDirty()) {
+    const [feedDirty, devicesDirty] = await Promise.all([
+      graph.isFeedDirty(),
+      graph.isDeviceRegistryDirty(),
+    ]);
+    if (feedDirty || devicesDirty) {
       await requestSync({ force: true });
     }
   } catch (err) {

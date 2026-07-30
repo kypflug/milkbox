@@ -18,7 +18,7 @@ export default defineConfig({
         name: 'Milkbox',
         short_name: 'Milkbox',
         description: 'A chat with yourself. Drop text, links, and files; they land on every device.',
-        theme_color: '#faf8f4',
+        theme_color: '#e8e4dd',
         background_color: '#faf8f4',
         display: 'standalone',
         display_override: ['window-controls-overlay'],

@@ -4,6 +4,11 @@ import { formatBytes, formatTime } from '../utils/format';
 import { domainOf, faviconUrl } from '../services/link-meta';
 import { iconFile, iconLink, iconCopy, iconDownload, iconEdit, iconTrash, iconRetry, iconClose } from './icons';
 
+export interface DropCardPresentation {
+  side: 'sent' | 'received';
+  deviceLabel: string;
+}
+
 /** Linkify bare URLs inside already-escaped text. */
 function linkify(escaped: string): string {
   return escaped.replace(
@@ -12,10 +17,10 @@ function linkify(escaped: string): string {
   );
 }
 
-function metaLine(record: DropRecord): string {
+function metaLine(record: DropRecord, deviceLabel: string): string {
   const { meta, state } = record;
   const time = formatTime(meta.createdAt);
-  const device = escapeHtml(meta.device.name);
+  const device = escapeHtml(deviceLabel);
   const edited = meta.editedAt ? ' · EDITED' : '';
   const status =
     state === 'sending' ? ' · SENDING' : state === 'failed' ? ' · FAILED' : '';
@@ -98,13 +103,16 @@ function bodyFor(record: DropRecord): string {
 }
 
 /** One feed card. The container carries data-drop-id for event delegation. */
-export function renderDropCard(record: DropRecord): string {
+export function renderDropCard(
+  record: DropRecord,
+  presentation: DropCardPresentation,
+): string {
   const { meta, state } = record;
   const stateClass = state ? ` drop-card--${state}` : '';
   return `
-    <article class="drop-card drop-card--${meta.kind}${stateClass}" data-drop-id="${escapeHtml(meta.id)}">
+    <article class="drop-card drop-card--${meta.kind} drop-card--${presentation.side}${stateClass}" data-drop-id="${escapeHtml(meta.id)}">
       ${bodyFor(record)}
-      ${metaLine(record)}
+      ${metaLine(record, presentation.deviceLabel)}
       ${actionsRow(record)}
     </article>
   `;

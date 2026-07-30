@@ -1,9 +1,11 @@
 import { getUserDisplayName, getUserEmail, signOut } from '../services/auth';
-import { getDeviceName, setDeviceName } from '../services/device';
+import { getDeviceName } from '../services/device';
 import { getTheme, applyTheme } from '../theme';
 import { clearAllData } from '../services/db';
 import { escapeHtml } from '../utils/storage';
 import { showToast } from '../components/toast';
+import { iconClose } from '../components/icons';
+import { renameCurrentDevice } from '../services/sync-coordinator';
 import type { Theme } from '../types';
 
 export function renderSettings(app: HTMLElement): void {
@@ -12,8 +14,8 @@ export function renderSettings(app: HTMLElement): void {
     <div class="settings-screen">
       <div class="boot-titlebar" aria-hidden="true"></div>
       <header class="settings-header">
-        <a class="settings-back" href="#" aria-label="Back to feed">← Feed</a>
         <h1 class="settings-title">Settings</h1>
+        <a class="settings-close" href="#" title="Close" aria-label="Close settings">${iconClose('1.2em')}</a>
       </header>
       <div class="settings-body">
         <section class="settings-section">
@@ -66,8 +68,9 @@ export function renderSettings(app: HTMLElement): void {
   });
 
   const deviceInput = document.getElementById('deviceNameInput') as HTMLInputElement;
-  deviceInput.addEventListener('change', () => {
-    setDeviceName(deviceInput.value);
+  deviceInput.addEventListener('change', async () => {
+    await renameCurrentDevice(deviceInput.value);
+    deviceInput.value = getDeviceName();
     showToast('Device name saved');
   });
 

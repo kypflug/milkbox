@@ -2,6 +2,7 @@ import type { Theme } from './types';
 import { safeGetItem, safeSetItem } from './utils/storage';
 
 const THEME_KEY = 'milkbox:theme';
+const PANE_QUERY = '(min-height: 600px) and (min-width: 800px)';
 
 export function getTheme(): Theme {
   const t = safeGetItem(THEME_KEY);
@@ -26,18 +27,18 @@ export function applyTheme(theme?: Theme): void {
 
   if (theme) safeSetItem(THEME_KEY, theme);
 
-  // Keep the browser chrome in step with --surface.
-  const colors: Record<string, string> = {
-    light: '#faf8f4',
-    dark: '#1c1b23',
-  };
+  updateChromeColor();
+}
+
+function updateChromeColor(): void {
   const metaEl = document.querySelector('meta[name="theme-color"]');
-  if (metaEl) {
-    metaEl.setAttribute('content', colors[resolved] || colors.light);
-  }
+  if (!metaEl) return;
+  metaEl.setAttribute('content', getComputedStyle(document.body).backgroundColor);
 }
 
 // Follow system theme changes when set to 'system'
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if (getTheme() === 'system') applyTheme();
 });
+
+matchMedia(PANE_QUERY).addEventListener('change', updateChromeColor);

@@ -161,8 +161,7 @@ body {
  * Window-controls-overlay installs: everything that reads as backdrop —
  * the desk behind the floating pane, the sign-in porch — doubles as the
  * window drag region. The panes themselves opt back out so the app stays
- * interactive; edge-to-edge mode keeps its dedicated titlebar strip
- * (.feed-titlebar / .boot-titlebar) as the drag handle instead.
+ * interactive; the feed header and boot titlebar opt into dragging directly.
  * app-region doesn't inherit, so each backdrop element is tagged.
  */
 @media (display-mode: window-controls-overlay) {
@@ -179,6 +178,26 @@ body {
     -webkit-app-region: no-drag;
     app-region: no-drag;
   }
+  .feed-header-row {
+    position: fixed;
+    top: env(titlebar-area-y, 0px);
+    left: env(titlebar-area-x, 0px);
+    width: env(titlebar-area-width, 100%);
+    height: env(titlebar-area-height, 0px);
+    min-height: env(titlebar-area-height, 0px);
+    padding: 0 12px;
+    z-index: 40;
+    -webkit-app-region: drag;
+    app-region: drag;
+  }
+  .feed-settings {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+  .feed-header {
+    height: env(titlebar-area-height, 0px);
+    background: transparent;
+  }
 }
 
 /*
@@ -186,7 +205,7 @@ body {
  * than a full-height sheet — a milkbox sitting on the porch, not wallpaper.
  * The pane keeps --ground inside; the page behind steps down to --desk.
  */
-@media (min-height: 900px) and (min-width: 768px) {
+@media (min-height: 600px) and (min-width: 800px) {
   body { background: var(--desk); }
   .feed-screen,
   .settings-screen {
@@ -199,6 +218,10 @@ body {
     box-shadow: var(--shadow-sheet), var(--card-highlight);
     overflow: hidden;
   }
+}
+
+@media (display-mode: window-controls-overlay) and (min-height: 600px) and (min-width: 800px) {
+  .feed-header { height: 0; }
 }
 
 a { color: var(--accent); }
