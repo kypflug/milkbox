@@ -42,9 +42,60 @@ its client ID goes in `src/services/auth-config.ts`.
 ## Deployment
 
 Production is built by [`kypflug/stuntcamp`](https://github.com/kypflug/stuntcamp)
-from a pinned Milkbox commit. After merging a release, update the `build.ref` in
-`registry/apps/milkbox.json` through a stuntcamp pull request. Pinning keeps the
-published source explicit and reproducible.
+from a pinned Milkbox commit, so nothing ships until that pin moves.
+
+1. Merge the release here and take the **full** commit SHA of `main`.
+2. If the release changed the look, regenerate the brand assets first — see
+   below. They are committed, not built, so they do not follow automatically.
+3. Open a stuntcamp pull request updating `registry/apps/milkbox.json`:
+   - `build.ref` — the full SHA. Not a branch or short SHA; pinning keeps the
+     published source explicit and reproducible.
+   - `accent` — the light-theme `--accent`, if the palette moved.
+   - `thumbnail` — the refreshed hub card, if the look changed.
+4. stuntcamp's `validate` workflow clones and builds the pinned ref. Merging
+   `main` there deploys.
+
+### Regenerating brand assets
+
+```bash
+npm run img:generate   # app icons + favicon-32, from art/icon-master.svg
+```
+
+The two captures come from `art/social-card.html`, which reads `?theme=dark`
+and `?size=og`. Any headless Chromium works. Load it over `file://` so its
+relative font paths resolve. The sizes matter — they are declared in metadata
+and in the hub's responsive ladder:
+
+| Output | Query | Viewport | Result |
+| --- | --- | --- | --- |
+| `public/og.png` | `?size=og` | 1200x630 @2x | 2400x1260, matching `og:image:width`/`height` in `index.html` |
+| hub card, light | *(none)* | 1280x800 @2x | 2560x1600 |
+| hub card, dark | `?theme=dark` | 1280x800 @2x | 2560x1600 |
+
+The hub card is a **curated override**, pinned by `thumbnail` in the registry,
+and must be refreshed in the deployment pull request. stuntcamp's post-deploy
+autocapture cannot stand in for it: that job screenshots the live site signed
+out, so it only ever reaches the sign-in screen.
+
+### Colours live in more than one place
+
+`src/styles/global.css` is the source of truth. These copies are not built
+from it and drift silently, so a palette change has to update all of them:
+
+- `index.html` — `<meta name="theme-color">` and the pre-CSS theme stamp
+  (`full` = `--ground`, `pane` = `--desk`, per theme)
+- `vite.config.ts` — manifest `theme_color` (`--ground`) and
+  `background_color` (`--surface`)
+- `src/styles/feed.css` — the lightbox scrim and caption, which stay dark in
+  both themes
+- `art/icon-master.svg`, `art/social-card.html` — inlined so they render
+  standalone
+- `scripts/generate-images.ts` — the icon background
+- stuntcamp's `registry/apps/milkbox.json` — `accent`
+
+Ink and accent steps are held to WCAG 4.5:1 against `--surface`,
+`--surface-sunk`, `--ground`, and `--accent-soft` in both themes; recompute
+the ratios noted in `global.css` rather than carrying them over.
 
 ## Contributing and security
 
