@@ -16,7 +16,7 @@
   "devDependencies": {
     "@fontsource-variable/schibsted-grotesk": "^5.2.0",
     "@fontsource/commit-mono": "^5.2.0",
-    "@types/node": "^25.2.2",
+    "@types/node": "^26.1.2",
     "sharp": "^0.35.3",
     "tsx": "^4.19.0",
     "typescript": "^7.0.2",
