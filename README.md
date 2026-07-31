@@ -23,6 +23,14 @@ built as an installable PWA. Live at [milkbox.stuntcamp.app](https://milkbox.stu
   rewriting drops. Folder-cTag checks keep steady-state polling small.
 - **Offline-first.** The feed renders from IndexedDB instantly; sends queue
   in a persistent outbox that survives reloads and drains on reconnect.
+- **Notifications without a server.** Opt in from Settings and a
+  backgrounded Milkbox announces drops from your other devices. That is
+  polling, not Web Push: a push needs an application server holding a VAPID
+  key, and the page cannot stand in for one — Google, Apple and Microsoft
+  all answer a cross-origin preflight to their push endpoints with no CORS
+  headers, so a browser can't POST to one. The service worker raises the
+  notification, because only it can see every window at once and keep quiet
+  when one is focused.
 - **Installable PWA** with Web Share Target support — share text, links, or
   photos into Milkbox from any app's share sheet.
 

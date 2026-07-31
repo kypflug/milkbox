@@ -14,6 +14,7 @@ import * as coordinator from '../services/sync-coordinator';
 import * as db from '../services/db';
 import { fetchThumbnail, downloadDropFile } from '../services/graph';
 import { onBroadcast } from '../services/broadcast';
+import { isNotifyEnabled } from '../services/notify';
 import { renderDropCard } from '../components/drop-card';
 import { renderDayDivider } from '../components/day-divider';
 import { mountComposer, type ComposerApi } from '../components/composer';
@@ -473,9 +474,14 @@ export async function renderFeed(
   teardownFns.push(offBroadcast);
 
   // Poll while visible — gated by the folder cTag check, so the steady-state
-  // cost is one tiny GET per tick.
+  // cost is one tiny GET per tick. With notifications on we keep ticking
+  // while hidden too, since that poll is the only thing that can spot an
+  // arrival to announce; browsers clamp hidden-tab timers to about a minute,
+  // which is the gentler cadence we want there anyway.
   const poll = setInterval(() => {
-    if (document.visibilityState === 'visible') void coordinator.pollTick();
+    if (document.visibilityState === 'visible' || isNotifyEnabled()) {
+      void coordinator.pollTick();
+    }
   }, 45_000);
   teardownFns.push(() => clearInterval(poll));
 
