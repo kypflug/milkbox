@@ -306,7 +306,7 @@ async function collectArrivals(upserts: DropRecord[]): Promise<DropMeta[]> {
   const candidates = upserts.filter(record => record.meta.device.id !== deviceId);
   if (!candidates.length) return [];
 
-  const known = new Set((await db.getAllDrops()).map(record => record.meta.id));
+  const known = new Set(await db.getAllDropIds());
   return candidates
     .filter(record => !known.has(record.meta.id))
     .map(record => record.meta)

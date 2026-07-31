@@ -35,7 +35,17 @@ interface NotifyItem {
 
 type SwMessage =
   | { type: 'SKIP_WAITING' }
-  | { type: 'MILKBOX_NOTIFY'; items: NotifyItem[] };
+  | { type: 'MILKBOX_NOTIFY'; items: unknown };
+
+/**
+ * A tab left running on an older build can post a shape we no longer expect,
+ * so nothing off the message port is trusted past this check.
+ */
+function isNotifyItem(value: unknown): value is NotifyItem {
+  if (typeof value !== 'object' || value === null) return false;
+  const { id, title, body } = value as Record<string, unknown>;
+  return typeof id === 'string' && typeof title === 'string' && typeof body === 'string';
+}
 
 self.addEventListener('message', event => {
   const data = event.data as SwMessage | undefined;
@@ -79,18 +89,28 @@ registerRoute(
  * worker activated is still same-origin and on screen but not controlled by
  * it, and would otherwise be invisible to the focus check.
  */
-async function announce(items: NotifyItem[]): Promise<void> {
+async function announce(items: readonly unknown[]): Promise<void> {
+  const valid = items.filter(isNotifyItem);
+  if (!valid.length) return;
+
   const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
   if (windows.some(client => client.visibilityState === 'visible' && client.focused)) return;
 
-  for (const item of items) {
-    await self.registration.showNotification(item.title, {
-      body: item.body,
-      tag: `milkbox-drop-${item.id}`,
-      icon: '/icons/icon-192.png',
-      badge: '/icons/icon-48.png',
-      data: { dropId: item.id },
-    });
+  for (const item of valid) {
+    try {
+      await self.registration.showNotification(item.title, {
+        body: item.body,
+        tag: `milkbox-drop-${item.id}`,
+        icon: '/icons/icon-192.png',
+        badge: '/icons/icon-48.png',
+        data: { dropId: item.id },
+      });
+    } catch (err) {
+      // Permission can be revoked while this worker is still alive. Announcing
+      // is never load-bearing, so warn and keep going rather than rejecting
+      // waitUntil and losing the rest of the batch.
+      console.warn('[SW] Notification failed for %s:', item.id, err);
+    }
   }
 }
 
