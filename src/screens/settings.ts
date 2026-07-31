@@ -6,7 +6,23 @@ import { escapeHtml } from '../utils/storage';
 import { showToast } from '../components/toast';
 import { iconClose } from '../components/icons';
 import { renameCurrentDevice } from '../services/sync-coordinator';
+import {
+  isNotifySupported,
+  isNotifyEnabled,
+  getNotifyPermission,
+  setNotifyEnabled,
+  requestNotifyPermission,
+} from '../services/notify';
 import type { Theme } from '../types';
+
+const NOTIFY_HINT =
+  'Announce drops from your other devices while Milkbox is in the background.';
+const NOTIFY_BLOCKED_HINT =
+  'Blocked for this site. Allow notifications in your browser settings to turn these on.';
+
+function notifyHint(): string {
+  return getNotifyPermission() === 'denied' ? NOTIFY_BLOCKED_HINT : NOTIFY_HINT;
+}
 
 export interface SettingsFlyoutApi {
   open(): void;
@@ -21,6 +37,7 @@ export function mountSettingsFlyout(
   titleRegion: HTMLElement,
 ): SettingsFlyoutApi {
   const themes: Theme[] = ['system', 'light', 'dark'];
+  const notifyOn = isNotifyEnabled();
   container.innerHTML = `
     <section class="settings-flyout" id="settingsFlyout" role="dialog"
              aria-labelledby="settingsTitle" hidden>
@@ -44,6 +61,22 @@ export function mountSettingsFlyout(
           <input class="settings-input" type="text" maxlength="40"
                  value="${escapeHtml(getDeviceName())}" aria-label="Device name">
         </section>
+
+        ${
+          isNotifySupported()
+            ? `
+        <section class="settings-section">
+          <h3 class="settings-label">Notifications</h3>
+          <p class="settings-hint" data-notify-hint>${escapeHtml(notifyHint())}</p>
+          <div class="settings-segment" role="radiogroup" aria-label="Notifications">
+            <button class="settings-segment-option${notifyOn ? '' : ' selected'}"
+                    role="radio" aria-checked="${!notifyOn}" data-notify-option="off">Off</button>
+            <button class="settings-segment-option${notifyOn ? ' selected' : ''}"
+                    role="radio" aria-checked="${notifyOn}" data-notify-option="on">On</button>
+          </div>
+        </section>`
+            : ''
+        }
 
         <section class="settings-section">
           <h3 class="settings-label">Theme</h3>
@@ -184,6 +217,42 @@ export function mountSettingsFlyout(
     deviceInput.value = getDeviceName();
     showToast('Device name saved');
   });
+
+  const notifyHintEl = panel.querySelector<HTMLElement>('[data-notify-hint]');
+  const notifyOptions = [...panel.querySelectorAll<HTMLButtonElement>('[data-notify-option]')];
+
+  function paintNotifyState(): void {
+    const on = isNotifyEnabled();
+    for (const option of notifyOptions) {
+      const selected = (option.dataset.notifyOption === 'on') === on;
+      option.classList.toggle('selected', selected);
+      option.setAttribute('aria-checked', String(selected));
+    }
+    if (notifyHintEl) notifyHintEl.textContent = notifyHint();
+    positionPanel();
+  }
+
+  for (const option of notifyOptions) {
+    option.addEventListener('click', async () => {
+      const wantOn = option.dataset.notifyOption === 'on';
+      if (wantOn) {
+        // Has to happen in the click handler itself — Safari and Firefox
+        // discard a permission request made outside a user gesture.
+        const permission = await requestNotifyPermission();
+        if (permission !== 'granted') {
+          showToast(
+            permission === 'denied'
+              ? 'Notifications are blocked for this site'
+              : 'Notifications need permission',
+          );
+          paintNotifyState();
+          return;
+        }
+      }
+      setNotifyEnabled(wantOn);
+      paintNotifyState();
+    });
+  }
 
   panel.querySelectorAll<HTMLButtonElement>('[data-theme-option]').forEach(btn => {
     btn.addEventListener('click', () => {

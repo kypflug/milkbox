@@ -13,6 +13,7 @@ import type { DeviceProfile, DropMeta, DropRecord, OutboxRecord } from '../types
 import * as db from './db';
 import * as graph from './graph';
 import * as device from './device';
+import * as notify from './notify';
 import { postBroadcast } from './broadcast';
 
 export type CoordinatorEvent =
@@ -26,6 +27,8 @@ type Handler = (event: CoordinatorEvent) => void;
 
 const handlers = new Set<Handler>();
 const PENDING_DEVICE_PROFILE_KEY = 'milkbox:pending-device-profile';
+/** Set once the first sync pass lands, so a fresh sign-in isn't announced. */
+const NOTIFY_PRIMED_KEY = 'milkbox:notify-primed';
 
 export function onCoordinatorEvent(handler: Handler): () => void {
   handlers.add(handler);
@@ -283,6 +286,55 @@ async function syncDeviceProfiles(): Promise<string | undefined> {
 }
 
 /**
+ * Pick out the upserts this device has never held before.
+ *
+ * Novelty is presence in IDB, not id order. ULIDs are minted when a drop is
+ * composed but only published when the author's outbox drains, so a drop
+ * queued offline — or one whose blob upload was slow, retried, or resumed —
+ * routinely surfaces with an id older than drops already seen. A high-water
+ * mark would skip those forever.
+ *
+ * Must be called before the pass writes upserts to IDB.
+ */
+async function collectArrivals(upserts: DropRecord[]): Promise<DropMeta[]> {
+  if (!upserts.length || !notify.isNotifyEnabled()) return [];
+
+  // Our own sends are already in IDB by the time the delta echoes them back,
+  // so presence would filter them anyway — but checking first usually skips
+  // the read entirely, since sending is what triggers the next pass.
+  const deviceId = device.getDeviceId();
+  const candidates = upserts.filter(record => record.meta.device.id !== deviceId);
+  if (!candidates.length) return [];
+
+  const known = new Set(await db.getAllDropIds());
+  return candidates
+    .filter(record => !known.has(record.meta.id))
+    .map(record => record.meta)
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
+}
+
+/**
+ * Announce drops that arrived from another device.
+ *
+ * The first completed pass on an install only primes: a fresh sign-in reads
+ * the entire existing feed as new, and announcing it would be a wall of
+ * notifications. Priming has to happen even when that pass found nothing,
+ * or the first drop the account ever receives would be mistaken for backlog.
+ */
+async function announceArrivals(arrivals: DropMeta[]): Promise<void> {
+  const primed = await db.getSetting<boolean>(NOTIFY_PRIMED_KEY);
+  if (!primed) {
+    await db.putSetting(NOTIFY_PRIMED_KEY, true);
+    return;
+  }
+  if (!arrivals.length) return;
+
+  const profiles = await db.getAllDeviceProfiles();
+  const names = new Map(profiles.map(profile => [profile.id, profile.name]));
+  await notify.announceDrops(arrivals, names);
+}
+
+/**
  * Run a sync pass: drain the outbox, then delta the drops folder into IDB.
  * Serialized and rate-floored; safe to call from every trigger.
  */
@@ -316,6 +368,10 @@ async function runSync(): Promise<void> {
 
         const result = await graph.runDelta();
 
+        // Snapshot novelty before the writes below land — afterwards every
+        // upsert is present in IDB and indistinguishable from one we held.
+        const arrivals = await collectArrivals(result.upserts);
+
         if (result.fullResync) {
           // Reconcile: the delta pass IS the complete server state. Drop local
           // records absent from it (except outbox pendings, which overlay anyway).
@@ -332,6 +388,12 @@ async function runSync(): Promise<void> {
 
         await graph.markFeedClean();
         if (deviceCTag) await graph.markDeviceRegistryClean(deviceCTag);
+
+        try {
+          await announceArrivals(arrivals);
+        } catch (err) {
+          console.warn('[Sync] Announcing arrivals failed; drops are synced:', err);
+        }
 
         if (result.upserts.length || result.removals.length || result.fullResync) {
           emit({ type: 'feed-updated' });

@@ -98,6 +98,11 @@ export function getDrop(id: string): Promise<DropRecord | undefined> {
   return tx('drops', 'readonly', s => s.get(id) as IDBRequest<DropRecord | undefined>);
 }
 
+/** Just the ids in the feed — a key-only read, so no record is deserialized. */
+export function getAllDropIds(): Promise<string[]> {
+  return tx('drops', 'readonly', s => s.getAllKeys() as IDBRequest<string[]>);
+}
+
 /** Replace the entire drops store (full re-delta reconcile). */
 export async function replaceAllDrops(records: DropRecord[]): Promise<void> {
   const db = await openDb();

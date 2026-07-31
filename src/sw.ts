@@ -11,6 +11,9 @@
  * Graph download URLs are pre-authenticated and short-lived, so URL-keyed
  * HTTP caching would never hit. The app caches bytes in IndexedDB keyed
  * by drop id instead.
+ *
+ * There is no push handler: with no server there is nothing to send a push,
+ * so backgrounded pages keep polling and ask us to raise the notification.
  */
 
 /// <reference lib="WebWorker" />
@@ -24,9 +27,35 @@ import { ExpirationPlugin } from 'workbox-expiration';
 precacheAndRoute(self.__WB_MANIFEST);
 cleanupOutdatedCaches();
 
+interface NotifyItem {
+  id: string;
+  title: string;
+  body: string;
+}
+
+type SwMessage =
+  | { type: 'SKIP_WAITING' }
+  | { type: 'MILKBOX_NOTIFY'; items: unknown };
+
+/**
+ * A tab left running on an older build can post a shape we no longer expect,
+ * so nothing off the message port is trusted past this check.
+ */
+function isNotifyItem(value: unknown): value is NotifyItem {
+  if (typeof value !== 'object' || value === null) return false;
+  const { id, title, body } = value as Record<string, unknown>;
+  return typeof id === 'string' && typeof title === 'string' && typeof body === 'string';
+}
+
 self.addEventListener('message', event => {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
+  const data = event.data as SwMessage | undefined;
+  if (!data?.type) return;
+  if (data.type === 'SKIP_WAITING') {
     self.skipWaiting();
+    return;
+  }
+  if (data.type === 'MILKBOX_NOTIFY' && Array.isArray(data.items)) {
+    event.waitUntil(announce(data.items));
   }
 });
 
@@ -44,6 +73,68 @@ registerRoute(
     ],
   }),
 );
+
+// ─── notifications ───
+
+/**
+ * Announce drops the page found while it was backgrounded.
+ *
+ * The page can't make this call itself: every open tab polls, so every open
+ * tab asks, and only the worker can see all of them at once. If any window
+ * is focused the user is already looking at the feed and we stay quiet;
+ * otherwise tagging by drop id collapses the duplicate asks into one
+ * notification per drop.
+ *
+ * includeUncontrolled matters: we never claim(), so a tab loaded before this
+ * worker activated is still same-origin and on screen but not controlled by
+ * it, and would otherwise be invisible to the focus check.
+ */
+async function announce(items: readonly unknown[]): Promise<void> {
+  const valid = items.filter(isNotifyItem);
+  if (!valid.length) return;
+
+  const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  if (windows.some(client => client.visibilityState === 'visible' && client.focused)) return;
+
+  for (const item of valid) {
+    try {
+      await self.registration.showNotification(item.title, {
+        body: item.body,
+        tag: `milkbox-drop-${item.id}`,
+        icon: '/icons/icon-192.png',
+        badge: '/icons/icon-48.png',
+        data: { dropId: item.id },
+      });
+    } catch (err) {
+      // Permission can be revoked while this worker is still alive. Announcing
+      // is never load-bearing, so warn and keep going rather than rejecting
+      // waitUntil and losing the rest of the batch.
+      console.warn('[SW] Notification failed for %s:', item.id, err);
+    }
+  }
+}
+
+self.addEventListener('notificationclick', event => {
+  event.notification.close();
+  event.waitUntil(
+    (async () => {
+      // Reuse an open window when there is one — matching the manifest's
+      // navigate-existing launch handler rather than piling up windows.
+      const windows = await self.clients.matchAll({
+        type: 'window',
+        includeUncontrolled: true,
+      });
+      const existing = windows.find(
+        client => new URL(client.url).origin === self.location.origin,
+      );
+      if (existing) {
+        await existing.focus();
+        return;
+      }
+      await self.clients.openWindow('/');
+    })(),
+  );
+});
 
 // ─── share target ───
 
