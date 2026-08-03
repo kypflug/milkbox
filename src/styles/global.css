@@ -174,9 +174,10 @@ body {
 /*
  * Window-controls-overlay installs: everything that reads as backdrop —
  * the desk behind the floating pane, the sign-in porch — doubles as the
- * window drag region. The panes themselves opt back out so the app stays
- * interactive; the feed header and boot titlebar opt into dragging directly.
- * app-region doesn't inherit, so each backdrop element is tagged.
+ * window drag region. Interactive surfaces opt back out so the app stays
+ * usable, but the feed pane itself must not be no-drag: Chromium treats that
+ * as an exclusion over the nested titlebar. app-region doesn't inherit, so
+ * each backdrop and interactive surface is tagged directly.
  */
 @media (display-mode: window-controls-overlay) {
   #app,
@@ -184,7 +185,6 @@ body {
     -webkit-app-region: drag;
     app-region: drag;
   }
-  .feed-screen,
   .sign-in-sheet,
   .toast,
   .lightbox {
@@ -229,6 +229,7 @@ body {
     -webkit-user-select: none;
     user-select: none;
   }
+  .feed-scroll,
   .composer-region,
   .settings-flyout {
     -webkit-app-region: no-drag;
