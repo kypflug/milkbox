@@ -172,25 +172,29 @@ body {
 }
 
 /*
- * Window-controls-overlay installs: everything that reads as backdrop —
- * the desk behind the floating pane, the sign-in porch — doubles as the
- * window drag region. Interactive surfaces opt back out so the app stays
- * usable, but the feed pane itself must not be no-drag: Chromium treats that
- * as an exclusion over the nested titlebar. app-region doesn't inherit, so
- * each backdrop and interactive surface is tagged directly.
+ * Keep window dragging on one empty overlay rather than composing nested
+ * drag/no-drag regions. Chrome 152 made window-drag explicitly inherit, so an
+ * isolated region avoids descendants and overlapping exclusions changing the
+ * result. The legacy declarations keep current Stable installs working.
  */
+.window-drag-region { display: none; }
+
 @media (display-mode: window-controls-overlay) {
-  #app,
-  .sign-in-screen {
+  .window-drag-region {
+    position: fixed;
+    top: env(titlebar-area-y, 0px);
+    left: 0;
+    width: 100%;
+    height: var(--wco-title-strip-height);
+    display: block;
+    z-index: 50;
     -webkit-app-region: drag;
     app-region: drag;
+    window-drag: move;
+    -webkit-user-select: none;
+    user-select: none;
   }
-  .sign-in-sheet,
-  .toast,
-  .lightbox {
-    -webkit-app-region: no-drag;
-    app-region: no-drag;
-  }
+
   /* The overlay rect stops where the window controls begin, so centring
    * inside it lands the wordmark off-window-centre — visibly left on Windows,
    * right on macOS. Span the whole window instead and centre there. The rails
@@ -214,26 +218,10 @@ body {
       minmax(var(--wco-controls-inset), 1fr);
     padding: 0 20px;
     z-index: 40;
-    -webkit-app-region: drag;
-    app-region: drag;
   }
-  /* app-region doesn't inherit, and selectable text swallows the gesture
-   * before a drag can start — grabbing the wordmark selects it instead of
-   * moving the window. Tag the strip's contents too and switch selection off.
-   * Neither changes how anything looks. Anything interactive added here must
-   * opt back out with no-drag, as the composer and flyout do below. */
-  .feed-header-row,
-  .feed-header-row * {
-    -webkit-app-region: drag;
-    app-region: drag;
+  .feed-header-row {
     -webkit-user-select: none;
     user-select: none;
-  }
-  .feed-scroll,
-  .composer-region,
-  .settings-flyout {
-    -webkit-app-region: no-drag;
-    app-region: no-drag;
   }
   .feed-header {
     height: var(--wco-title-strip-height);
