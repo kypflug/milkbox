@@ -218,8 +218,6 @@ body {
       minmax(var(--wco-controls-inset), 1fr);
     padding: 0 20px;
     z-index: 40;
-  }
-  .feed-header-row {
     -webkit-user-select: none;
     user-select: none;
   }
