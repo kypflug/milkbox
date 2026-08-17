@@ -11,16 +11,16 @@
     "img:generate": "tsx scripts/generate-images.ts"
   },
   "dependencies": {
-    "@azure/msal-browser": "^5.1.0"
+    "@azure/msal-browser": "^5.18.0"
   },
   "devDependencies": {
     "@fontsource-variable/schibsted-grotesk": "^5.2.0",
     "@fontsource/commit-mono": "^5.2.0",
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.2.0",
     "sharp": "^0.35.3",
-    "tsx": "^4.19.0",
+    "tsx": "^4.23.12",
     "typescript": "^7.0.2",
-    "vite": "^8.1.5",
+    "vite": "^8.2.1",
     "vite-plugin-pwa": "^1.2.0",
     "workbox-expiration": "^7.4.1",
     "workbox-precaching": "^7.4.1",
