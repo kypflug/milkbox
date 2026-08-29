@@ -28,6 +28,7 @@ import { renderDropCard, type DropCardPresentation } from '../components/drop-ca
 import { renderDayDivider } from '../components/day-divider';
 import { mountComposer, type ComposerApi } from '../components/composer';
 import { mountSettingsFlyout, type SettingsFlyoutApi } from './settings';
+import { startReconnectFlow } from '../services/chat-flows';
 import { showToast } from '../components/toast';
 import { iconBottle, iconClose } from '../components/icons';
 
@@ -41,6 +42,12 @@ let settingsFlyoutApi: SettingsFlyoutApi | null = null;
 const thumbUrls = new Map<string, string>();
 /** Drops whose delete is pending the undo window, keyed by `${scopeId}/${dropId}`. */
 const pendingDeletes = new Map<string, ReturnType<typeof setTimeout>>();
+/**
+ * An unconfirmed share-target payload. Scope switches re-mount the composer,
+ * so the payload is held here and re-applied — it follows the user to
+ * whichever chat they pick, until they send (or it goes stale).
+ */
+let pendingSharePayload: SharePayload | null = null;
 
 export function teardownScreenListeners(): void {
   for (const fn of teardownFns) fn();
@@ -61,6 +68,10 @@ export async function renderFeed(
   const title = isChat ? scope.name : 'Milkbox';
   const logLabel = isChat ? `Drops in ${scope.name}` : 'Your drops';
 
+  // A gone or paused chat renders read-only with a banner.
+  const chatRecord = isChat ? await db.getChat(scope.chatId) : undefined;
+  const chatState = chatRecord?.state ?? 'active';
+
   app.innerHTML = `
     <div class="feed-screen">
       <header class="feed-header">
@@ -69,6 +80,7 @@ export async function renderFeed(
           <span class="feed-wordmark">${escapeHtml(title)}</span>
         </div>
       </header>
+      <div class="chat-banner" id="chatBanner" hidden></div>
       <div class="feed-scroll" id="feedScroll">
         <div class="feed-sentinel" id="feedSentinel"></div>
         <div class="feed-list" id="feedList" role="log" aria-label="${escapeHtml(logLabel)}"></div>
@@ -305,6 +317,7 @@ export async function renderFeed(
   }
 
   async function send(text: string, files: File[]): Promise<void> {
+    pendingSharePayload = null; // whatever was shared has found its home
     const drops = buildDrops(text, files);
     try {
       for (const drop of drops) {
@@ -329,7 +342,36 @@ export async function renderFeed(
     (text, files) => void send(text, files),
     name => showToast(`"${name}" is over 250 MB — too big for the milkbox`, 'error'),
     () => coordinator.requestSync(scope, { force: true }),
+    { placeholder: isChat ? `Message ${scope.name}` : undefined },
   );
+
+  // Gone / paused chat: banner + composer greyed out. Read-only otherwise.
+  const banner = document.getElementById('chatBanner')!;
+  if (isChat && chatState !== 'active') {
+    banner.hidden = false;
+    if (chatState === 'gone') {
+      banner.innerHTML = `
+        <span class="chat-banner-text">You no longer have access to this chat. Showing what was last synced.</span>
+        <button class="chat-banner-action" data-banner="remove">Remove from list</button>`;
+      composerApi.setDisabled(true, 'No access');
+    } else {
+      banner.innerHTML = `
+        <span class="chat-banner-text">This chat is paused — Milkbox lost its OneDrive access.</span>
+        <button class="chat-banner-action" data-banner="reconnect">Reconnect</button>`;
+      composerApi.setDisabled(true, 'Paused');
+    }
+    banner.addEventListener('click', async e => {
+      const action = (e.target as HTMLElement).closest<HTMLElement>('[data-banner]')?.dataset.banner;
+      if (action === 'remove') {
+        await coordinator.removeChatLocally(scope.chatId);
+        history.replaceState(null, '', '/');
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      } else if (action === 'reconnect') {
+        startReconnectFlow(scope.chatId);
+      }
+    });
+  }
+
   const settingsTrigger = app.querySelector<HTMLButtonElement>('.composer-settings')!;
   settingsFlyoutApi = mountSettingsFlyout(
     app.querySelector<HTMLElement>('.settings-flyout-mount')!,
@@ -587,19 +629,30 @@ export async function renderFeed(
   document.addEventListener('visibilitychange', onVisible);
   teardownFns.push(() => document.removeEventListener('visibilitychange', onVisible));
 
+  // A share payload that arrived before this scope was picked follows the
+  // user across switches until they send it.
+  if (pendingSharePayload && chatState === 'active') {
+    fillComposerFromShare(pendingSharePayload);
+  }
+
   // ── first paint: IDB-first render, then network ──
 
   await refresh({ stick: true });
   void coordinator.requestSync(scope, { force: true });
 }
 
-/** Handle a share-target payload: pre-fill the composer, never auto-send. */
-export function applySharePayload(payload: SharePayload): void {
+function fillComposerFromShare(payload: SharePayload): void {
   if (!composerApi) return;
   const text = payload.url || payload.text || payload.title || '';
   if (text) composerApi.setText(text);
   if (payload.files.length) composerApi.addFiles(payload.files);
   composerApi.focus();
+}
+
+/** Handle a share-target payload: pre-fill the composer, never auto-send. */
+export function applySharePayload(payload: SharePayload): void {
+  pendingSharePayload = payload;
+  fillComposerFromShare(payload);
 }
 
 function sanitizeName(name: string): string {

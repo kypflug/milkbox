@@ -227,6 +227,17 @@ async function enterApp(app: HTMLElement): Promise<void> {
   void coordinator.ensureMe();
   void coordinator.hydrateChatRegistry();
 
+  // A notification tap on an already-open window arrives as a worker
+  // message — route to the scope it named.
+  navigator.serviceWorker?.addEventListener('message', e => {
+    const data = e.data as { type?: string; scopeId?: string } | undefined;
+    if (data?.type !== 'MILKBOX_OPEN_SCOPE' || typeof data.scopeId !== 'string') return;
+    const scopeId = data.scopeId;
+    if (scopeId === 'private' || /^chat:[0-9A-HJKMNP-TV-Z]{26}$/.test(scopeId)) {
+      selectScope(app, scopeId);
+    }
+  });
+
   if (import.meta.env.DEV) {
     const dev = await import('./dev/chat-dev');
     dev.installChatDevHarness();

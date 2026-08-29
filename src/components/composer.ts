@@ -7,7 +7,7 @@
  */
 
 import { iconAttach, iconSend, iconClose, iconFile, iconRefresh, iconSettings, iconChats } from './icons';
-import { escapeHtml } from '../utils/storage';
+import { escapeAttr, escapeHtml } from '../utils/storage';
 import { formatBytes } from '../utils/format';
 
 export interface ComposerApi {
@@ -17,6 +17,8 @@ export interface ComposerApi {
   addFiles(files: File[]): void;
   focus(): void;
   setSyncState(state: 'syncing' | 'synced' | 'error'): void;
+  /** Grey out sending (a gone chat) — refresh/settings/chats stay usable. */
+  setDisabled(disabled: boolean, placeholder?: string): void;
   teardown(): void;
 }
 
@@ -28,13 +30,14 @@ export function mountComposer(
   onSend: (text: string, files: File[]) => void,
   onOversize: (name: string) => void,
   onRefresh: () => Promise<void>,
+  opts: { placeholder?: string } = {},
 ): ComposerApi {
   container.innerHTML = `
     <div class="composer">
       <div class="composer-chips" hidden></div>
       <div class="composer-row">
         <button class="composer-attach" title="Attach files" aria-label="Attach files">${iconAttach('1.25em')}</button>
-        <textarea class="composer-input" rows="1" placeholder="Drop something…" aria-label="Message"></textarea>
+        <textarea class="composer-input" rows="1" placeholder="${escapeAttr(opts.placeholder || 'Drop something…')}" aria-label="Message"></textarea>
         <span class="composer-tools">
           <button class="composer-chats" title="Chats" aria-label="Chats"
                   aria-haspopup="dialog">${iconChats('1.15em')}</button>
@@ -207,6 +210,14 @@ export function mountComposer(
     addFiles,
     focus: () => inputEl.focus(),
     setSyncState,
+    setDisabled(disabled: boolean, placeholder?: string) {
+      inputEl.disabled = disabled;
+      sendBtn.disabled = disabled;
+      attachBtn.disabled = disabled;
+      inputEl.placeholder = disabled
+        ? (placeholder || 'No access')
+        : (opts.placeholder || 'Drop something…');
+    },
     teardown() {
       document.removeEventListener('paste', onPaste);
       window.removeEventListener('dragenter', onDragEnter);

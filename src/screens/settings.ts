@@ -97,8 +97,13 @@ export function mountSettingsFlyout(
         <section class="settings-section">
           <h3 class="settings-label">About</h3>
           <p class="settings-hint">
-            Drops are stored in your OneDrive under <span class="settings-mono">Apps/Milkbox</span>.
+            Your private drops are stored in your OneDrive under <span class="settings-mono">Apps/Milkbox</span>.
             Delete the folder there and everything is gone — this app keeps no other copy.
+          </p>
+          <p class="settings-hint">
+            Shared chats live in the chat host's OneDrive. OneDrive grants every member edit
+            access to the whole chat folder — Milkbox's own-drops-only rules are app-level
+            courtesy, not OneDrive enforcement.
           </p>
         </section>
       </div>
