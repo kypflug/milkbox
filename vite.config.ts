@@ -17,7 +17,7 @@ export default defineConfig({
       manifest: {
         name: 'Milkbox',
         short_name: 'Milkbox',
-        description: 'A chat with yourself. Drop text, links, and files; they land on every device.',
+        description: 'A chat with yourself — and shared chats with friends. Drop text, links, and files; they land on every device.',
         theme_color: '#e3e8ee',
         background_color: '#fafbfd',
         display: 'standalone',
