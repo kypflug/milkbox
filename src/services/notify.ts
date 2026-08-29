@@ -25,6 +25,9 @@ export interface NotifyItem {
   id: string;
   title: string;
   body: string;
+  /** Scope the drop landed in — lets a notification tap open the right chat.
+   *  Optional so old service workers (and old tabs) tolerate the shape. */
+  scopeId?: string;
 }
 
 /**
@@ -69,7 +72,7 @@ function truncate(text: string): string {
   return clean.length > BODY_LIMIT ? `${clean.slice(0, BODY_LIMIT - 1)}…` : clean;
 }
 
-function describeDrop(meta: DropMeta): string {
+export function describeDrop(meta: DropMeta): string {
   switch (meta.kind) {
     case 'link':
       return truncate(meta.link?.title || meta.url || 'Link');
@@ -92,22 +95,32 @@ export async function announceDrops(
   metas: DropMeta[],
   deviceNames: Map<string, string>,
 ): Promise<void> {
-  if (!metas.length || !isNotifyEnabled()) return;
+  await announceItems(metas.map(meta => ({
+    id: meta.id,
+    title: (meta.device.id && deviceNames.get(meta.device.id)) || meta.device.name,
+    body: describeDrop(meta),
+  })));
+}
 
-  const newest = metas[metas.length - 1];
-  const items: NotifyItem[] =
-    metas.length > MAX_INDIVIDUAL
-      ? [{ id: newest.id, title: 'Milkbox', body: `${metas.length} new drops` }]
-      : metas.map(meta => ({
-          id: meta.id,
-          title: (meta.device.id && deviceNames.get(meta.device.id)) || meta.device.name,
-          body: describeDrop(meta),
-        }));
+/**
+ * Hand pre-built notification items to the worker, oldest first, collapsing
+ * a burst into a single count. Does nothing when notifications are off or no
+ * worker is registered yet (dev server, or a first load before registration
+ * settles) — announcing is never load-bearing, so it must not fail a sync pass.
+ */
+export async function announceItems(items: NotifyItem[]): Promise<void> {
+  if (!items.length || !isNotifyEnabled()) return;
+
+  const newest = items[items.length - 1];
+  const sent: NotifyItem[] =
+    items.length > MAX_INDIVIDUAL
+      ? [{ id: newest.id, title: 'Milkbox', body: `${items.length} new drops`, ...(newest.scopeId ? { scopeId: newest.scopeId } : {}) }]
+      : items;
 
   // getRegistration() rather than .ready: ready never settles when nothing
   // is registered, which would hang the caller awaiting this.
   const registration = await navigator.serviceWorker.getRegistration();
   const worker = registration?.active;
   if (!worker) return;
-  worker.postMessage({ type: 'MILKBOX_NOTIFY', items });
+  worker.postMessage({ type: 'MILKBOX_NOTIFY', items: sent });
 }

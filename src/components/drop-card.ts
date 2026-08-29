@@ -6,7 +6,12 @@ import { iconFile, iconLink, iconCopy, iconDownload, iconEdit, iconTrash, iconRe
 
 export interface DropCardPresentation {
   side: 'sent' | 'received';
-  deviceLabel: string;
+  /** Meta-line label: device label (private feed) or author name (chat). */
+  attributionLabel: string;
+  /** Own text drop, not pending. */
+  canEdit: boolean;
+  /** Own drop — or the viewer hosts the chat (soft-enforced moderation). */
+  canDelete: boolean;
 }
 
 /** Linkify bare URLs inside already-escaped text. */
@@ -19,17 +24,17 @@ function linkify(escaped: string): string {
   );
 }
 
-function metaLine(record: DropRecord, deviceLabel: string): string {
+function metaLine(record: DropRecord, attributionLabel: string): string {
   const { meta, state } = record;
   const time = formatTime(meta.createdAt);
-  const device = escapeHtml(deviceLabel);
+  const label = escapeHtml(attributionLabel);
   const edited = meta.editedAt ? ' · EDITED' : '';
   const status =
     state === 'sending' ? ' · SENDING' : state === 'failed' ? ' · FAILED' : '';
-  return `<div class="drop-meta">${time} · ${device}${edited}${status}</div>`;
+  return `<div class="drop-meta">${time} · ${label}${edited}${status}</div>`;
 }
 
-function actionsRow(record: DropRecord): string {
+function actionsRow(record: DropRecord, presentation: DropCardPresentation): string {
   const { meta, state } = record;
   if (state === 'failed') {
     return `
@@ -45,10 +50,13 @@ function actionsRow(record: DropRecord): string {
   if (meta.kind === 'file' || meta.kind === 'image') {
     buttons.push(`<button class="drop-action" data-action="download" title="Download">${iconDownload()}</button>`);
   }
-  if (meta.kind === 'text' && !state) {
+  if (presentation.canEdit && meta.kind === 'text' && !state) {
     buttons.push(`<button class="drop-action" data-action="edit" title="Edit">${iconEdit()}</button>`);
   }
-  buttons.push(`<button class="drop-action drop-action-danger" data-action="delete" title="Delete">${iconTrash()}</button>`);
+  if (presentation.canDelete) {
+    buttons.push(`<button class="drop-action drop-action-danger" data-action="delete" title="Delete">${iconTrash()}</button>`);
+  }
+  if (!buttons.length) return '';
   return `<div class="drop-actions" role="toolbar" aria-label="Drop actions">${buttons.join('')}</div>`;
 }
 
@@ -117,8 +125,8 @@ export function renderDropCard(
   return `
     <article class="drop-card drop-card--${meta.kind} drop-card--${presentation.side}${stateClass}" data-drop-id="${escapeAttr(meta.id)}">
       ${bodyFor(record)}
-      ${metaLine(record, presentation.deviceLabel)}
-      ${actionsRow(record)}
+      ${metaLine(record, presentation.attributionLabel)}
+      ${actionsRow(record, presentation)}
     </article>
   `;
 }
