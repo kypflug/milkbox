@@ -9,7 +9,7 @@
  * - Event pub/sub — the UI subscribes; this module never touches the DOM
  */
 
-import type { DeviceProfile, DropMeta, DropRecord, OutboxRecord } from '../types';
+import { PRIVATE_SCOPE, type DeviceProfile, type DropMeta, type DropRecord, type OutboxRecord } from '../types';
 import * as db from './db';
 import * as graph from './graph';
 import * as device from './device';
@@ -209,8 +209,8 @@ async function processOutboxRecord(record: OutboxRecord): Promise<void> {
 
 async function performOp(record: OutboxRecord): Promise<void> {
   if (record.op === 'delete') {
-    await graph.deleteDropJson(record.id);
-    if (record.meta.file) await graph.deleteDropFiles(record.id);
+    await graph.deleteDropJson(PRIVATE_SCOPE, record.id);
+    if (record.meta.file) await graph.deleteDropFiles(PRIVATE_SCOPE, record.id);
     await db.deleteDrop(record.id);
     await db.deleteThumb(record.id).catch(() => {});
     await db.deleteCachedBlob(record.id).catch(() => {});
@@ -221,7 +221,7 @@ async function performOp(record: OutboxRecord): Promise<void> {
 
   if (record.op === 'create' && meta.file && record.blob) {
     // Blob first, then JSON — other devices never see a dangling reference
-    const uploaded = await graph.uploadDropFile(meta, record.blob, {
+    const uploaded = await graph.uploadDropFile(PRIVATE_SCOPE, meta, record.blob, {
       existingSessionUrl: record.uploadUrl,
       onSessionCreated: uploadUrl => {
         // Persist so a reloaded tab resumes instead of restarting
@@ -233,7 +233,7 @@ async function performOp(record: OutboxRecord): Promise<void> {
   }
 
   const existing = record.op === 'edit' ? await db.getDrop(meta.id) : undefined;
-  const eTag = await graph.putDropJson(meta, existing?.eTag);
+  const eTag = await graph.putDropJson(PRIVATE_SCOPE, meta, existing?.eTag);
   await db.putDrop({ meta, eTag });
 
   // Cache the local payload as the image blob so the sender gets an
@@ -366,7 +366,7 @@ async function runSync(): Promise<void> {
         }
         await drainOutbox();
 
-        const result = await graph.runDelta();
+        const result = await graph.runDelta(PRIVATE_SCOPE);
 
         // Snapshot novelty before the writes below land — afterwards every
         // upsert is present in IDB and indistinguishable from one we held.
@@ -386,7 +386,7 @@ async function runSync(): Promise<void> {
           }
         }
 
-        await graph.markFeedClean();
+        await graph.markFeedClean(PRIVATE_SCOPE);
         if (deviceCTag) await graph.markDeviceRegistryClean(deviceCTag);
 
         try {
@@ -425,7 +425,7 @@ export async function pollTick(): Promise<void> {
       return;
     }
     const [feedDirty, devicesDirty] = await Promise.all([
-      graph.isFeedDirty(),
+      graph.isFeedDirty(PRIVATE_SCOPE),
       graph.isDeviceRegistryDirty(),
     ]);
     if (feedDirty || devicesDirty) {

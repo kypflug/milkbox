@@ -9,7 +9,7 @@
  * a sync pass.
  */
 
-import type { AuthorAttribution, DropKind, DropMeta } from '../types';
+import type { AuthorAttribution, ChatDescriptor, ChatMember, DropKind, DropMeta, JoinedChatPointer } from '../types';
 
 /** Crockford base32 ULID — first char caps the 48-bit timestamp. */
 const ULID_RE = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
@@ -48,6 +48,46 @@ function author(value: unknown): AuthorAttribution | null {
   const name = str(raw.name, MAX_LABEL);
   if (!id || !name) return null;
   return { id, name };
+}
+
+/** Validate a chat.json body fetched from a (possibly foreign) drive. */
+export function validateChatDescriptor(raw: unknown): ChatDescriptor | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const body = raw as Record<string, unknown>;
+  if (body.v !== 1 || !isValidUlid(body.id)) return null;
+  const name = str(body.name, MAX_LABEL);
+  const createdAt = finiteNum(body.createdAt);
+  const host = author(body.host);
+  if (!name || createdAt === null || !host) return null;
+  return { v: 1, id: body.id, name, createdAt, host };
+}
+
+/** Validate a members/<id>.json body — written by other members' clients. */
+export function validateChatMember(raw: unknown): ChatMember | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const body = raw as Record<string, unknown>;
+  if (body.v !== 1) return null;
+  const id = str(body.id, MAX_ID);
+  const name = str(body.name, MAX_LABEL);
+  const joinedAt = finiteNum(body.joinedAt);
+  const updatedAt = finiteNum(body.updatedAt);
+  if (!id || !name || joinedAt === null || updatedAt === null) return null;
+  return { v: 1, id, name, joinedAt, updatedAt };
+}
+
+/** Validate a chats-joined/<id>.json roaming pointer from our own approot. */
+export function validateJoinedPointer(raw: unknown): JoinedChatPointer | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const body = raw as Record<string, unknown>;
+  if (body.v !== 1 || !isValidUlid(body.chatId)) return null;
+  const name = str(body.name, MAX_LABEL);
+  const driveId = str(body.driveId, MAX_LABEL);
+  const itemId = str(body.itemId, 256);
+  const dropsItemId = str(body.dropsItemId, 256);
+  const host = author(body.host);
+  const joinedAt = finiteNum(body.joinedAt);
+  if (!name || !driveId || !itemId || !dropsItemId || !host || joinedAt === null) return null;
+  return { v: 1, chatId: body.chatId, name, driveId, itemId, dropsItemId, host, joinedAt };
 }
 
 export interface ValidateDropOptions {

@@ -11,17 +11,18 @@
  * item is a JSON we always download.
  */
 
-import { getAccessToken } from './auth';
+import { getAccessToken, type TokenTier } from './auth';
 import { getSetting, putSetting, deleteSetting } from './db';
 import { validateDropMeta } from './validate-drop';
-import type { DeviceProfile, DropMeta, DropRecord } from '../types';
+import { scopeIdOf, type DeviceProfile, type DropMeta, type DropRecord, type Scope } from '../types';
 
-const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
+export const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 const DROPS_FOLDER = 'drops';
 const DEVICES_FOLDER = 'devices';
-const DELTA_TOKEN_KEY = 'milkbox:delta-token';
-const FOLDER_CTAG_KEY = 'milkbox:drops-ctag';
 const DEVICES_CTAG_KEY = 'milkbox:devices-ctag';
+
+const deltaTokenKey = (scope: Scope) => `milkbox:delta-token:${scopeIdOf(scope)}`;
+const folderCtagKey = (scope: Scope) => `milkbox:ctag:${scopeIdOf(scope)}`;
 
 /** Simple PUT limit — Graph requires upload sessions above 4 MB. */
 export const SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024;
@@ -47,13 +48,13 @@ export function isThrottleError(err: unknown): boolean {
   return err instanceof GraphHttpError && (err.status === 429 || err.status === 503);
 }
 
-async function authHeaders(): Promise<Record<string, string>> {
-  const token = await getAccessToken();
+async function authHeaders(tier: TokenTier): Promise<Record<string, string>> {
+  const token = await getAccessToken(tier);
   return { Authorization: `Bearer ${token}` };
 }
 
-async function graphFetch(url: string, init?: RequestInit): Promise<Response> {
-  const headers = await authHeaders();
+export async function graphFetch(url: string, init?: RequestInit, tier: TokenTier = 'base'): Promise<Response> {
+  const headers = await authHeaders(tier);
   const res = await fetch(url, {
     ...init,
     headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
@@ -70,13 +71,42 @@ async function graphFetch(url: string, init?: RequestInit): Promise<Response> {
   return res;
 }
 
-function contentUrl(path: string): string {
-  return `${GRAPH_BASE}/me/drive/special/approot:/${path}:/content`;
+/**
+ * Where a scope's folder tree is addressed. The private feed lives in the
+ * signed-in user's own approot; a chat folder lives in the HOST's drive and
+ * is addressed by drive + item id (the only stable form for shared items).
+ * Both use the same relative paths (drops/…, files/…) below the root.
+ */
+export type DriveRef =
+  | { kind: 'approot' }
+  | { kind: 'item'; driveId: string; itemId: string };
+
+function scopeRef(scope: Scope): DriveRef {
+  return scope.kind === 'private'
+    ? { kind: 'approot' }
+    : { kind: 'item', driveId: scope.driveId, itemId: scope.itemId };
 }
 
-function itemByPathUrl(path: string): string {
-  return `${GRAPH_BASE}/me/drive/special/approot:/${path}`;
+/** Chat traffic crosses drives, which the app-folder scope cannot reach. */
+export function scopeTier(scope: Scope): TokenTier {
+  return scope.kind === 'private' ? 'base' : 'share';
 }
+
+function rootUrl(ref: DriveRef): string {
+  return ref.kind === 'approot'
+    ? `${GRAPH_BASE}/me/drive/special/approot`
+    : `${GRAPH_BASE}/drives/${ref.driveId}/items/${ref.itemId}`;
+}
+
+export function contentUrl(ref: DriveRef, path: string): string {
+  return `${rootUrl(ref)}:/${path}:/content`;
+}
+
+export function itemByPathUrl(ref: DriveRef, path: string): string {
+  return `${rootUrl(ref)}:/${path}`;
+}
+
+const APPROOT: DriveRef = { kind: 'approot' };
 
 const dropJsonPath = (id: string) => `${DROPS_FOLDER}/${id}.json`;
 const deviceJsonPath = (id: string) => `${DEVICES_FOLDER}/${id}.json`;
@@ -84,29 +114,47 @@ const deviceJsonPath = (id: string) => `${DEVICES_FOLDER}/${id}.json`;
 // ─── drop JSON CRUD ───
 
 /**
+ * Thrown when a chat-scope edit loses its conditional write — the drop was
+ * changed or removed by another member. Terminal: the caller must drop the
+ * queued edit, never retry (an unconditional retry would resurrect a drop
+ * the host moderated away).
+ */
+export class DropConflictError extends Error {
+  constructor(public dropId: string) {
+    super(`Drop ${dropId} was changed or removed`);
+  }
+}
+
+/**
  * Upload a drop's JSON. Path-based PUT auto-creates the drops/ folder (and
  * the approot itself) on first write. Pass eTag for a conditional write on
- * edits; on 412 the caller decides (we retry once unconditionally — the data
- * is single-user, conflicts are self-races, last write wins).
+ * edits. Conflict handling differs by scope:
+ * - private: retry once unconditionally — the data is single-user, conflicts
+ *   are self-races, last write wins;
+ * - chat: strictly conditional — 412/404 becomes DropConflictError so a
+ *   queued edit can never recreate a drop another member deleted.
  */
-export async function putDropJson(meta: DropMeta, eTag?: string): Promise<string | undefined> {
+export async function putDropJson(scope: Scope, meta: DropMeta, eTag?: string): Promise<string | undefined> {
+  const ref = scopeRef(scope);
+  const tier = scopeTier(scope);
   const body = JSON.stringify(meta, null, 2);
   const doPut = (conditional: boolean) =>
-    graphFetch(contentUrl(dropJsonPath(meta.id)), {
+    graphFetch(contentUrl(ref, dropJsonPath(meta.id)), {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
         ...(conditional && eTag ? { 'If-Match': eTag } : {}),
       },
       body,
-    });
+    }, tier);
 
   try {
     const res = await doPut(true);
     const item = await res.json();
     return item.eTag as string | undefined;
   } catch (err) {
-    if (err instanceof GraphHttpError && err.status === 412) {
+    if (err instanceof GraphHttpError && (err.status === 412 || (eTag !== undefined && err.status === 404))) {
+      if (scope.kind === 'chat') throw new DropConflictError(meta.id);
       console.debug('[Graph] eTag conflict on %s — retrying last-write-wins', meta.id);
       const res = await doPut(false);
       const item = await res.json();
@@ -117,9 +165,9 @@ export async function putDropJson(meta: DropMeta, eTag?: string): Promise<string
 }
 
 /** Delete a drop's JSON. 404 = already gone = success. */
-export async function deleteDropJson(id: string): Promise<void> {
+export async function deleteDropJson(scope: Scope, id: string): Promise<void> {
   try {
-    await graphFetch(itemByPathUrl(dropJsonPath(id)), { method: 'DELETE' });
+    await graphFetch(itemByPathUrl(scopeRef(scope), dropJsonPath(id)), { method: 'DELETE' }, scopeTier(scope));
   } catch (err) {
     if (isGoneError(err)) return;
     throw err;
@@ -127,9 +175,9 @@ export async function deleteDropJson(id: string): Promise<void> {
 }
 
 /** Delete a drop's files/<id> folder (file/image drops). 404 = success. */
-export async function deleteDropFiles(id: string): Promise<void> {
+export async function deleteDropFiles(scope: Scope, id: string): Promise<void> {
   try {
-    await graphFetch(itemByPathUrl(`files/${id}`), { method: 'DELETE' });
+    await graphFetch(itemByPathUrl(scopeRef(scope), `files/${id}`), { method: 'DELETE' }, scopeTier(scope));
   } catch (err) {
     if (isGoneError(err)) return;
     throw err;
@@ -139,7 +187,7 @@ export async function deleteDropFiles(id: string): Promise<void> {
 // ─── device profiles ───
 
 export async function putDeviceProfile(profile: DeviceProfile): Promise<void> {
-  await graphFetch(contentUrl(deviceJsonPath(profile.id)), {
+  await graphFetch(contentUrl(APPROOT, deviceJsonPath(profile.id)), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(profile, null, 2),
@@ -161,7 +209,7 @@ export interface DeviceProfileSnapshot {
 export async function listDeviceProfiles(): Promise<DeviceProfileSnapshot> {
   let cTag: string | undefined;
   try {
-    const folderRes = await graphFetch(`${itemByPathUrl(DEVICES_FOLDER)}?$select=cTag`);
+    const folderRes = await graphFetch(`${itemByPathUrl(APPROOT, DEVICES_FOLDER)}?$select=cTag`);
     const folder = await folderRes.json();
     cTag = folder.cTag as string | undefined;
   } catch (err) {
@@ -169,7 +217,7 @@ export async function listDeviceProfiles(): Promise<DeviceProfileSnapshot> {
     throw err;
   }
 
-  let url = `${itemByPathUrl(DEVICES_FOLDER)}:/children?$select=id,name,file,@microsoft.graph.downloadUrl`;
+  let url = `${itemByPathUrl(APPROOT, DEVICES_FOLDER)}:/children?$select=id,name,file,@microsoft.graph.downloadUrl`;
   const profiles: DeviceProfile[] = [];
 
   while (url) {
@@ -218,12 +266,12 @@ export interface UploadedItem {
 }
 
 /** Upload a blob ≤ 4 MB in one PUT. */
-async function uploadSmallFile(path: string, blob: Blob): Promise<UploadedItem> {
-  const res = await graphFetch(contentUrl(path), {
+async function uploadSmallFile(scope: Scope, path: string, blob: Blob): Promise<UploadedItem> {
+  const res = await graphFetch(contentUrl(scopeRef(scope), path), {
     method: 'PUT',
     headers: { 'Content-Type': blob.type || 'application/octet-stream' },
     body: blob,
-  });
+  }, scopeTier(scope));
   const item = await res.json();
   return { itemId: item.id };
 }
@@ -233,14 +281,14 @@ export interface UploadSessionState {
 }
 
 /** Create a resumable upload session for a large blob. */
-export async function createUploadSession(path: string): Promise<UploadSessionState> {
-  const res = await graphFetch(`${itemByPathUrl(path)}:/createUploadSession`, {
+export async function createUploadSession(scope: Scope, path: string): Promise<UploadSessionState> {
+  const res = await graphFetch(`${itemByPathUrl(scopeRef(scope), path)}:/createUploadSession`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       item: { '@microsoft.graph.conflictBehavior': 'replace' },
     }),
-  });
+  }, scopeTier(scope));
   const data = await res.json();
   return { uploadUrl: data.uploadUrl };
 }
@@ -297,6 +345,7 @@ export async function uploadToSession(
  * use a resumable session. `existingSession` lets a reloaded tab resume.
  */
 export async function uploadDropFile(
+  scope: Scope,
   meta: DropMeta,
   blob: Blob,
   opts: {
@@ -307,7 +356,7 @@ export async function uploadDropFile(
 ): Promise<UploadedItem> {
   if (!meta.file) throw new Error('Not a file drop');
   if (blob.size <= SIMPLE_UPLOAD_LIMIT && !opts.existingSessionUrl) {
-    return uploadSmallFile(meta.file.path, blob);
+    return uploadSmallFile(scope, meta.file.path, blob);
   }
   let uploadUrl = opts.existingSessionUrl;
   if (uploadUrl) {
@@ -318,7 +367,7 @@ export async function uploadDropFile(
       console.debug('[Graph] Upload session expired — restarting');
     }
   }
-  const session = await createUploadSession(meta.file.path);
+  const session = await createUploadSession(scope, meta.file.path);
   uploadUrl = session.uploadUrl;
   opts.onSessionCreated?.(uploadUrl);
   return uploadToSession(uploadUrl, blob, opts.onProgress);
@@ -326,9 +375,16 @@ export async function uploadDropFile(
 
 // ─── downloads & thumbnails ───
 
+/** Blobs uploaded by any member live in the host's drive — address them there. */
+function fileItemUrl(scope: Scope, itemId: string): string {
+  return scope.kind === 'private'
+    ? `${GRAPH_BASE}/me/drive/items/${itemId}`
+    : `${GRAPH_BASE}/drives/${scope.driveId}/items/${itemId}`;
+}
+
 /** Download a drop's file bytes. */
-export async function downloadDropFile(itemId: string): Promise<Blob> {
-  const res = await graphFetch(`${GRAPH_BASE}/me/drive/items/${itemId}/content`);
+export async function downloadDropFile(scope: Scope, itemId: string): Promise<Blob> {
+  const res = await graphFetch(`${fileItemUrl(scope, itemId)}/content`, undefined, scopeTier(scope));
   return res.blob();
 }
 
@@ -337,10 +393,12 @@ export async function downloadDropFile(itemId: string): Promise<Blob> {
  * pre-authenticated and short-lived, so we fetch the bytes immediately and
  * the caller stores them in IndexedDB keyed by drop id.
  */
-export async function fetchThumbnail(itemId: string): Promise<Blob | null> {
+export async function fetchThumbnail(scope: Scope, itemId: string): Promise<Blob | null> {
   try {
     const res = await graphFetch(
-      `${GRAPH_BASE}/me/drive/items/${itemId}/thumbnails/0/large`,
+      `${fileItemUrl(scope, itemId)}/thumbnails/0/large`,
+      undefined,
+      scopeTier(scope),
     );
     const data = await res.json();
     if (!data.url) return null;
@@ -371,14 +429,35 @@ interface DeltaItem {
   '@microsoft.graph.downloadUrl'?: string;
 }
 
+function deltaStartUrl(scope: Scope): string {
+  return scope.kind === 'private'
+    ? `${GRAPH_BASE}/me/drive/special/approot:/${DROPS_FOLDER}:/delta`
+    : `${GRAPH_BASE}/drives/${scope.driveId}/items/${scope.dropsItemId}/delta`;
+}
+
 /**
- * Run a delta pass over approot:/drops. Persists the delta token only after
- * every changed JSON body downloaded successfully, so a mid-pass failure
- * replays the page next time instead of losing changes.
+ * True when a fresh delta start is rejected as unsupported (the unverified
+ * cross-drive-shared-folder combination) — callers fall back to a children
+ * listing. Distinct from 404/410, which mean the folder itself is gone.
  */
-export async function runDelta(): Promise<DeltaResult> {
-  const savedToken = await getSetting<string>(DELTA_TOKEN_KEY);
-  let url = savedToken ?? `${GRAPH_BASE}/me/drive/special/approot:/${DROPS_FOLDER}:/delta`;
+export function isDeltaUnsupportedError(err: unknown): boolean {
+  return err instanceof GraphHttpError && (err.status === 400 || err.status === 403 || err.status === 501);
+}
+
+/**
+ * Run a delta pass over a scope's drops folder. Persists the delta token only
+ * after every changed JSON body downloaded successfully, so a mid-pass failure
+ * replays the page next time instead of losing changes.
+ *
+ * A missing folder is an empty private feed, but for a chat it means access
+ * was revoked or the chat deleted — that propagates to the caller.
+ */
+export async function runDelta(scope: Scope): Promise<DeltaResult> {
+  const tokenKey = deltaTokenKey(scope);
+  const tier = scopeTier(scope);
+  const isChat = scope.kind === 'chat';
+  const savedToken = await getSetting<string>(tokenKey);
+  let url = savedToken ?? deltaStartUrl(scope);
   const fullResync = !savedToken;
 
   const upserts: DropRecord[] = [];
@@ -388,16 +467,17 @@ export async function runDelta(): Promise<DeltaResult> {
   while (url) {
     let data: { value: DeltaItem[]; '@odata.nextLink'?: string; '@odata.deltaLink'?: string };
     try {
-      const res = await graphFetch(url);
+      const res = await graphFetch(url, undefined, tier);
       data = await res.json();
     } catch (err) {
       if (isGoneError(err)) {
         if (savedToken) {
           // Token expired — clear it and restart as a full delta
           console.debug('[Sync] Delta token expired — full resync');
-          await deleteSetting(DELTA_TOKEN_KEY);
-          return runDelta();
+          await deleteSetting(tokenKey);
+          return runDelta(scope);
         }
+        if (isChat) throw err; // revoked / deleted — the caller decides
         // Folder doesn't exist yet — empty feed, not an error
         return { upserts: [], removals: [], fullResync };
       }
@@ -414,15 +494,16 @@ export async function runDelta(): Promise<DeltaResult> {
 
       // Prefer the pre-authenticated downloadUrl from the delta response —
       // no extra token round-trip per item.
-      const downloadUrl =
-        item['@microsoft.graph.downloadUrl'] ||
-        `${GRAPH_BASE}/me/drive/items/${item.id}/content`;
+      const fallbackUrl = scope.kind === 'private'
+        ? `${GRAPH_BASE}/me/drive/items/${item.id}/content`
+        : `${GRAPH_BASE}/drives/${scope.driveId}/items/${item.id}/content`;
+      const downloadUrl = item['@microsoft.graph.downloadUrl'] || fallbackUrl;
       const bodyRes = item['@microsoft.graph.downloadUrl']
         ? await fetch(downloadUrl)
-        : await graphFetch(downloadUrl);
+        : await graphFetch(downloadUrl, undefined, tier);
       if (!bodyRes.ok) throw new GraphHttpError(bodyRes.status, downloadUrl, 'Drop JSON download failed');
       const parsed: unknown = await bodyRes.json();
-      const meta = validateDropMeta(parsed, { expectedId: name.slice(0, -5), requireAuthor: false });
+      const meta = validateDropMeta(parsed, { expectedId: name.slice(0, -5), requireAuthor: isChat });
       if (!meta) {
         console.debug('[Sync] Discarding malformed drop JSON: %s', name);
         continue;
@@ -439,43 +520,60 @@ export async function runDelta(): Promise<DeltaResult> {
   }
 
   if (finalDeltaLink) {
-    await putSetting(DELTA_TOKEN_KEY, finalDeltaLink);
+    await putSetting(tokenKey, finalDeltaLink);
   }
 
   return { upserts, removals, fullResync };
 }
 
-export function clearDeltaToken(): Promise<void> {
-  return deleteSetting(DELTA_TOKEN_KEY);
+export function clearDeltaToken(scope: Scope): Promise<void> {
+  return deleteSetting(deltaTokenKey(scope));
 }
 
 // ─── fast-path dirty check ───
 
 /**
+ * The cTag we watch per scope. Private watches the drops/ folder as before;
+ * a chat watches the whole chat folder so member joins (members/ writes)
+ * count as changes too.
+ */
+function dirtyCheckUrl(scope: Scope): string {
+  return scope.kind === 'private'
+    ? itemByPathUrl(APPROOT, DROPS_FOLDER)
+    : `${GRAPH_BASE}/drives/${scope.driveId}/items/${scope.itemId}`;
+}
+
+/**
  * One tiny GET that answers "did anything change?" — a folder's cTag changes
  * whenever any descendant changes. Keeps the 45s poll nearly free.
  * Returns true when a delta pass is warranted.
+ *
+ * A gone folder is "nothing to sync" for private, but for chats it must
+ * surface — revoked access is a state change the coordinator tracks.
  */
-export async function isFeedDirty(): Promise<boolean> {
+export async function isFeedDirty(scope: Scope): Promise<boolean> {
   try {
-    const res = await graphFetch(`${itemByPathUrl(DROPS_FOLDER)}?$select=cTag`);
+    const res = await graphFetch(`${dirtyCheckUrl(scope)}?$select=cTag`, undefined, scopeTier(scope));
     const data = await res.json();
     const cTag = data.cTag as string | undefined;
     if (!cTag) return true;
-    const known = await getSetting<string>(FOLDER_CTAG_KEY);
+    const known = await getSetting<string>(folderCtagKey(scope));
     return known !== cTag;
   } catch (err) {
-    if (isGoneError(err)) return false; // folder not created yet — nothing to sync
+    if (isGoneError(err)) {
+      if (scope.kind === 'chat') throw err;
+      return false; // folder not created yet — nothing to sync
+    }
     throw err;
   }
 }
 
 /** Record the folder cTag after a completed sync pass. */
-export async function markFeedClean(): Promise<void> {
+export async function markFeedClean(scope: Scope): Promise<void> {
   try {
-    const res = await graphFetch(`${itemByPathUrl(DROPS_FOLDER)}?$select=cTag`);
+    const res = await graphFetch(`${dirtyCheckUrl(scope)}?$select=cTag`, undefined, scopeTier(scope));
     const data = await res.json();
-    if (data.cTag) await putSetting(FOLDER_CTAG_KEY, data.cTag);
+    if (data.cTag) await putSetting(folderCtagKey(scope), data.cTag);
   } catch {
     // Folder may not exist yet — fine
   }
@@ -483,7 +581,7 @@ export async function markFeedClean(): Promise<void> {
 
 export async function isDeviceRegistryDirty(): Promise<boolean> {
   try {
-    const res = await graphFetch(`${itemByPathUrl(DEVICES_FOLDER)}?$select=cTag`);
+    const res = await graphFetch(`${itemByPathUrl(APPROOT, DEVICES_FOLDER)}?$select=cTag`);
     const data = await res.json();
     const cTag = data.cTag as string | undefined;
     if (!cTag) return true;

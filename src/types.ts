@@ -96,6 +96,9 @@ export interface PrivateScope {
   kind: 'private';
 }
 
+export const PRIVATE_SCOPE: PrivateScope = { kind: 'private' };
+export const PRIVATE_SCOPE_ID: ScopeId = 'private';
+
 /** A shared chat — a folder in the HOST's OneDrive. */
 export interface ChatScope {
   kind: 'chat';

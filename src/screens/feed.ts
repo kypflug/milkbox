@@ -4,7 +4,7 @@
  * PAGE_SIZE drops; a sentinel at the top pages older ones in from IDB.
  */
 
-import type { DeviceProfile, DropMeta, DropRecord, SharePayload } from '../types';
+import { PRIVATE_SCOPE, type DeviceProfile, type DropMeta, type DropRecord, type SharePayload } from '../types';
 import { ulid } from '../utils/ulid';
 import { dayKey } from '../utils/format';
 import { escapeHtml } from '../utils/storage';
@@ -144,14 +144,14 @@ export async function renderFeed(
         const file = record?.meta.file;
         if (!file?.itemId) return;
         try {
-          const fetched = await fetchThumbnail(file.itemId);
+          const fetched = await fetchThumbnail(PRIVATE_SCOPE, file.itemId);
           if (fetched) {
             blob = fetched;
             await db.putThumb(id, fetched).catch(() => {});
           } else if (file.size <= FULL_IMAGE_PREVIEW_LIMIT) {
             // No thumbnail (not generated yet, or unsupported format) —
             // the image itself is small enough to be its own preview.
-            blob = await downloadDropFile(file.itemId);
+            blob = await downloadDropFile(PRIVATE_SCOPE, file.itemId);
             await db.putCachedBlob(id, blob).catch(() => {});
           }
         } catch { /* offline or transient — retry below */ }
@@ -340,7 +340,7 @@ export async function renderFeed(
           return;
         }
         showToast('Downloading…');
-        blob = await downloadDropFile(f.itemId);
+        blob = await downloadDropFile(PRIVATE_SCOPE, f.itemId);
         if (record.meta.kind === 'image') {
           await db.putCachedBlob(record.meta.id, blob).catch(() => {});
         }
@@ -387,7 +387,7 @@ export async function renderFeed(
     try {
       let blob = await db.getCachedBlob(record.meta.id).catch(() => undefined);
       if (!blob && f.itemId) {
-        blob = await downloadDropFile(f.itemId);
+        blob = await downloadDropFile(PRIVATE_SCOPE, f.itemId);
         await db.putCachedBlob(record.meta.id, blob).catch(() => {});
       }
       if (blob) img.src = URL.createObjectURL(blob);

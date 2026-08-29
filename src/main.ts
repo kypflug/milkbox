@@ -199,6 +199,11 @@ async function enterApp(app: HTMLElement): Promise<void> {
   await handleShareTarget();
   setupResumeHandler();
   setupBackgroundBackup();
+
+  if (import.meta.env.DEV) {
+    const dev = await import('./dev/chat-dev');
+    dev.installChatDevHarness();
+  }
 }
 
 async function route(app: HTMLElement): Promise<void> {
