@@ -784,6 +784,40 @@ export async function rotateInviteLink(chatId: string): Promise<string> {
   return link.webUrl;
 }
 
+export function getCachedMembers(scopeId: ScopeId): Promise<import('../types').ChatMember[] | undefined> {
+  return db.getSetting(membersKey(scopeId));
+}
+
+/**
+ * Host: revoke one member's direct permission grant. Consumer OneDrive may
+ * only expose link-level grants (everyone who redeemed the link shares one
+ * permission) — then there is nothing individual to delete and this throws
+ * 'unsupported'; the UI offers "Reset invite link" instead.
+ */
+export async function removeMember(chatId: string, memberId: string): Promise<void> {
+  const record = await db.getChat(chatId);
+  if (!record || record.role !== 'host') throw new Error('Only the host can remove members');
+  const permissions = await chatsApi.listChatPermissions(record);
+  const direct = permissions.find(p => !p.isLink && p.granteeIds.includes(memberId));
+  if (!direct) throw new Error('unsupported');
+  await chatsApi.deleteChatPermission(record, direct.id);
+  await chatsApi.deleteMemberFile(record, memberId).catch(() => {});
+  const members = await chatsApi.listMembers(record);
+  await db.putSetting(membersKey(`chat:${chatId}`), members);
+  emit({ type: 'chats-changed' });
+}
+
+/** A needs-consent chat regained its grant — try it again right away. */
+export async function reactivateChat(chatId: string): Promise<void> {
+  const record = await db.getChat(chatId);
+  if (!record) return;
+  await db.patchChat(chatId, { state: 'active' });
+  const st = stateFor(`chat:${chatId}`);
+  st.consecutiveGone = 0;
+  emit({ type: 'chats-changed' });
+  void requestSync(chatScopeOf({ ...record, state: 'active' }), { force: true });
+}
+
 export class JoinError extends Error {
   constructor(public reason: 'invalid-link' | 'not-a-chat') {
     super(reason);

@@ -2,10 +2,17 @@ import { initAuth, isSignedIn, tryRecoverAuth, refreshTokenOnResume, hasAccountH
 import { restoreMsalCacheIfNeeded, setupBackgroundBackup } from './services/msal-cache-backup';
 import { initBroadcast, postBroadcast } from './services/broadcast';
 import { drainShareInbox } from './services/share-inbox';
+import * as coordinator from './services/sync-coordinator';
+import { resumePendingAction, startCreateChatFlow, startJoinFlow, startReconnectFlow } from './services/chat-flows';
+import { setPendingAction } from './services/pending-actions';
 import { renderSignIn } from './screens/sign-in';
 import { renderFeed, applySharePayload, teardownScreenListeners } from './screens/feed';
+import { showManageSheet } from './screens/chat-sheets';
+import { mountChatSwitcher } from './components/chat-switcher';
+import { showToast } from './components/toast';
 import { applyTheme } from './theme';
 import { escapeHtml } from './utils/storage';
+import { PRIVATE_SCOPE, scopeIdOf, type Scope, type ScopeId } from './types';
 import { registerSW } from 'virtual:pwa-register';
 
 const app = document.getElementById('app')!;
@@ -32,6 +39,8 @@ const updateSW = registerSW({
   },
 });
 let authBootComplete = false;
+/** Set when this launch came from an invite link — flavors the sign-in copy. */
+let invitedSignIn = false;
 
 boot(app).catch(err => {
   console.error('Boot failed:', err);
@@ -87,7 +96,19 @@ async function boot(app: HTMLElement): Promise<void> {
     pendingSwUpdate = null;
   }
 
-  if (redirectResponse?.account || isSignedIn()) {
+  // An invite link opened while signed out: park the join (IDB — survives
+  // the sign-in redirect and iOS storage wipes) and greet as invited.
+  const invitedToken = location.hash.startsWith('#join=')
+    ? decodeURIComponent(location.hash.slice(6))
+    : null;
+  const signedIn = Boolean(redirectResponse?.account) || isSignedIn();
+  if (invitedToken && !signedIn) {
+    invitedSignIn = true;
+    await setPendingAction({ type: 'join', token: invitedToken, createdAt: Date.now() });
+    history.replaceState(null, '', '/');
+  }
+
+  if (signedIn) {
     clearAutoRedirectMark();
     await enterApp(app);
   } else if (cacheRestored || hasAccountHint()) {
@@ -108,10 +129,10 @@ async function boot(app: HTMLElement): Promise<void> {
       markAutoRedirected();
       await attemptAutoRedirect(app);
     } else {
-      renderSignIn(app, () => void enterApp(app));
+      renderSignIn(app, () => void enterApp(app), { invited: invitedSignIn });
     }
   } else {
-    renderSignIn(app, () => void enterApp(app));
+    renderSignIn(app, () => void enterApp(app), { invited: invitedSignIn });
   }
 }
 
@@ -178,7 +199,7 @@ async function attemptAutoRedirect(app: HTMLElement): Promise<void> {
       }
     } catch { /* fall through */ }
 
-    renderSignIn(app, () => void enterApp(app));
+    renderSignIn(app, () => void enterApp(app), { invited: invitedSignIn });
   };
   document.addEventListener('visibilitychange', handler);
 
@@ -186,7 +207,7 @@ async function attemptAutoRedirect(app: HTMLElement): Promise<void> {
     await signInWithHint();
   } catch {
     document.removeEventListener('visibilitychange', handler);
-    renderSignIn(app, () => void enterApp(app));
+    renderSignIn(app, () => void enterApp(app), { invited: invitedSignIn });
   }
 }
 
@@ -196,9 +217,15 @@ async function enterApp(app: HTMLElement): Promise<void> {
   postBroadcast({ type: 'auth-changed', signedIn: true });
   await route(app);
   window.addEventListener('hashchange', () => void route(app));
+  // Anything a consent redirect / sign-in / iOS sheet interrupted.
+  await resumePendingAction();
   await handleShareTarget();
   setupResumeHandler();
   setupBackgroundBackup();
+  // Warm the author identity and pull chats this account has elsewhere
+  // (hosted folders + roaming pointers) into the local registry.
+  void coordinator.ensureMe();
+  void coordinator.hydrateChatRegistry();
 
   if (import.meta.env.DEV) {
     const dev = await import('./dev/chat-dev');
@@ -206,10 +233,77 @@ async function enterApp(app: HTMLElement): Promise<void> {
   }
 }
 
+/** Only the very first empty-hash route restores the remembered scope —
+ *  after that, an empty hash means the user chose the private feed. */
+let restoredActiveScope = false;
+let chatUiTeardown: (() => void) | null = null;
+
 async function route(app: HTMLElement): Promise<void> {
+  const rawHash = location.hash.slice(1);
+
+  if (rawHash.startsWith('join=')) {
+    // Strip the hash first so a reload doesn't re-trigger the join, then
+    // run the flow on top of whatever scope renders below.
+    history.replaceState(null, '', '/');
+    void startJoinFlow(decodeURIComponent(rawHash.slice(5)));
+  }
+  const hash = rawHash.startsWith('join=') ? '' : rawHash;
+
   teardownScreenListeners();
-  const hash = location.hash.slice(1);
-  await renderFeed(app, { openSettings: hash === 'settings' });
+  chatUiTeardown?.();
+  chatUiTeardown = null;
+
+  let scope: Scope = PRIVATE_SCOPE;
+  if (hash.startsWith('chat/')) {
+    const resolved = await coordinator.resolveScope(`chat:${hash.slice(5)}`);
+    if (resolved) {
+      scope = resolved;
+    } else {
+      showToast('That chat isn’t on this device');
+      history.replaceState(null, '', '/');
+    }
+  } else if (!restoredActiveScope && (hash === '' || hash === 'settings')) {
+    const resolved = await coordinator.resolveScope(await coordinator.getActiveScopeId());
+    if (resolved) scope = resolved;
+  }
+  restoredActiveScope = true;
+
+  await coordinator.setActiveScopeId(scopeIdOf(scope));
+  await renderFeed(app, { openSettings: hash === 'settings', scope });
+  chatUiTeardown = mountChatUi(app, scopeIdOf(scope));
+}
+
+function selectScope(app: HTMLElement, scopeId: ScopeId): void {
+  const targetHash = scopeId === 'private' ? '' : `#chat/${scopeId.slice(5)}`;
+  const current = location.hash === '#' ? '' : location.hash;
+  if (current === targetHash) {
+    void route(app);
+  } else if (targetHash === '') {
+    history.replaceState(null, '', '/');
+    void route(app);
+  } else {
+    location.hash = targetHash;
+  }
+}
+
+/** Mount the chat switcher beside the freshly rendered feed and wire its trigger. */
+function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
+  const switcher = mountChatSwitcher(app, currentScopeId, {
+    onSelect: scopeId => selectScope(app, scopeId),
+    onCreate: () => startCreateChatFlow(),
+    onManage: chatId =>
+      void showManageSheet(chatId, {
+        onGoneFromList: () => selectScope(app, 'private'),
+      }),
+    onReconnect: chatId => startReconnectFlow(chatId),
+  });
+  const trigger = app.querySelector<HTMLButtonElement>('.composer-chats');
+  const onTrigger = () => switcher.toggle();
+  trigger?.addEventListener('click', onTrigger);
+  return () => {
+    trigger?.removeEventListener('click', onTrigger);
+    switcher.teardown();
+  };
 }
 
 /**

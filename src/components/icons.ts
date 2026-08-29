@@ -51,3 +51,22 @@ export const iconClose = (size = '1em') =>
 
 export const iconSignOut = (size = '1em') =>
   svg('<path d="M14 4H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7"/><path d="M17 8.5 20.5 12 17 15.5M20 12H10"/>', size);
+
+/** Two speech bubbles — the chat switcher. */
+export const iconChats = (size = '1em') =>
+  svg('<path d="M4 5.5h11a1.5 1.5 0 0 1 1.5 1.5v6a1.5 1.5 0 0 1-1.5 1.5H9L5.5 18v-3.5H4A1.5 1.5 0 0 1 2.5 13V7A1.5 1.5 0 0 1 4 5.5Z"/><path d="M19 9.5h1A1.5 1.5 0 0 1 21.5 11v5a1.5 1.5 0 0 1-1.5 1.5h-1V21l-3.5-3.5H12"/>', size);
+
+export const iconPlus = (size = '1em') =>
+  svg('<path d="M12 5v14M5 12h14"/>', size);
+
+/** Two people — chat members / manage. */
+export const iconPeople = (size = '1em') =>
+  svg('<circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M15.5 5.4a3.2 3.2 0 0 1 0 5.2M17.5 14.9A5.5 5.5 0 0 1 20.5 20"/>', size);
+
+/** Door with an arrow — leave chat. */
+export const iconLeave = (size = '1em') =>
+  svg('<path d="M10 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h4"/><path d="M14 8.5 17.5 12 14 15.5M17 12H8"/>', size);
+
+/** QR grid — invite. */
+export const iconQr = (size = '1em') =>
+  svg('<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M14 14h2.5v2.5H14zM17.5 17.5H20V20h-2.5zM14 20h1M20 14v1"/>', size);

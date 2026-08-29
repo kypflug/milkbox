@@ -6,7 +6,7 @@
  * with the text and files and lets the feed screen queue drops.
  */
 
-import { iconAttach, iconSend, iconClose, iconFile, iconRefresh, iconSettings } from './icons';
+import { iconAttach, iconSend, iconClose, iconFile, iconRefresh, iconSettings, iconChats } from './icons';
 import { escapeHtml } from '../utils/storage';
 import { formatBytes } from '../utils/format';
 
@@ -36,6 +36,8 @@ export function mountComposer(
         <button class="composer-attach" title="Attach files" aria-label="Attach files">${iconAttach('1.25em')}</button>
         <textarea class="composer-input" rows="1" placeholder="Drop something…" aria-label="Message"></textarea>
         <span class="composer-tools">
+          <button class="composer-chats" title="Chats" aria-label="Chats"
+                  aria-haspopup="dialog">${iconChats('1.15em')}</button>
           <button class="composer-refresh" title="Refresh" aria-label="Refresh">${iconRefresh('1.15em')}</button>
           <button class="composer-settings" title="Settings" aria-label="Settings"
                   aria-haspopup="dialog">${iconSettings('1.15em')}</button>
