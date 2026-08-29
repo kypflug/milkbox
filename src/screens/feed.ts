@@ -453,7 +453,7 @@ export async function renderFeed(
         break;
       case 'drop-progress': {
         const bar = listEl.querySelector<HTMLElement>(
-          `[data-drop-id="${event.dropId}"] .drop-image-progress`,
+          `[data-drop-id="${CSS.escape(event.dropId)}"] .drop-image-progress`,
         );
         if (bar) {
           bar.hidden = false;

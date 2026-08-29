@@ -13,6 +13,7 @@
 
 import { getAccessToken } from './auth';
 import { getSetting, putSetting, deleteSetting } from './db';
+import { validateDropMeta } from './validate-drop';
 import type { DeviceProfile, DropMeta, DropRecord } from '../types';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
@@ -420,8 +421,12 @@ export async function runDelta(): Promise<DeltaResult> {
         ? await fetch(downloadUrl)
         : await graphFetch(downloadUrl);
       if (!bodyRes.ok) throw new GraphHttpError(bodyRes.status, downloadUrl, 'Drop JSON download failed');
-      const meta = (await bodyRes.json()) as DropMeta;
-      if (!meta?.id) continue;
+      const parsed: unknown = await bodyRes.json();
+      const meta = validateDropMeta(parsed, { expectedId: name.slice(0, -5), requireAuthor: false });
+      if (!meta) {
+        console.debug('[Sync] Discarding malformed drop JSON: %s', name);
+        continue;
+      }
       upserts.push({ meta, eTag: item.eTag });
     }
 

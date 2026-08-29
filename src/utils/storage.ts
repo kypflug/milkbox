@@ -35,3 +35,12 @@ export function escapeHtml(text: string): string {
   div.textContent = text;
   return div.innerHTML;
 }
+
+/**
+ * Escape a string for a double-quoted HTML attribute position.
+ * escapeHtml goes through textContent, which leaves quotes intact — safe for
+ * element bodies, attribute-injectable in href/title/etc. Apply this on top.
+ */
+export function escapeAttr(text: string): string {
+  return escapeHtml(text).replace(/"/g, '&quot;');
+}

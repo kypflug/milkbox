@@ -22,7 +22,33 @@ const msalConfig: Configuration = {
   },
 };
 
-const LOGIN_SCOPES = ['Files.ReadWrite.AppFolder', 'User.Read', 'offline_access'];
+/**
+ * Two consent tiers. Sign-in and all private-feed traffic use BASE_SCOPES —
+ * the minimal app-folder grant. Shared chats need whole-drive access
+ * (createLink / cross-drive reads live outside the app folder), consented
+ * incrementally the first time a user creates or joins a chat; solo users
+ * never see the broader prompt.
+ */
+const BASE_SCOPES = ['Files.ReadWrite.AppFolder', 'User.Read', 'offline_access'];
+const SHARE_SCOPES = ['Files.ReadWrite', 'User.Read', 'offline_access'];
+
+export type TokenTier = 'base' | 'share';
+
+function scopesFor(tier: TokenTier): string[] {
+  return tier === 'share' ? SHARE_SCOPES : BASE_SCOPES;
+}
+
+/**
+ * Thrown when a share-tier token needs user interaction (never consented,
+ * or consent revoked). Share-tier calls run from background polling, so they
+ * must never auto-redirect — only an explicit user action converts this into
+ * the consent flow.
+ */
+export class ConsentRequiredError extends Error {
+  constructor() {
+    super('OneDrive sharing consent required');
+  }
+}
 
 /** Detect iOS standalone PWA (home-screen installed). */
 function isIosStandalone(): boolean {
@@ -91,6 +117,7 @@ export async function initAuth(force = false): Promise<AuthenticationResult | nu
 
     // Persist account hint on successful redirect sign-in
     if (response?.account) {
+      msalInstance.setActiveAccount(response.account);
       saveAccountHint(response.account);
       // Mirror MSAL cache to IndexedDB (iOS localStorage durability)
       backupMsalCache().catch(() => {});
@@ -156,8 +183,11 @@ function cleanUpStaleState(): void {
 /**
  * Detect whether this page load is returning from a MSAL login/token redirect.
  * MSAL redirect responses include `code`, `error`, `id_token`, or `access_token`
- * in the URL hash or query. Our app's own routes (#settings) and the share
- * target (?share=1) never contain these parameters.
+ * in the URL hash or query. Our app's own routes (#settings, #chat/<ULID>) and
+ * the share target (?share=1) never contain these parameters — and the invite
+ * deep link is exactly `#join=` + unpadded base64url ([A-Za-z0-9_-]), an
+ * alphabet with no `=`, so none of the substrings above can occur. Raw share
+ * URLs (which carry arbitrary query strings) must never be put in the hash.
  */
 function hasRedirectResponse(): boolean {
   const hash = window.location.hash;
@@ -178,6 +208,7 @@ export function getAccount(): AccountInfo | null {
   if (!msalInstance) return null;
   const accounts = msalInstance.getAllAccounts();
   if (accounts.length > 0) {
+    if (!msalInstance.getActiveAccount()) msalInstance.setActiveAccount(accounts[0]);
     saveAccountHint(accounts[0]);
     return accounts[0];
   }
@@ -196,7 +227,7 @@ export function getAccount(): AccountInfo | null {
 export async function signIn(): Promise<AccountInfo | null> {
   const msal = getMsal();
   await msal.loginRedirect({
-    scopes: LOGIN_SCOPES,
+    scopes: BASE_SCOPES,
     prompt: 'select_account',
   });
   // loginRedirect navigates away; this code won't continue.
@@ -221,16 +252,26 @@ export async function signOut(): Promise<void> {
   // Page navigates away
 }
 
-export async function getAccessToken(): Promise<string> {
+export async function getAccessToken(tier: TokenTier = 'base'): Promise<string> {
   const msal = getMsal();
   const account = getAccount();
   if (!account) throw new Error('Not signed in');
+  const scopes = scopesFor(tier);
+
+  /**
+   * Interactive fallback when silent acquisition is exhausted. Base tier
+   * redirects with the scopes that actually failed (redirecting with a
+   * different set would consent the wrong scopes and loop). Share tier never
+   * auto-redirects — see ConsentRequiredError.
+   */
+  const interactive = async (): Promise<never> => {
+    if (tier === 'share') throw new ConsentRequiredError();
+    await msal.acquireTokenRedirect({ scopes, account });
+    throw new Error('Redirecting for token…');
+  };
 
   try {
-    const result = await msal.acquireTokenSilent({
-      scopes: LOGIN_SCOPES,
-      account,
-    });
+    const result = await msal.acquireTokenSilent({ scopes, account });
     if (!result.accessToken) {
       throw new InteractionRequiredAuthError('empty_token', 'Silent token acquisition returned empty access token');
     }
@@ -244,31 +285,52 @@ export async function getAccessToken(): Promise<string> {
     if (err instanceof BrowserAuthError) {
       console.debug('[Auth] Silent iframe renewal failed, retrying with refresh token:', (err as Error).message);
       try {
-        const result = await msal.acquireTokenSilent({
-          scopes: LOGIN_SCOPES,
-          account,
-          forceRefresh: true,
-        });
+        const result = await msal.acquireTokenSilent({ scopes, account, forceRefresh: true });
         if (result.accessToken) {
           backupMsalCache().catch(() => {});
           return result.accessToken;
         }
       } catch (retryErr) {
-        console.warn('[Auth] Refresh token retry also failed, redirecting for interactive auth:', retryErr);
-        // BrowserAuthError retry exhausted — redirect for interactive auth
-        await msal.acquireTokenRedirect({ scopes: LOGIN_SCOPES });
-        throw new Error('Redirecting for token…');
+        console.warn('[Auth] Refresh token retry also failed:', retryErr);
+        return interactive();
       }
     }
 
     if (err instanceof InteractionRequiredAuthError) {
-      // Redirect for interactive token — silent refresh failed
-      console.debug('[Auth] InteractionRequiredAuthError — redirecting for interactive auth');
-      await msal.acquireTokenRedirect({ scopes: LOGIN_SCOPES });
-      throw new Error('Redirecting for token…');
+      console.debug('[Auth] InteractionRequiredAuthError on %s tier', tier);
+      return interactive();
     }
     throw err;
   }
+}
+
+/**
+ * Whether the share tier can mint a token without interaction — used by the
+ * UI to skip the consent interstitial for already-consented users.
+ */
+export async function hasShareConsent(): Promise<boolean> {
+  if (!msalInstance) return false;
+  const account = getAccount();
+  if (!account) return false;
+  try {
+    const result = await msalInstance.acquireTokenSilent({ scopes: scopesFor('share'), account });
+    return Boolean(result.accessToken);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Start the interactive consent round-trip for the share tier. The caller
+ * must have persisted a pending action first (the redirect navigates away on
+ * desktop; on iOS standalone it opens the in-app sheet instead — callers pair
+ * this with the one-shot visibilitychange → initAuth(true) recovery pattern).
+ */
+export async function requestShareConsent(): Promise<void> {
+  const msal = getMsal();
+  const account = getAccount();
+  if (!account) throw new Error('Not signed in');
+  await msal.acquireTokenRedirect({ scopes: scopesFor('share'), account });
 }
 
 export function isSignedIn(): boolean {
@@ -349,7 +411,7 @@ export async function tryRecoverAuth(): Promise<boolean> {
   if (account) {
     try {
       const result = await msalInstance.acquireTokenSilent({
-        scopes: LOGIN_SCOPES,
+        scopes: BASE_SCOPES,
         account,
         forceRefresh: true,
       });
@@ -379,7 +441,7 @@ export async function tryRecoverAuth(): Promise<boolean> {
     if (hint?.username) {
       try {
         const result = await msalInstance.ssoSilent({
-          scopes: LOGIN_SCOPES,
+          scopes: BASE_SCOPES,
           loginHint: hint.username,
         });
         if (result.account) {
@@ -415,7 +477,7 @@ export async function refreshTokenOnResume(): Promise<void> {
   try {
     // Step 1: cheap silent acquire (uses cached token if still valid)
     const result = await msalInstance.acquireTokenSilent({
-      scopes: LOGIN_SCOPES,
+      scopes: BASE_SCOPES,
       account,
     });
     if (result.accessToken) {
@@ -428,7 +490,7 @@ export async function refreshTokenOnResume(): Promise<void> {
   try {
     // Step 2: force refresh via refresh token (no iframe)
     await msalInstance.acquireTokenSilent({
-      scopes: LOGIN_SCOPES,
+      scopes: BASE_SCOPES,
       account,
       forceRefresh: true,
     });
@@ -452,7 +514,7 @@ export async function signInWithHint(): Promise<void> {
   const msal = getMsal();
   const hint = getAccountHint();
   await msal.loginRedirect({
-    scopes: LOGIN_SCOPES,
+    scopes: BASE_SCOPES,
     ...(hint?.username ? { loginHint: hint.username } : {}),
   });
 }
