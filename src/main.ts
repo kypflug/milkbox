@@ -335,13 +335,14 @@ function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
     trigger?.setAttribute('aria-label', label);
     trigger?.setAttribute('title', label);
   };
+  const repaintBadge = () => void paintBadge().catch(err => console.debug('[Chats] Badge paint failed:', err));
   const offCoordinator = coordinator.onCoordinatorEvent(event => {
-    if (event.type === 'chats-changed') void paintBadge();
+    if (event.type === 'chats-changed') repaintBadge();
   });
   const offBroadcast = onBroadcast(event => {
-    if (event.type === 'chats-changed') void paintBadge();
+    if (event.type === 'chats-changed') repaintBadge();
   });
-  void paintBadge();
+  repaintBadge();
 
   return () => {
     trigger?.removeEventListener('click', onTrigger);

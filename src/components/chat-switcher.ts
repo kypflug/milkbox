@@ -105,6 +105,10 @@ export function showChatSwitcher(currentScopeId: ScopeId, handlers: ChatSwitcher
         modal.close();
         if (chat?.state === 'needs-consent') handlers.onReconnect(chat.id);
         else handlers.onSelect(scopeId);
+      }).catch(err => {
+        console.debug('[Chats] Switcher selection failed:', err);
+        modal.close();
+        handlers.onSelect(scopeId);
       });
     } else {
       modal.close();
@@ -112,12 +116,14 @@ export function showChatSwitcher(currentScopeId: ScopeId, handlers: ChatSwitcher
     }
   });
 
+  const repaint = () => void paint().catch(err => console.debug('[Chats] Switcher paint failed:', err));
+
   offCoordinator = coordinator.onCoordinatorEvent(event => {
-    if (event.type === 'chats-changed') void paint();
+    if (event.type === 'chats-changed') repaint();
   });
   offBroadcast = onBroadcast(event => {
-    if (event.type === 'chats-changed') void paint();
+    if (event.type === 'chats-changed') repaint();
   });
 
-  void paint();
+  repaint();
 }
