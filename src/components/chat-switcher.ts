@@ -8,7 +8,7 @@
  * for free.
  */
 
-import { escapeHtml } from '../utils/storage';
+import { escapeAttr, escapeHtml } from '../utils/storage';
 import * as coordinator from '../services/sync-coordinator';
 import { onBroadcast } from '../services/broadcast';
 import { iconBottle, iconClose, iconPeople, iconPlus } from './icons';
@@ -76,7 +76,7 @@ export function mountChatSwitcher(
       const unread = chat.unreadCount ?? 0;
       rows.push(`
         <div class="chat-row">
-          <button class="chat-item${selected}${goneClass}" data-scope="${escapeHtml(scopeId)}">
+          <button class="chat-item${selected}${goneClass}" data-scope="${escapeAttr(scopeId)}">
             <span class="chat-item-glyph">${iconPeople('1.1em')}</span>
             <span class="chat-item-text">
               <span class="chat-item-name">${escapeHtml(chat.name)}</span>
@@ -84,7 +84,7 @@ export function mountChatSwitcher(
             </span>
             <span class="chat-unread-badge"${unread > 0 ? '' : ' hidden'}>${unread > 99 ? '99+' : unread}</span>
           </button>
-          <button class="chat-manage" data-manage="${escapeHtml(chat.id)}" title="Chat options" aria-label="Options for ${escapeHtml(chat.name)}">${iconPeople('1em')}</button>
+          <button class="chat-manage" data-manage="${escapeAttr(chat.id)}" title="Chat options" aria-label="Options for ${escapeAttr(chat.name)}">${iconPeople('1em')}</button>
         </div>`);
     }
 

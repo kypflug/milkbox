@@ -339,8 +339,11 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
     const uploaded = await graph.uploadDropFile(scope, meta, record.blob, {
       existingSessionUrl: record.uploadUrl,
       onSessionCreated: uploadUrl => {
-        // Persist so a reloaded tab resumes instead of restarting
-        void db.putOutboxRecord({ ...record, uploadUrl });
+        // Persist so a reloaded tab resumes instead of restarting — and keep
+        // the in-memory record in step, or a retry's state write would
+        // clobber the session URL and restart the upload from byte zero.
+        record.uploadUrl = uploadUrl;
+        void db.putOutboxRecord({ ...record });
       },
       onProgress: fraction => emit({ type: 'drop-progress', scopeId, dropId: meta.id, fraction }),
     });
@@ -592,7 +595,10 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
           result = await graph.runDelta(scope);
         } else {
           const record = await db.getChat(scope.chatId);
-          if (!record || record.state === 'gone') return;
+          if (!record || record.state === 'gone') {
+            emit({ type: 'sync-complete', scopeId });
+            return;
+          }
           const known = await db.getScopeDropETags(scopeId);
           const synced = await chatsApi.runChatSync(scope, record.syncStrategy, known);
           result = synced.result;
@@ -649,7 +655,7 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
         emit({ type: 'sync-complete', scopeId });
       } catch (err) {
         noteThrottle(err);
-        if (scope.kind === 'chat' && graph.isGoneError(err)) {
+        if (scope.kind === 'chat' && graph.isAccessLostError(err)) {
           st.consecutiveGone++;
           if (st.consecutiveGone >= GONE_THRESHOLD) await handleChatGone(scope.chatId);
         } else if (scope.kind === 'chat' && err instanceof ConsentRequiredError) {
@@ -689,7 +695,7 @@ async function pollScope(scopeId: ScopeId): Promise<void> {
     if (dirty || devicesDirty) await requestSync(scope, { force: true });
   } catch (err) {
     noteThrottle(err);
-    if (scope.kind === 'chat' && graph.isGoneError(err)) {
+    if (scope.kind === 'chat' && graph.isAccessLostError(err)) {
       const chatState = stateFor(scopeId);
       chatState.consecutiveGone++;
       if (chatState.consecutiveGone >= GONE_THRESHOLD) await handleChatGone(scope.chatId);
@@ -741,11 +747,6 @@ export async function pollAll(activeScopeId: ScopeId): Promise<void> {
 
 export function loadChats(): Promise<ChatRecord[]> {
   return db.getAllChats();
-}
-
-export async function getUnreadCounts(): Promise<Map<ScopeId, number>> {
-  const chats = await db.getAllChats();
-  return new Map(chats.map(c => [`chat:${c.id}`, c.unreadCount ?? 0]));
 }
 
 /** Create a chat (host). Requires share consent — throws ConsentRequiredError otherwise. */

@@ -104,7 +104,7 @@ export function mountComposer(
           <span class="composer-chip-glyph">${iconFile('0.9em')}</span>
           <span class="composer-chip-name">${escapeHtml(f.name)}</span>
           <span class="composer-chip-size">${formatBytes(f.size)}</span>
-          <button class="composer-chip-remove" data-index="${i}" title="Remove" aria-label="Remove ${escapeHtml(f.name)}">${iconClose('0.85em')}</button>
+          <button class="composer-chip-remove" data-index="${i}" title="Remove" aria-label="Remove ${escapeAttr(f.name)}">${iconClose('0.85em')}</button>
         </span>`,
       )
       .join('');

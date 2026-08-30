@@ -6,7 +6,7 @@
  */
 
 import QRCode from 'qrcode';
-import { escapeHtml } from '../utils/storage';
+import { escapeAttr, escapeHtml } from '../utils/storage';
 import { showToast } from '../components/toast';
 import { iconClose } from '../components/icons';
 import * as coordinator from '../services/sync-coordinator';
@@ -22,7 +22,7 @@ function openModal(title: string, bodyHtml: string, opts: { onClose?: () => void
   const scrim = document.createElement('div');
   scrim.className = 'chat-modal-scrim';
   scrim.innerHTML = `
-    <div class="chat-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
+    <div class="chat-modal" role="dialog" aria-modal="true" aria-label="${escapeAttr(title)}">
       <header class="chat-modal-header">
         <h2 class="chat-modal-title">${escapeHtml(title)}</h2>
         <button class="chat-modal-close" aria-label="Close">${iconClose('1.1em')}</button>
@@ -180,7 +180,7 @@ export async function showManageSheet(
     <div class="chat-member-row">
       <span class="chat-member-name">${escapeHtml(member.name)}${member.id === chat.host.id ? ' <span class="chat-member-tag">host</span>' : ''}</span>
       ${isHost && member.id !== chat.host.id
-        ? `<button class="chat-member-remove" data-remove="${escapeHtml(member.id)}" data-name="${escapeHtml(member.name)}">Remove</button>`
+        ? `<button class="chat-member-remove" data-remove="${escapeAttr(member.id)}" data-name="${escapeAttr(member.name)}">Remove</button>`
         : ''}
     </div>`).join('');
 

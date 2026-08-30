@@ -5,6 +5,7 @@ import { drainShareInbox } from './services/share-inbox';
 import * as coordinator from './services/sync-coordinator';
 import { resumePendingAction, startCreateChatFlow, startJoinFlow, startReconnectFlow } from './services/chat-flows';
 import { setPendingAction } from './services/pending-actions';
+import { isValidShareToken } from './services/chats';
 import { renderSignIn } from './screens/sign-in';
 import { renderFeed, applySharePayload, teardownScreenListeners } from './screens/feed';
 import { showManageSheet } from './screens/chat-sheets';
@@ -98,9 +99,10 @@ async function boot(app: HTMLElement): Promise<void> {
 
   // An invite link opened while signed out: park the join (IDB — survives
   // the sign-in redirect and iOS storage wipes) and greet as invited.
-  const invitedToken = location.hash.startsWith('#join=')
+  const rawInvited = location.hash.startsWith('#join=')
     ? decodeURIComponent(location.hash.slice(6))
     : null;
+  const invitedToken = rawInvited && isValidShareToken(rawInvited) ? rawInvited : null;
   const signedIn = Boolean(redirectResponse?.account) || isSignedIn();
   if (invitedToken && !signedIn) {
     invitedSignIn = true;
@@ -256,7 +258,9 @@ async function route(app: HTMLElement): Promise<void> {
     // Strip the hash first so a reload doesn't re-trigger the join, then
     // run the flow on top of whatever scope renders below.
     history.replaceState(null, '', '/');
-    void startJoinFlow(decodeURIComponent(rawHash.slice(5)));
+    const token = decodeURIComponent(rawHash.slice(5));
+    if (isValidShareToken(token)) void startJoinFlow(token);
+    else showToast('This invite link doesn’t work anymore. Ask the host for a new one.', 'error');
   }
   const hash = rawHash.startsWith('join=') ? '' : rawHash;
 

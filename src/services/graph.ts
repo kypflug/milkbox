@@ -438,10 +438,17 @@ function deltaStartUrl(scope: Scope): string {
 /**
  * True when a fresh delta start is rejected as unsupported (the unverified
  * cross-drive-shared-folder combination) — callers fall back to a children
- * listing. Distinct from 404/410, which mean the folder itself is gone.
+ * listing. Distinct from 404/410 (folder gone) and 403 (access revoked —
+ * e.g. the host removed this member), which must surface as access loss,
+ * not trigger a fallback that would fail the same way forever.
  */
 export function isDeltaUnsupportedError(err: unknown): boolean {
-  return err instanceof GraphHttpError && (err.status === 400 || err.status === 403 || err.status === 501);
+  return err instanceof GraphHttpError && (err.status === 400 || err.status === 501);
+}
+
+/** Gone OR forbidden — for a chat, both mean this account lost access. */
+export function isAccessLostError(err: unknown): boolean {
+  return isGoneError(err) || (err instanceof GraphHttpError && err.status === 403);
 }
 
 /**

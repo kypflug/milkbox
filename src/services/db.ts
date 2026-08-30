@@ -349,7 +349,6 @@ function scopeSettingsKeys(scopeId: ScopeId): string[] {
     `milkbox:ctag:${scopeId}`,
     `milkbox:notify-primed:${scopeId}`,
     `milkbox:members:${scopeId}`,
-    `milkbox:members-ctag:${scopeId}`,
   ];
 }
 

@@ -192,17 +192,14 @@ export function encodeShareUrl(url: string): string {
   return 'u!' + base64.replace(/=+$/, '').replace(/\//g, '_').replace(/\+/g, '-');
 }
 
-/** Strict inverse of encodeShareUrl — returns null on any malformed input. */
-export function decodeShareToken(token: string): string | null {
-  if (!/^u![A-Za-z0-9_-]+$/.test(token)) return null;
-  try {
-    const base64 = token.slice(2).replace(/_/g, '/').replace(/-/g, '+');
-    const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-    const url = new TextDecoder().decode(bytes);
-    return /^https:\/\//i.test(url) ? url : null;
-  } catch {
-    return null;
-  }
+/**
+ * Strict shape check for a sharing token before it goes anywhere near a URL:
+ * 'u!' + unpadded base64url only. Everything a #join= link carries must pass
+ * this — the alphabet has no '=', '/' or '?', so a token can neither confuse
+ * MSAL's redirect detection nor steer the /shares/{token} Graph path.
+ */
+export function isValidShareToken(token: string): boolean {
+  return /^u![A-Za-z0-9_-]+$/.test(token) && token.length <= 4096;
 }
 
 // ─── joining (guest) ───
@@ -220,6 +217,9 @@ export interface SharedChatResolution {
  * folder is reachable but is not a Milkbox chat.
  */
 export async function resolveSharedChat(shareToken: string): Promise<SharedChatResolution | null> {
+  if (!isValidShareToken(shareToken)) {
+    throw new GraphHttpError(400, 'shares', 'Malformed sharing token');
+  }
   const res = await graphFetch(`${GRAPH_BASE}/shares/${shareToken}/driveItem?$select=id,name,parentReference`, {
     headers: { Prefer: 'redeemSharingLink' },
   }, 'share');
@@ -436,7 +436,10 @@ export async function listChatDrops(
   }
 
   const removals = [...known.keys()].filter(id => !seen.has(id));
-  return { upserts, removals, fullResync: true };
+  // NOT a fullResync: unchanged known drops are deliberately absent from
+  // upserts (their bodies were never downloaded), so a scope-replacing
+  // reconcile would wipe them. upserts + removals reconcile exactly.
+  return { upserts, removals, fullResync: false };
 }
 
 /**

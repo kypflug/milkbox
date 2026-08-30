@@ -86,23 +86,6 @@ export function describeDrop(meta: DropMeta): string {
 }
 
 /**
- * Hand drops to the worker to announce, oldest first. Does nothing when
- * notifications are off or no worker is registered yet (dev server, or a
- * first load before registration settles) — announcing is never
- * load-bearing, so it must not fail a sync pass.
- */
-export async function announceDrops(
-  metas: DropMeta[],
-  deviceNames: Map<string, string>,
-): Promise<void> {
-  await announceItems(metas.map(meta => ({
-    id: meta.id,
-    title: (meta.device.id && deviceNames.get(meta.device.id)) || meta.device.name,
-    body: describeDrop(meta),
-  })));
-}
-
-/**
  * Hand pre-built notification items to the worker, oldest first, collapsing
  * a burst into a single count. Does nothing when notifications are off or no
  * worker is registered yet (dev server, or a first load before registration

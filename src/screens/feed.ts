@@ -16,7 +16,7 @@ import {
 } from '../types';
 import { ulid } from '../utils/ulid';
 import { dayKey } from '../utils/format';
-import { escapeHtml } from '../utils/storage';
+import { escapeAttr, escapeHtml } from '../utils/storage';
 import { getDeviceId, getDeviceInfo } from '../services/device';
 import { isBareUrl, domainOf } from '../services/link-meta';
 import * as coordinator from '../services/sync-coordinator';
@@ -83,7 +83,7 @@ export async function renderFeed(
       <div class="chat-banner" id="chatBanner" hidden></div>
       <div class="feed-scroll" id="feedScroll">
         <div class="feed-sentinel" id="feedSentinel"></div>
-        <div class="feed-list" id="feedList" role="log" aria-label="${escapeHtml(logLabel)}"></div>
+        <div class="feed-list" id="feedList" role="log" aria-label="${escapeAttr(logLabel)}"></div>
       </div>
       <div class="composer-region" id="composerRegion">
         <div class="settings-flyout-mount"></div>
@@ -485,7 +485,7 @@ export async function renderFeed(
     overlay.className = 'lightbox';
     overlay.innerHTML = `
       <button class="lightbox-close" aria-label="Close">${iconClose('1.3em')}</button>
-      <img class="lightbox-img" alt="${escapeHtml(f.name)}">
+      <img class="lightbox-img" alt="${escapeAttr(f.name)}">
       <div class="lightbox-caption">${escapeHtml(f.name)}</div>
     `;
     const close = () => overlay.remove();
