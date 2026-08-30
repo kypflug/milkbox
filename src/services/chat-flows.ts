@@ -10,13 +10,21 @@
  * away and boot() → enterApp() → resumePendingAction() picks the record up.
  */
 
-import { hasShareConsent, initAuth, requestShareConsent } from './auth';
+import { ConsentRequiredError, hasShareConsent, initAuth, requestShareConsent } from './auth';
+import { GraphHttpError } from './graph';
 import * as coordinator from './sync-coordinator';
 import { clearPendingAction, getPendingAction, setPendingAction, type PendingAction } from './pending-actions';
 import { showConsentInterstitial, showCreateChatSheet, showInviteSheet, showJoinProgress } from '../screens/chat-sheets';
 import { showToast } from '../components/toast';
 
 const CONSENT_DENIED_COPY = 'Milkbox needs OneDrive access for shared chats. You can try again anytime.';
+
+/** Failure copy that names the OneDrive status — a report of "error 400"
+ *  diagnoses itself, where a generic connection hint cannot. */
+function describeFailure(prefix: string, err: unknown): string {
+  if (err instanceof GraphHttpError) return `${prefix} — OneDrive error ${err.status}. Try again.`;
+  return `${prefix}. Check your connection and try again.`;
+}
 
 function openChat(chatId: string): void {
   location.hash = `#chat/${chatId}`;
@@ -68,8 +76,16 @@ async function doCreate(name: string): Promise<void> {
     // Hand the host the invite immediately — a chat with no invite is inert.
     void showInviteSheet(record.id);
   } catch (err) {
+    if (err instanceof ConsentRequiredError) {
+      // The share grant isn't actually there (revoked, or a stale probe) —
+      // restart the consent round-trip instead of dead-ending on a toast.
+      showConsentInterstitial(() => {
+        void beginShareConsent({ type: 'create-chat', name, createdAt: Date.now() });
+      });
+      return;
+    }
     console.warn('[Chats] Create failed:', err);
-    showToast('Couldn’t create the chat. Check your connection and try again.', 'error');
+    showToast(describeFailure('Couldn’t create the chat', err), 'error');
   }
 }
 

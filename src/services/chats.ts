@@ -113,31 +113,45 @@ export async function createChatFolder(name: string, me: AuthorAttribution): Pro
   const createdAt = Date.now();
   const descriptor: ChatDescriptor = { v: 1, id: chatId, name, createdAt, host: me };
 
-  // Path-based PUT auto-creates chats/<id>/ (and the approot itself).
+  // Path-based PUT auto-creates chats/<id>/ (and the approot itself) — the
+  // same multi-level auto-create the private feed's files/<id>/<name>
+  // uploads have always relied on.
   await putJson(APPROOT, `${CHATS_FOLDER}/${chatId}/chat.json`, descriptor, 'base');
-
-  // drops/ must exist up front — it is the delta target.
-  for (const folder of ['drops', 'members', 'files']) {
-    await graphFetch(`${itemByPathUrl(APPROOT, `${CHATS_FOLDER}/${chatId}`)}:/children`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: folder, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' }),
-    }).catch(err => {
-      // 409 nameAlreadyExists is fine (retry after a partial create)
-      if (!(err instanceof GraphHttpError && err.status === 409)) throw err;
-    });
-  }
 
   const folderRes = await graphFetch(
     `${itemByPathUrl(APPROOT, `${CHATS_FOLDER}/${chatId}`)}?$select=id,parentReference`,
   );
   const folderItem = await folderRes.json();
-  const dropsRes = await graphFetch(
-    `${itemByPathUrl(APPROOT, `${CHATS_FOLDER}/${chatId}/drops`)}?$select=id`,
-  );
-  const dropsItem = await dropsRes.json();
   const driveId = folderItem.parentReference?.driveId as string | undefined;
-  if (!driveId || !folderItem.id || !dropsItem.id) throw new Error('Chat folder creation incomplete');
+  if (!driveId || !folderItem.id) throw new Error('Chat folder creation incomplete');
+
+  // drops/ must exist up front — it is the delta target. Children are
+  // created against the folder's item id: the path-addressed form
+  // (…approot:/chats/<id>:/children) is rejected with 400 invalidRequest
+  // by consumer OneDrive.
+  let dropsItemId: string | undefined;
+  for (const folder of ['drops', 'members', 'files']) {
+    try {
+      const res = await graphFetch(`${GRAPH_BASE}/me/drive/items/${folderItem.id}/children`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: folder, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' }),
+      });
+      const created = await res.json();
+      if (folder === 'drops') dropsItemId = created.id as string | undefined;
+    } catch (err) {
+      // 409 nameAlreadyExists is fine (retry after a partial create)
+      if (!(err instanceof GraphHttpError && err.status === 409)) throw err;
+    }
+  }
+  if (!dropsItemId) {
+    // The drops/ folder pre-existed (409 above) — resolve its id.
+    const dropsRes = await graphFetch(
+      `${itemByPathUrl(APPROOT, `${CHATS_FOLDER}/${chatId}/drops`)}?$select=id`,
+    );
+    dropsItemId = (await dropsRes.json()).id as string | undefined;
+  }
+  if (!dropsItemId) throw new Error('Chat folder creation incomplete');
 
   const record: ChatRecord = {
     id: chatId,
@@ -145,7 +159,7 @@ export async function createChatFolder(name: string, me: AuthorAttribution): Pro
     role: 'host',
     driveId,
     itemId: folderItem.id as string,
-    dropsItemId: dropsItem.id as string,
+    dropsItemId,
     host: me,
     joinedAt: createdAt,
     state: 'active',
