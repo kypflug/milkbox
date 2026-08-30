@@ -121,9 +121,11 @@ async function announce(items: readonly unknown[]): Promise<void> {
 self.addEventListener('notificationclick', event => {
   event.notification.close();
   const scopeId = (event.notification.data as { scopeId?: string } | undefined)?.scopeId;
-  // Crockford base32 only — anything else falls back to the plain shell.
+  // Crockford base32 only — anything else falls back to the private feed.
+  // '#private' (not '/') because a bare open restores the last active scope,
+  // which could be some chat — a private-feed notification must not land there.
   const chatId = scopeId?.startsWith('chat:') ? scopeId.slice(5) : null;
-  const target = chatId && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(chatId) ? `/#chat/${chatId}` : '/';
+  const target = chatId && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(chatId) ? `/#chat/${chatId}` : '/#private';
   event.waitUntil(
     (async () => {
       // Reuse an open window when there is one — matching the manifest's

@@ -282,7 +282,12 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
   let attempts = record.attempts;
   while (attempts < MAX_ATTEMPTS) {
     try {
-      await db.putOutboxRecord({ ...record, attempts, state: 'sending' });
+      // Mutate the in-memory record before persisting: performOp's
+      // onSessionCreated later persists { ...record }, so a stale copy here
+      // would revert the row's attempts/state mid-flight.
+      record.attempts = attempts;
+      record.state = 'sending';
+      await db.putOutboxRecord({ ...record });
       await performOp(scope, record);
       await db.deleteOutboxRecord(record.id);
       emit({ type: 'feed-updated', scopeId });
@@ -312,7 +317,9 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       if (throttled) noteThrottle(err);
       console.warn('[Outbox] %s %s failed (attempt %d):', record.op, record.id, attempts, err);
       if (attempts >= MAX_ATTEMPTS) {
-        await db.putOutboxRecord({ ...record, attempts, state: 'failed' });
+        record.attempts = attempts;
+        record.state = 'failed';
+        await db.putOutboxRecord({ ...record });
         emit({ type: 'feed-updated', scopeId });
         return;
       }

@@ -277,6 +277,8 @@ async function route(app: HTMLElement): Promise<void> {
       showToast('That chat isn’t on this device');
       history.replaceState(null, '', '/');
     }
+  } else if (hash === 'private') {
+    // Explicitly the private feed (notification taps) — never scope-restored.
   } else if (!restoredActiveScope && (hash === '' || hash === 'settings')) {
     const resolved = await coordinator.resolveScope(await coordinator.getActiveScopeId());
     if (resolved) scope = resolved;
