@@ -1,17 +1,15 @@
 /**
- * The chat switcher — a slide-out drawer on narrow screens, a persistent
- * left rail beside the feed pane at the desktop "pane" breakpoint (the CSS
- * in chats.css decides which; this component renders one DOM either way).
- *
- * Rows are <button> elements throughout: the house focus-trap convention
- * (settings.ts) only recognises button/input, and buttons get key handling
- * for free.
+ * The chat switcher — a dialog opened from the chats button in the feed
+ * header (top right, mirroring the logomark). Built on the same modal shell
+ * as the other chat sheets, so it dismisses like settings: scrim, Escape,
+ * close button. Repaints live while open when the registry changes.
  */
 
 import { escapeAttr, escapeHtml } from '../utils/storage';
 import * as coordinator from '../services/sync-coordinator';
 import { onBroadcast } from '../services/broadcast';
-import { iconBottle, iconClose, iconPeople, iconPlus } from './icons';
+import { openModal } from '../screens/chat-sheets';
+import { iconBottle, iconPeople } from './icons';
 import type { ChatRecord, ScopeId } from '../types';
 
 export interface ChatSwitcherHandlers {
@@ -23,13 +21,6 @@ export interface ChatSwitcherHandlers {
   onReconnect(chatId: string): void;
 }
 
-export interface ChatSwitcherApi {
-  open(): void;
-  close(): void;
-  toggle(): void;
-  teardown(): void;
-}
-
 function chatSubline(chat: ChatRecord): string {
   if (chat.state === 'gone') return 'Access ended';
   if (chat.state === 'needs-consent') return 'Needs OneDrive access';
@@ -37,22 +28,23 @@ function chatSubline(chat: ChatRecord): string {
   return `Hosted by ${chat.host.name}`;
 }
 
-export function mountChatSwitcher(
-  app: HTMLElement,
-  currentScopeId: ScopeId,
-  handlers: ChatSwitcherHandlers,
-): ChatSwitcherApi {
-  const rail = document.createElement('aside');
-  rail.className = 'chat-rail';
-  rail.setAttribute('aria-label', 'Chats');
-  const scrim = document.createElement('div');
-  scrim.className = 'chat-scrim';
-  scrim.hidden = true;
+export function showChatSwitcher(currentScopeId: ScopeId, handlers: ChatSwitcherHandlers): void {
+  let offCoordinator: () => void = () => {};
+  let offBroadcast: () => void = () => {};
 
-  // The rail must precede the feed screen so the pane-mode row layout puts
-  // it on the left.
-  app.prepend(rail);
-  app.appendChild(scrim);
+  const modal = openModal('Chats', `
+    <div class="chat-list"></div>
+    <div class="chat-modal-actions">
+      <button class="chat-modal-primary" data-action="new-chat">New chat</button>
+    </div>
+  `, {
+    onClose: () => {
+      offCoordinator();
+      offBroadcast();
+    },
+  });
+
+  const listEl = modal.body.querySelector<HTMLElement>('.chat-list')!;
 
   async function paint(): Promise<void> {
     const chats = (await coordinator.loadChats()).sort((a, b) => a.joinedAt - b.joinedAt);
@@ -88,89 +80,44 @@ export function mountChatSwitcher(
         </div>`);
     }
 
-    rail.innerHTML = `
-      <div class="chat-rail-header">
-        <span class="chat-rail-title">Chats</span>
-        <button class="chat-rail-new" data-action="new-chat" title="New chat" aria-label="New chat">${iconPlus('1.1em')}</button>
-        <button class="chat-rail-close" data-action="close" title="Close" aria-label="Close chat list">${iconClose('1.05em')}</button>
-      </div>
-      <div class="chat-list">${rows.join('')}</div>
-    `;
+    listEl.innerHTML = rows.join('');
   }
 
-  function open(): void {
-    rail.setAttribute('data-open', '');
-    scrim.hidden = false;
-  }
-
-  function close(): void {
-    rail.removeAttribute('data-open');
-    scrim.hidden = true;
-  }
-
-  function toggle(): void {
-    if (rail.hasAttribute('data-open')) close();
-    else open();
-  }
-
-  rail.addEventListener('click', e => {
+  modal.body.addEventListener('click', e => {
     const target = e.target as HTMLElement;
     const manageBtn = target.closest<HTMLElement>('[data-manage]');
     if (manageBtn) {
-      close();
+      modal.close();
       handlers.onManage(manageBtn.dataset.manage!);
       return;
     }
-    const actionBtn = target.closest<HTMLElement>('[data-action]');
-    if (actionBtn) {
-      if (actionBtn.dataset.action === 'close') close();
-      if (actionBtn.dataset.action === 'new-chat') {
-        close();
-        handlers.onCreate();
-      }
+    if (target.closest<HTMLElement>('[data-action="new-chat"]')) {
+      modal.close();
+      handlers.onCreate();
       return;
     }
     const item = target.closest<HTMLElement>('[data-scope]');
     if (!item) return;
     const scopeId = item.dataset.scope! as ScopeId;
-    close();
     if (scopeId.startsWith('chat:')) {
       void coordinator.loadChats().then(chats => {
         const chat = chats.find(c => `chat:${c.id}` === scopeId);
+        modal.close();
         if (chat?.state === 'needs-consent') handlers.onReconnect(chat.id);
         else handlers.onSelect(scopeId);
       });
     } else {
+      modal.close();
       handlers.onSelect(scopeId);
     }
   });
 
-  scrim.addEventListener('click', close);
-
-  const onKeyDown = (e: KeyboardEvent) => {
-    if (e.key === 'Escape' && rail.hasAttribute('data-open')) close();
-  };
-  document.addEventListener('keydown', onKeyDown);
-
-  const offCoordinator = coordinator.onCoordinatorEvent(event => {
+  offCoordinator = coordinator.onCoordinatorEvent(event => {
     if (event.type === 'chats-changed') void paint();
   });
-  const offBroadcast = onBroadcast(event => {
+  offBroadcast = onBroadcast(event => {
     if (event.type === 'chats-changed') void paint();
   });
 
   void paint();
-
-  return {
-    open,
-    close,
-    toggle,
-    teardown() {
-      document.removeEventListener('keydown', onKeyDown);
-      offCoordinator();
-      offBroadcast();
-      rail.remove();
-      scrim.remove();
-    },
-  };
 }

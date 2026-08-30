@@ -1,6 +1,6 @@
 import { initAuth, isSignedIn, tryRecoverAuth, refreshTokenOnResume, hasAccountHint, signInWithHint } from './services/auth';
 import { restoreMsalCacheIfNeeded, setupBackgroundBackup } from './services/msal-cache-backup';
-import { initBroadcast, postBroadcast } from './services/broadcast';
+import { initBroadcast, onBroadcast, postBroadcast } from './services/broadcast';
 import { drainShareInbox } from './services/share-inbox';
 import * as coordinator from './services/sync-coordinator';
 import { resumePendingAction, startCreateChatFlow, startJoinFlow, startReconnectFlow } from './services/chat-flows';
@@ -9,7 +9,7 @@ import { isValidShareToken } from './services/chats';
 import { renderSignIn } from './screens/sign-in';
 import { renderFeed, applySharePayload, teardownScreenListeners } from './screens/feed';
 import { showManageSheet } from './screens/chat-sheets';
-import { mountChatSwitcher } from './components/chat-switcher';
+import { showChatSwitcher, type ChatSwitcherHandlers } from './components/chat-switcher';
 import { showToast } from './components/toast';
 import { applyTheme } from './theme';
 import { escapeHtml } from './utils/storage';
@@ -305,9 +305,10 @@ function selectScope(app: HTMLElement, scopeId: ScopeId): void {
   }
 }
 
-/** Mount the chat switcher beside the freshly rendered feed and wire its trigger. */
+/** Wire the header's chats button: opens the switcher dialog, carries the
+ *  unread badge. Re-run per route (the feed re-renders the header). */
 function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
-  const switcher = mountChatSwitcher(app, currentScopeId, {
+  const handlers: ChatSwitcherHandlers = {
     onSelect: scopeId => selectScope(app, scopeId),
     onCreate: () => startCreateChatFlow(),
     onManage: chatId =>
@@ -315,13 +316,32 @@ function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
         onGoneFromList: () => selectScope(app, 'private'),
       }),
     onReconnect: chatId => startReconnectFlow(chatId),
-  });
-  const trigger = app.querySelector<HTMLButtonElement>('.composer-chats');
-  const onTrigger = () => switcher.toggle();
+  };
+
+  const trigger = app.querySelector<HTMLButtonElement>('.feed-chats-btn');
+  const badge = app.querySelector<HTMLElement>('.feed-chats-badge');
+  const onTrigger = () => showChatSwitcher(currentScopeId, handlers);
   trigger?.addEventListener('click', onTrigger);
+
+  const paintBadge = async () => {
+    if (!badge) return;
+    const chats = await coordinator.loadChats();
+    const unread = chats.reduce((sum, chat) => sum + (chat.unreadCount ?? 0), 0);
+    badge.hidden = unread === 0;
+    badge.textContent = unread > 99 ? '99+' : String(unread);
+  };
+  const offCoordinator = coordinator.onCoordinatorEvent(event => {
+    if (event.type === 'chats-changed') void paintBadge();
+  });
+  const offBroadcast = onBroadcast(event => {
+    if (event.type === 'chats-changed') void paintBadge();
+  });
+  void paintBadge();
+
   return () => {
     trigger?.removeEventListener('click', onTrigger);
-    switcher.teardown();
+    offCoordinator();
+    offBroadcast();
   };
 }
 

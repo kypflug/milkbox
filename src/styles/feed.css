@@ -47,13 +47,10 @@
   letter-spacing: -0.01em;
 }
 
-/* Window controls on the left (macOS traffic lights, or an RTL install): the
- * bottle swaps to the far rail so it isn't crowded against them. The wordmark
- * stays in the middle column, so it is centred either way. */
-:root[data-controls-left] .feed-mark {
-  grid-column: 3;
-  justify-self: end;
-}
+/* Both rails are occupied now (bottle left, chats button right), so the old
+ * controls-left side-swap is gone; under window-controls-overlay each corner
+ * item takes a side-aware inset instead (see chats.css). The wordmark stays
+ * in the middle column, so it is centred either way. */
 
 /* ── scroll area ── */
 

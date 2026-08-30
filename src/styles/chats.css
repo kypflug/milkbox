@@ -1,55 +1,18 @@
 /*
- * Shared chats: the switcher (drawer on narrow viewports, persistent rail
- * beside the pane on wide ones) and the chat modals (create / consent /
+ * Shared chats: the header chats button (top right, mirroring the logomark),
+ * the switcher dialog it opens, and the chat modals (create / consent /
  * invite / manage / join progress).
  *
  * z-ladder (see feed/global css): WCO header 40 → drag overlay 50 →
- * chat scrim 55 → chat rail 56 → lightbox 60 → chat modals 70 → toast 100.
+ * WCO chats button 55 → lightbox 60 → chat modals 70 → toast 100.
  */
 
-/* ── rail / drawer ── */
+/* ── header chats button ── */
 
-.chat-rail {
-  position: fixed;
-  inset: 0 auto 0 0;
-  width: min(320px, 85vw);
-  display: flex;
-  flex-direction: column;
-  background: var(--ground);
-  border-right: 1px solid var(--hairline);
-  box-shadow: var(--shadow-pop);
-  z-index: 56;
-  transform: translateX(-105%);
-  transition: transform var(--dur) var(--ease);
-  padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
-}
-
-.chat-rail[data-open] {
-  transform: translateX(0);
-}
-
-.chat-scrim {
-  position: fixed;
-  inset: 0;
-  background: rgb(0 0 0 / 0.35);
-  z-index: 55;
-}
-
-.chat-rail-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 14px 16px 10px;
-}
-
-.chat-rail-title {
-  flex: 1;
-  font: var(--type-title);
-}
-
-.chat-rail-new,
-.chat-rail-close {
+.feed-chats-btn {
+  grid-column: 3;
+  justify-self: end;
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -58,21 +21,66 @@
   border: none;
   border-radius: var(--radius-chip);
   background: transparent;
-  color: var(--ink-2);
+  color: var(--accent);
   cursor: pointer;
 }
 
-.chat-rail-new:hover,
-.chat-rail-close:hover {
+.feed-chats-btn:hover {
   background: var(--surface-sunk);
-  color: var(--ink);
 }
 
+.feed-chats-badge {
+  position: absolute;
+  top: -2px;
+  right: -4px;
+  min-width: 15px;
+  padding: 1px 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font: var(--type-meta);
+  text-align: center;
+}
+
+/*
+ * Window-controls-overlay: the drag overlay (z-50) sits above the fixed
+ * header row (z-40), so a button inside that stacking context can never be
+ * clicked. Lift the trigger out as its own fixed element above the overlay
+ * (the drag-region comment in global.css sanctions interactive titlebar
+ * content above z-50), inset past the window controls on whichever side
+ * they occupy. The logomark gets the matching left inset.
+ */
+@media (display-mode: window-controls-overlay) {
+  .feed-header-row {
+    --wco-inset-left: env(titlebar-area-x, 0px);
+    --wco-inset-right: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw));
+  }
+
+  .feed-mark {
+    margin-left: max(0px, calc(var(--wco-inset-left) - 20px));
+  }
+
+  .feed-chats-btn {
+    position: fixed;
+    top: env(titlebar-area-y, 0px);
+    right: max(14px, var(--wco-inset-right));
+    height: var(--wco-title-strip-height);
+    width: 36px;
+    border-radius: 0;
+    z-index: 55;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+
+  .feed-chats-btn:hover {
+    background: transparent;
+    color: var(--accent-hover);
+  }
+}
+
+/* ── switcher dialog rows (inside a chat-modal) ── */
+
 .chat-list {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 0 8px 12px;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -169,44 +177,6 @@
 .chat-manage:hover {
   background: var(--surface-sunk);
   color: var(--ink);
-}
-
-/* ── wide: persistent rail beside the pane ── */
-
-@media (min-height: 600px) and (min-width: 800px) {
-  #app:has(.chat-rail) {
-    flex-direction: row;
-    justify-content: center;
-    align-items: center;
-    gap: 16px;
-  }
-
-  #app:has(.chat-rail) .feed-screen {
-    margin: 0;
-  }
-
-  .chat-rail,
-  .chat-rail[data-open] {
-    position: static;
-    transform: none;
-    width: 264px;
-    flex: none;
-    height: min(800px, calc(100dvh - 96px));
-    border: 1px solid var(--hairline);
-    border-radius: 14px;
-    box-shadow: var(--shadow-sheet), var(--card-highlight);
-    padding: 0;
-  }
-
-  .chat-scrim {
-    display: none !important;
-  }
-
-  /* The rail is always visible — no trigger, no close button. */
-  .composer-chats,
-  .chat-rail-close {
-    display: none;
-  }
 }
 
 /* ── in-feed banner (gone / paused chat) ── */

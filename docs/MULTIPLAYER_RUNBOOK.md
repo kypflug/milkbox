@@ -48,6 +48,7 @@ switcher/header in all four layout combos where noted: window-controls-overlay
 Setup & consent
 - [ ] Solo account that never touches chats is **never** shown the broad consent.
 - [ ] HOST creates a chat → consent interstitial → Microsoft prompt appears **exactly once**; invite sheet opens with QR + link.
+- [ ] The chats button (top right of the header) opens the switcher dialog and is clickable in all four WCO × pane layout combos (in window-controls-overlay it must sit beside — never under — the window controls); the unread badge shows on it.
 - [ ] Consent denial (cancel at Microsoft) lands the "You can try again anytime" toast — no redirect loop.
 - [ ] iOS standalone PWA: consent opens the in-app sheet; closing it resumes the create/join without a reload.
 
