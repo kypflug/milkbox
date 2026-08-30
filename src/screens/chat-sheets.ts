@@ -11,6 +11,7 @@ import { showToast } from '../components/toast';
 import { iconClose } from '../components/icons';
 import * as coordinator from '../services/sync-coordinator';
 import { encodeShareUrl } from '../services/chats';
+import { GraphHttpError } from '../services/graph';
 
 interface ModalHandle {
   el: HTMLElement;
@@ -135,7 +136,12 @@ export async function showInviteSheet(chatId: string): Promise<void> {
   } catch (err) {
     modal.close();
     console.warn('[Chats] Invite link failed:', err);
-    showToast('Couldn’t create the invite link. Check your connection and try again.', 'error');
+    showToast(
+      err instanceof GraphHttpError
+        ? `Couldn’t create the invite link — OneDrive error ${err.status}. Try again.`
+        : 'Couldn’t create the invite link. Check your connection and try again.',
+      'error',
+    );
     return;
   }
 
