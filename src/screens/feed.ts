@@ -1,13 +1,22 @@
 /**
- * The feed — a chat with yourself. Newest drops at the bottom, composer
+ * The feed screen — the private "chat with yourself" and, with a chat scope,
+ * a shared chat in someone's OneDrive. Newest drops at the bottom, composer
  * pinned underneath, day dividers between groups. Renders the newest
  * PAGE_SIZE drops; a sentinel at the top pages older ones in from IDB.
  */
 
-import type { DeviceProfile, DropMeta, DropRecord, SharePayload } from '../types';
+import {
+  PRIVATE_SCOPE,
+  scopeIdOf,
+  type DeviceProfile,
+  type DropMeta,
+  type DropRecord,
+  type Scope,
+  type SharePayload,
+} from '../types';
 import { ulid } from '../utils/ulid';
 import { dayKey } from '../utils/format';
-import { escapeHtml } from '../utils/storage';
+import { escapeAttr, escapeHtml } from '../utils/storage';
 import { getDeviceId, getDeviceInfo } from '../services/device';
 import { isBareUrl, domainOf } from '../services/link-meta';
 import * as coordinator from '../services/sync-coordinator';
@@ -15,10 +24,11 @@ import * as db from '../services/db';
 import { fetchThumbnail, downloadDropFile } from '../services/graph';
 import { onBroadcast } from '../services/broadcast';
 import { isNotifyEnabled } from '../services/notify';
-import { renderDropCard } from '../components/drop-card';
+import { renderDropCard, type DropCardPresentation } from '../components/drop-card';
 import { renderDayDivider } from '../components/day-divider';
 import { mountComposer, type ComposerApi } from '../components/composer';
 import { mountSettingsFlyout, type SettingsFlyoutApi } from './settings';
+import { startReconnectFlow } from '../services/chat-flows';
 import { showToast } from '../components/toast';
 import { iconBottle, iconClose } from '../components/icons';
 
@@ -28,10 +38,16 @@ let teardownFns: Array<() => void> = [];
 let composerApi: ComposerApi | null = null;
 let settingsFlyoutApi: SettingsFlyoutApi | null = null;
 
-/** Object URLs for thumbnails, keyed by drop id — survive re-renders. */
+/** Object URLs for thumbnails, keyed by `${scopeId}/${dropId}` — survive re-renders. */
 const thumbUrls = new Map<string, string>();
-/** Drops whose delete is pending the undo window. */
+/** Drops whose delete is pending the undo window, keyed by `${scopeId}/${dropId}`. */
 const pendingDeletes = new Map<string, ReturnType<typeof setTimeout>>();
+/**
+ * An unconfirmed share-target payload. Scope switches re-mount the composer,
+ * so the payload is held here and re-applied — it follows the user to
+ * whichever chat they pick, until they send (or it goes stale).
+ */
+let pendingSharePayload: SharePayload | null = null;
 
 export function teardownScreenListeners(): void {
   for (const fn of teardownFns) fn();
@@ -44,19 +60,30 @@ export function teardownScreenListeners(): void {
 
 export async function renderFeed(
   app: HTMLElement,
-  options: { openSettings?: boolean } = {},
+  options: { openSettings?: boolean; scope?: Scope } = {},
 ): Promise<void> {
+  const scope: Scope = options.scope ?? PRIVATE_SCOPE;
+  const scopeId = scopeIdOf(scope);
+  const isChat = scope.kind === 'chat';
+  const title = isChat ? scope.name : 'Milkbox';
+  const logLabel = isChat ? `Drops in ${scope.name}` : 'Your drops';
+
+  // A gone or paused chat renders read-only with a banner.
+  const chatRecord = isChat ? await db.getChat(scope.chatId) : undefined;
+  const chatState = chatRecord?.state ?? 'active';
+
   app.innerHTML = `
     <div class="feed-screen">
       <header class="feed-header">
         <div class="feed-header-row">
           <span class="feed-mark">${iconBottle('1.15em')}</span>
-          <span class="feed-wordmark">Milkbox</span>
+          <span class="feed-wordmark">${escapeHtml(title)}</span>
         </div>
       </header>
+      <div class="chat-banner" id="chatBanner" hidden></div>
       <div class="feed-scroll" id="feedScroll">
         <div class="feed-sentinel" id="feedSentinel"></div>
-        <div class="feed-list" id="feedList" role="log" aria-label="Your drops"></div>
+        <div class="feed-list" id="feedList" role="log" aria-label="${escapeAttr(logLabel)}"></div>
       </div>
       <div class="composer-region" id="composerRegion">
         <div class="settings-flyout-mount"></div>
@@ -70,6 +97,17 @@ export async function renderFeed(
 
   let visibleCount = PAGE_SIZE;
   let feed: DropRecord[] = [];
+  const mkey = (id: string) => `${scopeId}/${id}`;
+
+  // Author identity for chat attribution. Resolved from IDB after the first
+  // ever fetch; for the private feed it's never awaited on the render path.
+  const mePromise = isChat ? coordinator.ensureMe() : Promise.resolve(null);
+
+  /** Informational toasts yield to a pending delete-undo toast (a new toast
+   *  would destroy the undo affordance while its timer keeps running). */
+  const infoToast = (message: string) => {
+    if (pendingDeletes.size === 0) showToast(message);
+  };
 
   function nearBottom(): boolean {
     return scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 120;
@@ -79,24 +117,42 @@ export async function renderFeed(
     scrollEl.scrollTop = scrollEl.scrollHeight;
   }
 
+  function permsFor(own: boolean): { canEdit: boolean; canDelete: boolean } {
+    if (!isChat) return { canEdit: true, canDelete: true };
+    return { canEdit: own, canDelete: own || scope.role === 'host' };
+  }
+
+  /** Re-render deferred while an inline editor is open — any member posting
+   *  would otherwise destroy in-progress typing (full-innerHTML pipeline). */
+  let pendingRefresh: { stick?: boolean } | null = null;
+
   async function refresh(opts: { stick?: boolean } = {}): Promise<void> {
+    if (listEl.querySelector('.drop-edit')) {
+      pendingRefresh = { ...(pendingRefresh ?? {}), ...opts };
+      return;
+    }
     const stick = opts.stick ?? nearBottom();
-    const [loadedFeed, profiles] = await Promise.all([
-      coordinator.loadFeed(),
-      coordinator.loadDeviceProfiles(),
+    const [loadedFeed, profiles, me] = await Promise.all([
+      coordinator.loadFeed(scopeId),
+      isChat ? Promise.resolve([] as DeviceProfile[]) : coordinator.loadDeviceProfiles(),
+      mePromise,
     ]);
     feed = loadedFeed;
     const deviceLabels = buildDeviceLabels(profiles);
     const currentDeviceId = getDeviceId();
-    const visible = feed.slice(-visibleCount).filter(r => !pendingDeletes.has(r.meta.id));
+    const visible = feed.slice(-visibleCount).filter(r => !pendingDeletes.has(mkey(r.meta.id)));
 
     let html = '';
     if (visible.length === 0) {
+      const emptyTitle = isChat ? 'Say hello' : 'The milkbox is empty';
+      const emptyDek = isChat
+        ? `Drops shared here appear for everyone in ${escapeHtml(scope.name)}.`
+        : 'Drop a note, a link, or a file below. It shows up on every device you sign in on.';
       html = `
         <div class="feed-empty">
           <div class="feed-empty-glyph">${iconBottle('40px')}</div>
-          <p class="feed-empty-title">The milkbox is empty</p>
-          <p class="feed-empty-dek">Drop a note, a link, or a file below. It shows up on every device you sign in on.</p>
+          <p class="feed-empty-title">${emptyTitle}</p>
+          <p class="feed-empty-dek">${emptyDek}</p>
         </div>`;
     } else {
       let lastDay = '';
@@ -106,17 +162,39 @@ export async function renderFeed(
           html += renderDayDivider(record.meta.createdAt);
           lastDay = day;
         }
-        const profileId = record.meta.device.id;
-        html += renderDropCard(record, {
-          side: profileId === currentDeviceId ? 'sent' : 'received',
-          deviceLabel: (profileId && deviceLabels.get(profileId)) || record.meta.device.name,
-        });
+        let own: boolean;
+        let attributionLabel: string;
+        if (isChat) {
+          own = !!me && record.meta.author?.id === me.id;
+          attributionLabel = record.meta.author?.name ?? scope.host.name;
+        } else {
+          const profileId = record.meta.device.id;
+          own = profileId === currentDeviceId;
+          attributionLabel = (profileId && deviceLabels.get(profileId)) || record.meta.device.name;
+        }
+        const presentation: DropCardPresentation = {
+          side: own ? 'sent' : 'received',
+          attributionLabel,
+          ...permsFor(own),
+        };
+        html += renderDropCard(record, presentation);
       }
     }
     listEl.innerHTML = html;
     hydrateImages();
     hydrateFavicons();
     if (stick) scrollToBottom();
+
+    if (isChat && document.visibilityState === 'visible') {
+      const lastId = feed.length ? feed[feed.length - 1].meta.id : undefined;
+      void coordinator.markScopeRead(scopeId, lastId);
+    }
+  }
+
+  function flushPendingRefresh(): void {
+    const queued = pendingRefresh;
+    pendingRefresh = null;
+    if (queued) void refresh(queued);
   }
 
   /**
@@ -131,28 +209,28 @@ export async function renderFeed(
   function hydrateImages(): void {
     listEl.querySelectorAll<HTMLImageElement>('img[data-thumb-id]').forEach(async img => {
       const id = img.dataset.thumbId!;
-      const cached = thumbUrls.get(id);
+      const cached = thumbUrls.get(mkey(id));
       if (cached) {
         img.src = cached;
         img.classList.add('loaded');
         return;
       }
-      let blob = (await db.getThumb(id).catch(() => undefined))
-        || (await db.getCachedBlob(id).catch(() => undefined));
+      let blob = (await db.getThumb(scopeId, id).catch(() => undefined))
+        || (await db.getCachedBlob(scopeId, id).catch(() => undefined));
       if (!blob) {
         const record = feed.find(r => r.meta.id === id);
         const file = record?.meta.file;
         if (!file?.itemId) return;
         try {
-          const fetched = await fetchThumbnail(file.itemId);
+          const fetched = await fetchThumbnail(scope, file.itemId);
           if (fetched) {
             blob = fetched;
-            await db.putThumb(id, fetched).catch(() => {});
+            await db.putThumb(scopeId, id, fetched).catch(() => {});
           } else if (file.size <= FULL_IMAGE_PREVIEW_LIMIT) {
             // No thumbnail (not generated yet, or unsupported format) —
             // the image itself is small enough to be its own preview.
-            blob = await downloadDropFile(file.itemId);
-            await db.putCachedBlob(id, blob).catch(() => {});
+            blob = await downloadDropFile(scope, file.itemId);
+            await db.putCachedBlob(scopeId, id, blob).catch(() => {});
           }
         } catch { /* offline or transient — retry below */ }
         if (!blob && !thumbRetried.has(id)) {
@@ -164,7 +242,7 @@ export async function renderFeed(
       }
       if (blob) {
         const url = URL.createObjectURL(blob);
-        thumbUrls.set(id, url);
+        thumbUrls.set(mkey(id), url);
         img.src = url;
         img.classList.add('loaded');
       }
@@ -207,18 +285,20 @@ export async function renderFeed(
       });
     }
 
-    if (text && files.length === 0) {
-      if (isBareUrl(text)) {
-        const url = text.trim();
+    const trimmed = text.trim();
+    if (trimmed && files.length === 0) {
+      const id = ulid();
+      if (isBareUrl(trimmed)) {
         out.push({
           meta: {
-            v: 1, id: ulid(), kind: 'link', createdAt: Date.now(), device,
-            url, link: { domain: domainOf(url) },
+            v: 1, id, kind: 'link', createdAt: Date.now(), device,
+            url: trimmed,
+            link: { domain: domainOf(trimmed) },
           },
         });
       } else {
         out.push({
-          meta: { v: 1, id: ulid(), kind: 'text', createdAt: Date.now(), device, text },
+          meta: { v: 1, id, kind: 'text', createdAt: Date.now(), device, text: trimmed },
         });
       }
     }
@@ -227,9 +307,9 @@ export async function renderFeed(
 
   async function measureImage(blob: Blob): Promise<{ width: number; height: number } | null> {
     try {
-      const bmp = await createImageBitmap(blob);
-      const dims = { width: bmp.width, height: bmp.height };
-      bmp.close();
+      const bitmap = await createImageBitmap(blob);
+      const dims = { width: bitmap.width, height: bitmap.height };
+      bitmap.close();
       return dims;
     } catch {
       return null;
@@ -237,16 +317,22 @@ export async function renderFeed(
   }
 
   async function send(text: string, files: File[]): Promise<void> {
+    pendingSharePayload = null; // whatever was shared has found its home
     const drops = buildDrops(text, files);
-    for (const drop of drops) {
-      if (drop.meta.kind === 'image' && drop.blob) {
-        const dims = await measureImage(drop.blob);
-        if (dims && drop.meta.file) {
-          drop.meta.file.width = dims.width;
-          drop.meta.file.height = dims.height;
+    try {
+      for (const drop of drops) {
+        if (drop.meta.kind === 'image' && drop.blob) {
+          const dims = await measureImage(drop.blob);
+          if (dims && drop.meta.file) {
+            drop.meta.file.width = dims.width;
+            drop.meta.file.height = dims.height;
+          }
         }
+        await coordinator.enqueueCreate(scope, drop.meta, drop.blob);
       }
-      await coordinator.enqueueCreate(drop.meta, drop.blob);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Could not send', 'error');
+      return;
     }
     await refresh({ stick: true });
   }
@@ -255,8 +341,37 @@ export async function renderFeed(
     document.getElementById('composerMount')!,
     (text, files) => void send(text, files),
     name => showToast(`"${name}" is over 250 MB — too big for the milkbox`, 'error'),
-    () => coordinator.requestSync({ force: true }),
+    () => coordinator.requestSync(scope, { force: true }),
+    { placeholder: isChat ? `Message ${scope.name}` : undefined },
   );
+
+  // Gone / paused chat: banner + composer greyed out. Read-only otherwise.
+  const banner = document.getElementById('chatBanner')!;
+  if (isChat && chatState !== 'active') {
+    banner.hidden = false;
+    if (chatState === 'gone') {
+      banner.innerHTML = `
+        <span class="chat-banner-text">You no longer have access to this chat. Showing what was last synced.</span>
+        <button class="chat-banner-action" data-banner="remove">Remove from list</button>`;
+      composerApi.setDisabled(true, 'No access');
+    } else {
+      banner.innerHTML = `
+        <span class="chat-banner-text">This chat is paused — Milkbox lost its OneDrive access.</span>
+        <button class="chat-banner-action" data-banner="reconnect">Reconnect</button>`;
+      composerApi.setDisabled(true, 'Paused');
+    }
+    banner.addEventListener('click', async e => {
+      const action = (e.target as HTMLElement).closest<HTMLElement>('[data-banner]')?.dataset.banner;
+      if (action === 'remove') {
+        await coordinator.removeChatLocally(scope.chatId);
+        history.replaceState(null, '', '/');
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      } else if (action === 'reconnect') {
+        startReconnectFlow(scope.chatId);
+      }
+    });
+  }
+
   const settingsTrigger = app.querySelector<HTMLButtonElement>('.composer-settings')!;
   settingsFlyoutApi = mountSettingsFlyout(
     app.querySelector<HTMLElement>('.settings-flyout-mount')!,
@@ -278,12 +393,18 @@ export async function renderFeed(
     if (!record) return;
     const action = actionEl.dataset.action!;
 
+    // Re-check moderation on dispatch — the DOM is user-editable, the rules
+    // aren't (soft-enforced, but not bypassable by editing a button in).
+    const me = await mePromise;
+    const own = isChat ? !!me && record.meta.author?.id === me.id : true;
+    const perms = permsFor(own);
+
     switch (action) {
       case 'copy': {
         const value = record.meta.kind === 'link' ? record.meta.url || '' : record.meta.text || '';
         try {
           await navigator.clipboard.writeText(value);
-          showToast('Copied');
+          infoToast('Copied');
         } catch {
           showToast('Copy failed', 'error');
         }
@@ -296,10 +417,10 @@ export async function renderFeed(
         await openLightbox(record);
         break;
       case 'edit':
-        startInlineEdit(card, record);
+        if (perms.canEdit) startInlineEdit(card, record);
         break;
       case 'delete':
-        scheduleDelete(record);
+        if (perms.canDelete) scheduleDelete(record);
         break;
       case 'retry':
         await coordinator.retryOutboxRecord(id);
@@ -313,17 +434,17 @@ export async function renderFeed(
   function scheduleDelete(record: DropRecord): void {
     const id = record.meta.id;
     const timer = setTimeout(() => {
-      pendingDeletes.delete(id);
-      void coordinator.enqueueDelete(id);
+      pendingDeletes.delete(mkey(id));
+      void coordinator.enqueueDelete(scope, id);
     }, 5000);
-    pendingDeletes.set(id, timer);
+    pendingDeletes.set(mkey(id), timer);
     void refresh();
     showToast('Drop deleted', 'info', {
       label: 'Undo',
       duration: 5000,
       onClick: () => {
         clearTimeout(timer);
-        pendingDeletes.delete(id);
+        pendingDeletes.delete(mkey(id));
         void refresh();
       },
     });
@@ -333,16 +454,16 @@ export async function renderFeed(
     const f = record.meta.file;
     if (!f) return;
     try {
-      let blob = await db.getCachedBlob(record.meta.id).catch(() => undefined);
+      let blob = await db.getCachedBlob(scopeId, record.meta.id).catch(() => undefined);
       if (!blob) {
         if (!f.itemId) {
-          showToast('Still uploading…');
+          infoToast('Still uploading…');
           return;
         }
-        showToast('Downloading…');
-        blob = await downloadDropFile(f.itemId);
+        infoToast('Downloading…');
+        blob = await downloadDropFile(scope, f.itemId);
         if (record.meta.kind === 'image') {
-          await db.putCachedBlob(record.meta.id, blob).catch(() => {});
+          await db.putCachedBlob(scopeId, record.meta.id, blob).catch(() => {});
         }
       }
       const url = URL.createObjectURL(blob);
@@ -364,7 +485,7 @@ export async function renderFeed(
     overlay.className = 'lightbox';
     overlay.innerHTML = `
       <button class="lightbox-close" aria-label="Close">${iconClose('1.3em')}</button>
-      <img class="lightbox-img" alt="${escapeHtml(f.name)}">
+      <img class="lightbox-img" alt="${escapeAttr(f.name)}">
       <div class="lightbox-caption">${escapeHtml(f.name)}</div>
     `;
     const close = () => overlay.remove();
@@ -382,13 +503,13 @@ export async function renderFeed(
 
     const img = overlay.querySelector<HTMLImageElement>('.lightbox-img')!;
     // Show the thumb instantly, then swap in the full-res image
-    const thumbUrl = thumbUrls.get(record.meta.id);
+    const thumbUrl = thumbUrls.get(mkey(record.meta.id));
     if (thumbUrl) img.src = thumbUrl;
     try {
-      let blob = await db.getCachedBlob(record.meta.id).catch(() => undefined);
+      let blob = await db.getCachedBlob(scopeId, record.meta.id).catch(() => undefined);
       if (!blob && f.itemId) {
-        blob = await downloadDropFile(f.itemId);
-        await db.putCachedBlob(record.meta.id, blob).catch(() => {});
+        blob = await downloadDropFile(scope, f.itemId);
+        await db.putCachedBlob(scopeId, record.meta.id, blob).catch(() => {});
       }
       if (blob) img.src = URL.createObjectURL(blob);
     } catch { /* keep the thumb */ }
@@ -412,14 +533,25 @@ export async function renderFeed(
     input.focus();
     input.setSelectionRange(input.value.length, input.value.length);
 
-    editor.querySelector('.drop-edit-cancel')!.addEventListener('click', () => void refresh());
+    // Remove the editor before re-rendering so the deferred-refresh guard
+    // can't wedge on our own editor node.
+    const closeEditor = () => {
+      editor.remove();
+      flushPendingRefresh();
+    };
+    editor.querySelector('.drop-edit-cancel')!.addEventListener('click', () => {
+      closeEditor();
+      void refresh();
+    });
     editor.querySelector('.drop-edit-save')!.addEventListener('click', async () => {
       const text = input.value.trim();
       if (!text || text === record.meta.text) {
+        closeEditor();
         void refresh();
         return;
       }
-      await coordinator.enqueueEdit({ ...record.meta, text, editedAt: Date.now() });
+      closeEditor();
+      await coordinator.enqueueEdit(scope, { ...record.meta, text, editedAt: Date.now() });
     });
   }
 
@@ -438,6 +570,8 @@ export async function renderFeed(
   // ── sync wiring ──
 
   const offCoordinator = coordinator.onCoordinatorEvent(event => {
+    if (event.type === 'chats-changed') return; // the switcher's concern
+    if (event.scopeId !== scopeId) return;
     switch (event.type) {
       case 'sync-start':
         composerApi?.setSyncState('syncing');
@@ -451,9 +585,12 @@ export async function renderFeed(
       case 'feed-updated':
         void refresh();
         break;
+      case 'drop-conflict':
+        showToast('A drop you changed was edited or removed by someone else', 'error');
+        break;
       case 'drop-progress': {
         const bar = listEl.querySelector<HTMLElement>(
-          `[data-drop-id="${event.dropId}"] .drop-image-progress`,
+          `[data-drop-id="${CSS.escape(event.dropId)}"] .drop-image-progress`,
         );
         if (bar) {
           bar.hidden = false;
@@ -468,42 +605,54 @@ export async function renderFeed(
 
   const offBroadcast = onBroadcast(event => {
     if (event.type === 'sync-complete' || event.type === 'drop-mutated') {
-      coordinator.refreshFromCache();
+      // Old builds broadcast without a scopeId — treat those as ours.
+      coordinator.refreshFromCache(event.scopeId ?? scopeId);
     }
   });
   teardownFns.push(offBroadcast);
 
   // Poll while visible — gated by the folder cTag check, so the steady-state
-  // cost is one tiny GET per tick. With notifications on we keep ticking
-  // while hidden too, since that poll is the only thing that can spot an
-  // arrival to announce; browsers clamp hidden-tab timers to about a minute,
-  // which is the gentler cadence we want there anyway.
+  // cost is a few tiny GETs per tick (active scope + one background scope).
+  // With notifications on we keep ticking while hidden too, since that poll
+  // is the only thing that can spot an arrival to announce; browsers clamp
+  // hidden-tab timers to about a minute, the gentler cadence we want there.
   const poll = setInterval(() => {
     if (document.visibilityState === 'visible' || isNotifyEnabled()) {
-      void coordinator.pollTick();
+      void coordinator.pollAll(scopeId);
     }
   }, 45_000);
   teardownFns.push(() => clearInterval(poll));
 
   const onVisible = () => {
-    if (document.visibilityState === 'visible') void coordinator.requestSync();
+    if (document.visibilityState === 'visible') void coordinator.requestSync(scope);
   };
   document.addEventListener('visibilitychange', onVisible);
   teardownFns.push(() => document.removeEventListener('visibilitychange', onVisible));
 
+  // A share payload that arrived before this scope was picked follows the
+  // user across switches until they send it.
+  if (pendingSharePayload && chatState === 'active') {
+    fillComposerFromShare(pendingSharePayload);
+  }
+
   // ── first paint: IDB-first render, then network ──
 
   await refresh({ stick: true });
-  void coordinator.requestSync({ force: true });
+  void coordinator.requestSync(scope, { force: true });
 }
 
-/** Handle a share-target payload: pre-fill the composer, never auto-send. */
-export function applySharePayload(payload: SharePayload): void {
+function fillComposerFromShare(payload: SharePayload): void {
   if (!composerApi) return;
   const text = payload.url || payload.text || payload.title || '';
   if (text) composerApi.setText(text);
   if (payload.files.length) composerApi.addFiles(payload.files);
   composerApi.focus();
+}
+
+/** Handle a share-target payload: pre-fill the composer, never auto-send. */
+export function applySharePayload(payload: SharePayload): void {
+  pendingSharePayload = payload;
+  fillComposerFromShare(payload);
 }
 
 function sanitizeName(name: string): string {

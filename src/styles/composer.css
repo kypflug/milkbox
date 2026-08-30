@@ -53,6 +53,7 @@
 
 .composer-attach,
 .composer-settings,
+.composer-chats,
 .composer-refresh {
   flex: none;
   display: grid;
@@ -65,6 +66,7 @@
 }
 .composer-attach:hover,
 .composer-settings:hover,
+.composer-chats:hover,
 .composer-refresh:hover { color: var(--ink); background: var(--surface-sunk); }
 .composer-refresh:disabled { cursor: default; opacity: 0.55; }
 .composer-refresh.syncing svg {

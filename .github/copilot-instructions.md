@@ -1,11 +1,18 @@
 # Milkbox review guidance
 
-- Preserve the privacy boundary: Milkbox is a static client and may access only
-  the signed-in user's OneDrive App Folder through
-  `Files.ReadWrite.AppFolder`. Never add service credentials or broader Graph
-  scopes.
+- Preserve the privacy boundary: Milkbox is a static client with no server.
+  Sign-in and all private-feed traffic use only the signed-in user's OneDrive
+  App Folder through `Files.ReadWrite.AppFolder`. The one sanctioned broader
+  scope is delegated `Files.ReadWrite` for shared chats, and it may only ever
+  be requested through the incremental-consent flow in `src/services/auth.ts`
+  (share tier) after an explicit user action — never at sign-in, never for
+  solo users, and never any other scope or credential.
+- Treat everything parsed from OneDrive as untrusted input: shared-chat JSON
+  is written by other members' clients. New remote-parsed shapes go through
+  `src/services/validate-drop.ts`-style validators, and every HTML attribute
+  interpolation uses `escapeAttr`.
 - Keep drop JSON backward compatible. Existing records may not have a device
-  ID, file metadata, or fields introduced by newer clients.
+  ID, an `author`, file metadata, or fields introduced by newer clients.
 - Preserve offline-first behavior. Mutations must survive reloads in the
   persistent outbox, and optional metadata/profile sync must not block drop
   delivery.

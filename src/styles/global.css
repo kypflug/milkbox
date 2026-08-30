@@ -26,6 +26,7 @@
 @import './composer.css';
 @import './sign-in.css';
 @import './settings.css';
+@import './chats.css';
 
 @font-face {
   font-family: 'Schibsted Grotesk';

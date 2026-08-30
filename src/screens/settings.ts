@@ -2,7 +2,7 @@ import { getUserDisplayName, getUserEmail, signOut } from '../services/auth';
 import { getDeviceName } from '../services/device';
 import { getTheme, applyTheme } from '../theme';
 import { clearAllData } from '../services/db';
-import { escapeHtml } from '../utils/storage';
+import { escapeAttr, escapeHtml } from '../utils/storage';
 import { showToast } from '../components/toast';
 import { iconClose } from '../components/icons';
 import { renameCurrentDevice } from '../services/sync-coordinator';
@@ -59,7 +59,7 @@ export function mountSettingsFlyout(
           <h3 class="settings-label">This device</h3>
           <p class="settings-hint">Shown on drops you send from here.</p>
           <input class="settings-input" type="text" maxlength="40"
-                 value="${escapeHtml(getDeviceName())}" aria-label="Device name">
+                 value="${escapeAttr(getDeviceName())}" aria-label="Device name">
         </section>
 
         ${
@@ -97,8 +97,13 @@ export function mountSettingsFlyout(
         <section class="settings-section">
           <h3 class="settings-label">About</h3>
           <p class="settings-hint">
-            Drops are stored in your OneDrive under <span class="settings-mono">Apps/Milkbox</span>.
+            Your private drops are stored in your OneDrive under <span class="settings-mono">Apps/Milkbox</span>.
             Delete the folder there and everything is gone — this app keeps no other copy.
+          </p>
+          <p class="settings-hint">
+            Shared chats live in the chat host's OneDrive. OneDrive grants every member edit
+            access to the whole chat folder — Milkbox's own-drops-only rules are app-level
+            courtesy, not OneDrive enforcement.
           </p>
         </section>
       </div>

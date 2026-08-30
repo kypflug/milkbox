@@ -31,6 +31,9 @@ interface NotifyItem {
   id: string;
   title: string;
   body: string;
+  /** Scope the drop landed in ('private' | 'chat:<ulid>'). Optional — items
+   *  from an older tab won't carry it, and that's fine. */
+  scopeId?: string;
 }
 
 type SwMessage =
@@ -43,7 +46,8 @@ type SwMessage =
  */
 function isNotifyItem(value: unknown): value is NotifyItem {
   if (typeof value !== 'object' || value === null) return false;
-  const { id, title, body } = value as Record<string, unknown>;
+  const { id, title, body, scopeId } = value as Record<string, unknown>;
+  if (scopeId !== undefined && typeof scopeId !== 'string') return false;
   return typeof id === 'string' && typeof title === 'string' && typeof body === 'string';
 }
 
@@ -103,7 +107,7 @@ async function announce(items: readonly unknown[]): Promise<void> {
         tag: `milkbox-drop-${item.id}`,
         icon: '/icons/icon-192.png',
         badge: '/icons/icon-48.png',
-        data: { dropId: item.id },
+        data: { dropId: item.id, scopeId: item.scopeId },
       });
     } catch (err) {
       // Permission can be revoked while this worker is still alive. Announcing
@@ -116,6 +120,12 @@ async function announce(items: readonly unknown[]): Promise<void> {
 
 self.addEventListener('notificationclick', event => {
   event.notification.close();
+  const scopeId = (event.notification.data as { scopeId?: string } | undefined)?.scopeId;
+  // Crockford base32 only — anything else falls back to the private feed.
+  // '#private' (not '/') because a bare open restores the last active scope,
+  // which could be some chat — a private-feed notification must not land there.
+  const chatId = scopeId?.startsWith('chat:') ? scopeId.slice(5) : null;
+  const target = chatId && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(chatId) ? `/#chat/${chatId}` : '/#private';
   event.waitUntil(
     (async () => {
       // Reuse an open window when there is one — matching the manifest's
@@ -129,9 +139,11 @@ self.addEventListener('notificationclick', event => {
       );
       if (existing) {
         await existing.focus();
+        // The page routes by hash; tell it which scope the tap meant.
+        existing.postMessage({ type: 'MILKBOX_OPEN_SCOPE', scopeId: scopeId ?? 'private' });
         return;
       }
-      await self.clients.openWindow('/');
+      await self.clients.openWindow(target);
     })(),
   );
 });

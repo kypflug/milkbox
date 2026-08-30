@@ -3,18 +3,26 @@ import { showToast } from '../components/toast';
 import { iconBottle } from '../components/icons';
 
 /**
- * Sign-in screen — the doorstep. One sheet, one button.
+ * Sign-in screen — the doorstep. One sheet, one button. The invited variant
+ * greets someone who arrived through a chat invite link.
  */
-export function renderSignIn(app: HTMLElement, _onSignedIn: () => void): void {
+export function renderSignIn(
+  app: HTMLElement,
+  _onSignedIn: () => void,
+  opts: { invited?: boolean } = {},
+): void {
+  const dek = opts.invited
+    ? 'You’ve been invited to a Milkbox chat. Sign in to join.'
+    : 'A chat with yourself. Drop text, links, and files here; they land on every device.';
   app.innerHTML = `
     <div class="sign-in-screen">
       <div class="boot-titlebar" aria-hidden="true"></div>
       <div class="sign-in-sheet">
         <div class="sign-in-glyph">${iconBottle('44px')}</div>
         <h1 class="sign-in-title">Milkbox</h1>
-        <p class="sign-in-dek">A chat with yourself. Drop text, links, and files here; they land on every device.</p>
+        <p class="sign-in-dek">${dek}</p>
         <button class="sign-in-button" id="signInBtn">Sign in with Microsoft</button>
-        <p class="sign-in-fine">Your drops live in your own OneDrive, in a private app folder. Nothing is stored anywhere else.</p>
+        <p class="sign-in-fine">Your private drops live in your own OneDrive, in a private app folder. Shared chats live in their host’s OneDrive.</p>
       </div>
     </div>
   `;

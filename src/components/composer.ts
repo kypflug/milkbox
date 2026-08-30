@@ -6,8 +6,8 @@
  * with the text and files and lets the feed screen queue drops.
  */
 
-import { iconAttach, iconSend, iconClose, iconFile, iconRefresh, iconSettings } from './icons';
-import { escapeHtml } from '../utils/storage';
+import { iconAttach, iconSend, iconClose, iconFile, iconRefresh, iconSettings, iconChats } from './icons';
+import { escapeAttr, escapeHtml } from '../utils/storage';
 import { formatBytes } from '../utils/format';
 
 export interface ComposerApi {
@@ -17,6 +17,8 @@ export interface ComposerApi {
   addFiles(files: File[]): void;
   focus(): void;
   setSyncState(state: 'syncing' | 'synced' | 'error'): void;
+  /** Grey out sending (a gone chat) — refresh/settings/chats stay usable. */
+  setDisabled(disabled: boolean, placeholder?: string): void;
   teardown(): void;
 }
 
@@ -28,14 +30,17 @@ export function mountComposer(
   onSend: (text: string, files: File[]) => void,
   onOversize: (name: string) => void,
   onRefresh: () => Promise<void>,
+  opts: { placeholder?: string } = {},
 ): ComposerApi {
   container.innerHTML = `
     <div class="composer">
       <div class="composer-chips" hidden></div>
       <div class="composer-row">
         <button class="composer-attach" title="Attach files" aria-label="Attach files">${iconAttach('1.25em')}</button>
-        <textarea class="composer-input" rows="1" placeholder="Drop something…" aria-label="Message"></textarea>
+        <textarea class="composer-input" rows="1" placeholder="${escapeAttr(opts.placeholder || 'Drop something…')}" aria-label="Message"></textarea>
         <span class="composer-tools">
+          <button class="composer-chats" title="Chats" aria-label="Chats"
+                  aria-haspopup="dialog">${iconChats('1.15em')}</button>
           <button class="composer-refresh" title="Refresh" aria-label="Refresh">${iconRefresh('1.15em')}</button>
           <button class="composer-settings" title="Settings" aria-label="Settings"
                   aria-haspopup="dialog">${iconSettings('1.15em')}</button>
@@ -99,7 +104,7 @@ export function mountComposer(
           <span class="composer-chip-glyph">${iconFile('0.9em')}</span>
           <span class="composer-chip-name">${escapeHtml(f.name)}</span>
           <span class="composer-chip-size">${formatBytes(f.size)}</span>
-          <button class="composer-chip-remove" data-index="${i}" title="Remove" aria-label="Remove ${escapeHtml(f.name)}">${iconClose('0.85em')}</button>
+          <button class="composer-chip-remove" data-index="${i}" title="Remove" aria-label="Remove ${escapeAttr(f.name)}">${iconClose('0.85em')}</button>
         </span>`,
       )
       .join('');
@@ -205,6 +210,14 @@ export function mountComposer(
     addFiles,
     focus: () => inputEl.focus(),
     setSyncState,
+    setDisabled(disabled: boolean, placeholder?: string) {
+      inputEl.disabled = disabled;
+      sendBtn.disabled = disabled;
+      attachBtn.disabled = disabled;
+      inputEl.placeholder = disabled
+        ? (placeholder || 'No access')
+        : (opts.placeholder || 'Drop something…');
+    },
     teardown() {
       document.removeEventListener('paste', onPaste);
       window.removeEventListener('dragenter', onDragEnter);

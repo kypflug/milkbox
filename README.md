@@ -3,24 +3,34 @@
 [![CI](https://github.com/kypflug/milkbox/actions/workflows/ci.yml/badge.svg)](https://github.com/kypflug/milkbox/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A chat with yourself. Drop text, links, files, and photos; they land on every
-device you sign in on — like leaving something in the milkbox on a neighbor's
-stoop.
+A chat with yourself — and, when you want company, shared chats with other
+people. Drop text, links, files, and photos; they land on every device you
+sign in on — like leaving something in the milkbox on a neighbor's stoop.
 
 A lightweight replacement for the deprecated Microsoft Edge "Drop" feature,
 built as an installable PWA. Live at [milkbox.stuntcamp.app](https://milkbox.stuntcamp.app).
 
 ## How it works
 
-- **Sign in with your Microsoft account.** Milkbox stores everything in a
-  private app folder in *your* OneDrive (`Apps/Milkbox`) via Microsoft Graph
-  with the minimal `Files.ReadWrite.AppFolder` scope. There is no server —
-  the app is static files; your data never transits anything else.
+- **Sign in with your Microsoft account.** Milkbox stores your private feed
+  in a private app folder in *your* OneDrive (`Apps/Milkbox`) via Microsoft
+  Graph with the minimal `Files.ReadWrite.AppFolder` scope. There is no
+  server — the app is static files; your data never transits anything else.
 - **Each drop is a tiny JSON** (`drops/<ulid>.json`) tracked by the Graph
   delta API; file payloads live beside them (`files/<ulid>/…`), uploaded
   resumably in 10 MiB chunks when large. Device profiles live separately in
   `devices/<id>.json`, so renames update historical attribution without
   rewriting drops. Folder-cTag checks keep steady-state polling small.
+- **Shared chats are the same model, shared.** A chat is a folder in the
+  *host's* OneDrive (`Apps/Milkbox/chats/<id>`) with the same drops/files
+  layout plus a member registry; the host invites people with a OneDrive
+  sharing link (shown as a QR code), and everyone syncs the folder directly —
+  still no server. Because sharing reaches outside the app folder, the first
+  time you create or join a chat Milkbox asks — once, and only then — for the
+  broader delegated `Files.ReadWrite` permission; users who never touch
+  shared chats never see that prompt. OneDrive permissions are folder-wide,
+  so the own-drops-only editing rules are enforced by the app's UI, not by
+  OneDrive — invite people you trust.
 - **Offline-first.** The feed renders from IndexedDB instantly; sends queue
   in a persistent outbox that survives reloads and drains on reconnect.
 - **Notifications without a server.** Opt in from Settings and a

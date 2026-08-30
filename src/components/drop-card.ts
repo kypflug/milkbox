@@ -1,33 +1,40 @@
 import type { DropRecord } from '../types';
-import { escapeHtml } from '../utils/storage';
+import { escapeAttr, escapeHtml } from '../utils/storage';
 import { formatBytes, formatTime } from '../utils/format';
 import { domainOf, faviconUrl } from '../services/link-meta';
 import { iconFile, iconLink, iconCopy, iconDownload, iconEdit, iconTrash, iconRetry, iconClose } from './icons';
 
 export interface DropCardPresentation {
   side: 'sent' | 'received';
-  deviceLabel: string;
+  /** Meta-line label: device label (private feed) or author name (chat). */
+  attributionLabel: string;
+  /** Own text drop, not pending. */
+  canEdit: boolean;
+  /** Own drop — or the viewer hosts the chat (soft-enforced moderation). */
+  canDelete: boolean;
 }
 
 /** Linkify bare URLs inside already-escaped text. */
 function linkify(escaped: string): string {
   return escaped.replace(
     /https?:\/\/[^\s<]+/g,
-    url => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`,
+    // The match is already HTML-escaped text, but quotes survive escapeHtml
+    // and would break out of the href attribute.
+    url => `<a href="${url.replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer">${url}</a>`,
   );
 }
 
-function metaLine(record: DropRecord, deviceLabel: string): string {
+function metaLine(record: DropRecord, attributionLabel: string): string {
   const { meta, state } = record;
   const time = formatTime(meta.createdAt);
-  const device = escapeHtml(deviceLabel);
+  const label = escapeHtml(attributionLabel);
   const edited = meta.editedAt ? ' · EDITED' : '';
   const status =
     state === 'sending' ? ' · SENDING' : state === 'failed' ? ' · FAILED' : '';
-  return `<div class="drop-meta">${time} · ${device}${edited}${status}</div>`;
+  return `<div class="drop-meta">${time} · ${label}${edited}${status}</div>`;
 }
 
-function actionsRow(record: DropRecord): string {
+function actionsRow(record: DropRecord, presentation: DropCardPresentation): string {
   const { meta, state } = record;
   if (state === 'failed') {
     return `
@@ -43,10 +50,13 @@ function actionsRow(record: DropRecord): string {
   if (meta.kind === 'file' || meta.kind === 'image') {
     buttons.push(`<button class="drop-action" data-action="download" title="Download">${iconDownload()}</button>`);
   }
-  if (meta.kind === 'text' && !state) {
+  if (presentation.canEdit && meta.kind === 'text' && !state) {
     buttons.push(`<button class="drop-action" data-action="edit" title="Edit">${iconEdit()}</button>`);
   }
-  buttons.push(`<button class="drop-action drop-action-danger" data-action="delete" title="Delete">${iconTrash()}</button>`);
+  if (presentation.canDelete) {
+    buttons.push(`<button class="drop-action drop-action-danger" data-action="delete" title="Delete">${iconTrash()}</button>`);
+  }
+  if (!buttons.length) return '';
   return `<div class="drop-actions" role="toolbar" aria-label="Drop actions">${buttons.join('')}</div>`;
 }
 
@@ -58,11 +68,14 @@ function bodyFor(record: DropRecord): string {
 
     case 'link': {
       const url = meta.url || '';
+      // Remote drop JSON goes through the ingest validator, but keep the
+      // protocol check here too — an href must never carry javascript: etc.
+      const href = /^https?:\/\//i.test(url) ? url : 'about:blank';
       const domain = meta.link?.domain || domainOf(url);
       const title = meta.link?.title;
       return `
-        <a class="drop-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">
-          <span class="drop-link-favicon-frame">${iconLink('0.9em')}<img class="drop-link-favicon" src="${escapeHtml(faviconUrl(domain))}" alt="" loading="lazy"></span>
+        <a class="drop-link" href="${escapeAttr(href)}" target="_blank" rel="noopener noreferrer">
+          <span class="drop-link-favicon-frame">${iconLink('0.9em')}<img class="drop-link-favicon" src="${escapeAttr(faviconUrl(domain))}" alt="" loading="lazy"></span>
           <span class="drop-link-body">
             <span class="drop-link-title">${escapeHtml(title || url)}</span>
             <span class="drop-link-domain">${escapeHtml(domain)}</span>
@@ -77,8 +90,8 @@ function bodyFor(record: DropRecord): string {
         ? `<div class="drop-text drop-caption">${linkify(escapeHtml(meta.text))}</div>`
         : '';
       return `
-        <button class="drop-image" data-action="lightbox" style="${ratio}" title="${escapeHtml(f?.name || 'Image')}">
-          <img data-thumb-id="${escapeHtml(meta.id)}" alt="${escapeHtml(f?.name || 'Image')}" loading="lazy">
+        <button class="drop-image" data-action="lightbox" style="${ratio}" title="${escapeAttr(f?.name || 'Image')}">
+          <img data-thumb-id="${escapeAttr(meta.id)}" alt="${escapeAttr(f?.name || 'Image')}" loading="lazy">
           <span class="drop-image-progress" hidden><span class="drop-image-progress-fill"></span></span>
         </button>
         ${caption}`;
@@ -110,10 +123,10 @@ export function renderDropCard(
   const { meta, state } = record;
   const stateClass = state ? ` drop-card--${state}` : '';
   return `
-    <article class="drop-card drop-card--${meta.kind} drop-card--${presentation.side}${stateClass}" data-drop-id="${escapeHtml(meta.id)}">
+    <article class="drop-card drop-card--${meta.kind} drop-card--${presentation.side}${stateClass}" data-drop-id="${escapeAttr(meta.id)}">
       ${bodyFor(record)}
-      ${metaLine(record, presentation.deviceLabel)}
-      ${actionsRow(record)}
+      ${metaLine(record, presentation.attributionLabel)}
+      ${actionsRow(record, presentation)}
     </article>
   `;
 }
