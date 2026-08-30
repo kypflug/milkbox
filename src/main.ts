@@ -352,8 +352,9 @@ function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
 }
 
 /**
- * Proactively refresh the access token when the app resumes from background,
- * with a hard floor between attempts.
+ * On resume from background: proactively refresh the access token and
+ * re-check OneDrive for chats created/joined on other devices while this
+ * one slept. Both self-limit; the hard floor here absorbs flapping.
  */
 function setupResumeHandler(): void {
   let lastRefresh = Date.now();
@@ -369,6 +370,7 @@ function setupResumeHandler(): void {
     refreshTokenOnResume().catch(() => {
       console.debug('[Auth] Resume token refresh failed — next Graph call will handle it');
     });
+    void coordinator.hydrateChatRegistry(true);
   });
 }
 

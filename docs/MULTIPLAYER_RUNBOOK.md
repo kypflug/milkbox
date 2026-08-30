@@ -59,6 +59,7 @@ Join
 - [ ] A rotated/dead link shows "This invite link doesn't work anymore."
 - [ ] HOST opens their **own** invite link on a second device → registers as host (no self-member file, host affordances present).
 - [ ] GUEST's **second device** shows the joined chat without re-joining (roaming pointer), after sign-in + one sync.
+- [ ] A chat created or joined while the **other device's app was already running** appears there without a restart: within ~30 s of bringing that app back to the foreground, or within ~5 min if it stays foregrounded the whole time (recurring registry hydration).
 
 Messaging
 - [ ] Text, link, image, file (>4 MB for the upload session) in both directions.

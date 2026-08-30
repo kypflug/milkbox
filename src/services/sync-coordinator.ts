@@ -722,6 +722,9 @@ async function pollScope(scopeId: ScopeId): Promise<void> {
  */
 export async function pollAll(activeScopeId: ScopeId): Promise<void> {
   if (Date.now() < throttledUntil) return;
+  // Pick up chats created/joined on other devices; self-gated to one pass
+  // per HYDRATE_INTERVAL_MS, and discoveries join the rotation next tick.
+  void hydrateChatRegistry();
   try {
     const outbox = await db.getOutbox();
     const pendingProfile = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
@@ -933,7 +936,12 @@ export async function removeChatLocally(chatId: string): Promise<void> {
   postBroadcast({ type: 'chats-changed' });
 }
 
-let registryHydrated = false;
+let hydrating = false;
+let lastHydratedAt = 0;
+/** Background re-check cadence (each poll tick asks; this gates the work). */
+const HYDRATE_INTERVAL_MS = 5 * 60_000;
+/** Floor for eager re-checks (boot, foreground resume) — absorbs flapping. */
+const HYDRATE_FLOOR_MS = 30_000;
 
 /**
  * Merge chats discovered in OneDrive into the local registry — chats this
@@ -941,26 +949,30 @@ let registryHydrated = false;
  * (approot:/chats-joined roaming pointers). Both live in our own approot,
  * so discovery needs no share consent; syncing a discovered guest chat will
  * surface needs-consent on its own if the grant is missing.
+ *
+ * This is how a chat created or joined on ANOTHER device shows up here, so
+ * it must recur for the life of the process, not just at boot: pollAll calls
+ * it every tick (gated to once per HYDRATE_INTERVAL_MS) and the resume
+ * handler calls it eagerly (gated by HYDRATE_FLOOR_MS). A failed pass leaves
+ * the gate open so the next call retries.
  */
-export async function hydrateChatRegistry(): Promise<void> {
-  if (registryHydrated) return;
-  registryHydrated = true;
+export async function hydrateChatRegistry(eager = false): Promise<void> {
+  if (hydrating) return;
+  if (Date.now() - lastHydratedAt < (eager ? HYDRATE_FLOOR_MS : HYDRATE_INTERVAL_MS)) return;
+  hydrating = true;
   try {
     const me = await ensureMe();
-    if (!me) {
-      registryHydrated = false;
-      return;
-    }
+    if (!me) return;
     const local = new Set((await db.getAllChats()).map(c => c.id));
     let changed = false;
 
-    for (const record of await chatsApi.listHostChats(me)) {
+    for (const record of await chatsApi.listHostChats(me, local)) {
       if (local.has(record.id)) continue;
       await db.putChat(record);
       changed = true;
     }
 
-    for (const pointer of await chatsApi.listJoinedPointers()) {
+    for (const pointer of await chatsApi.listJoinedPointers(local)) {
       if (local.has(pointer.chatId)) continue;
       await db.putChat({
         id: pointer.chatId,
@@ -976,12 +988,15 @@ export async function hydrateChatRegistry(): Promise<void> {
       changed = true;
     }
 
+    lastHydratedAt = Date.now();
     if (changed) {
       emit({ type: 'chats-changed' });
       postBroadcast({ type: 'chats-changed' });
     }
   } catch (err) {
-    registryHydrated = false; // retry on a later call
+    // lastHydratedAt untouched — the next call retries.
     console.debug('[Chats] Registry hydration failed:', err);
+  } finally {
+    hydrating = false;
   }
 }
