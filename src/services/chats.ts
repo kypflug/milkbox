@@ -355,7 +355,7 @@ export async function deleteJoinedPointer(chatId: string): Promise<void> {
   }
 }
 
-export async function listJoinedPointers(): Promise<JoinedChatPointer[]> {
+export async function listJoinedPointers(skipChatIds?: ReadonlySet<string>): Promise<JoinedChatPointer[]> {
   let items: GraphChildItem[];
   try {
     items = await listChildren(APPROOT, JOINED_FOLDER, 'id,name,file,@microsoft.graph.downloadUrl', 'base');
@@ -366,6 +366,9 @@ export async function listJoinedPointers(): Promise<JoinedChatPointer[]> {
   const pointers: JoinedChatPointer[] = [];
   for (const item of items) {
     if (!item.file || !item.name?.endsWith('.json')) continue;
+    // Pointer files are named <chatId>.json — chats the caller already knows
+    // need no download, keeping recurring hydration to the one listing GET.
+    if (skipChatIds?.has(item.name.slice(0, -5))) continue;
     try {
       const pointer = validateJoinedPointer(await downloadJson(item, undefined, 'base'));
       if (pointer) pointers.push(pointer);
@@ -375,10 +378,11 @@ export async function listJoinedPointers(): Promise<JoinedChatPointer[]> {
 }
 
 /**
- * Rediscover chats this account hosts by listing approot:/chats — used to
- * rebuild the registry on a fresh device (local IDB knows nothing yet).
+ * Rediscover chats this account hosts by listing approot:/chats — rebuilds
+ * the registry on a fresh device and, on the recurring hydration passes,
+ * picks up chats created on other devices while this one was running.
  */
-export async function listHostChats(me: AuthorAttribution): Promise<ChatRecord[]> {
+export async function listHostChats(me: AuthorAttribution, skipChatIds?: ReadonlySet<string>): Promise<ChatRecord[]> {
   let items: GraphChildItem[];
   try {
     items = await listChildren(APPROOT, CHATS_FOLDER, 'id,name,folder,parentReference', 'base');
@@ -389,6 +393,9 @@ export async function listHostChats(me: AuthorAttribution): Promise<ChatRecord[]
   const records: ChatRecord[] = [];
   for (const item of items) {
     if (!item.folder || !item.name) continue;
+    // Folders are named by chat id — chats the caller already knows need no
+    // descriptor/drops reads, keeping recurring hydration to the listing GET.
+    if (skipChatIds?.has(item.name)) continue;
     try {
       const descRes = await graphFetch(contentUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/chat.json`));
       const descriptor = validateChatDescriptor(await descRes.json());

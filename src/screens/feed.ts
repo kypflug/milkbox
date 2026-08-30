@@ -30,7 +30,7 @@ import { mountComposer, type ComposerApi } from '../components/composer';
 import { mountSettingsFlyout, type SettingsFlyoutApi } from './settings';
 import { startReconnectFlow } from '../services/chat-flows';
 import { showToast } from '../components/toast';
-import { iconBottle, iconClose } from '../components/icons';
+import { iconBottle, iconChats, iconClose } from '../components/icons';
 
 const PAGE_SIZE = 100;
 
@@ -78,6 +78,9 @@ export async function renderFeed(
         <div class="feed-header-row">
           <span class="feed-mark">${iconBottle('1.15em')}</span>
           <span class="feed-wordmark">${escapeHtml(title)}</span>
+          <button class="feed-chats-btn" title="Chats" aria-label="Chats" aria-haspopup="dialog">
+            ${iconChats('1.15em')}<span class="feed-chats-badge" aria-hidden="true" hidden></span>
+          </button>
         </div>
       </header>
       <div class="chat-banner" id="chatBanner" hidden></div>

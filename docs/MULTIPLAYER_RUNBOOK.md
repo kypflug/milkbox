@@ -48,16 +48,18 @@ switcher/header in all four layout combos where noted: window-controls-overlay
 Setup & consent
 - [ ] Solo account that never touches chats is **never** shown the broad consent.
 - [ ] HOST creates a chat → consent interstitial → Microsoft prompt appears **exactly once**; invite sheet opens with QR + link.
+- [ ] The chats button (top right of the header) opens the switcher dialog and is clickable in all four WCO × pane layout combos (in window-controls-overlay it must sit beside — never under — the window controls); the unread badge shows on it.
 - [ ] Consent denial (cancel at Microsoft) lands the "You can try again anytime" toast — no redirect loop.
 - [ ] iOS standalone PWA: consent opens the in-app sheet; closing it resumes the create/join without a reload.
 
 Join
 - [ ] GUEST scans the QR with the iOS camera → Milkbox opens → signs in (invited sign-in copy) → joins → lands in the chat.
-- [ ] GUEST on desktop opens the link signed-out → sign-in → consent → join resumes automatically.
+- [ ] GUEST on desktop opens the link signed-out → **one** Microsoft screen (sign-in with the OneDrive consent folded in via extraScopesToConsent, disclosed on the invited sign-in sheet first) → join resumes automatically with no interstitial afterwards. Cancelling that screen returns to the invited sign-in sheet. (The silent auto-redirect recovery path deliberately stays base-tier — it never shows the disclosure — and uses the interstitial as before.)
 - [ ] Join while offline shows the offline copy and completes on next launch.
 - [ ] A rotated/dead link shows "This invite link doesn't work anymore."
 - [ ] HOST opens their **own** invite link on a second device → registers as host (no self-member file, host affordances present).
 - [ ] GUEST's **second device** shows the joined chat without re-joining (roaming pointer), after sign-in + one sync.
+- [ ] A chat created or joined while the **other device's app was already running** appears there without a restart: within ~30 s of bringing that app back to the foreground, or within ~5 min if it stays foregrounded the whole time (recurring registry hydration).
 
 Messaging
 - [ ] Text, link, image, file (>4 MB for the upload session) in both directions.

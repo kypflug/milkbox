@@ -13,13 +13,15 @@ import * as coordinator from '../services/sync-coordinator';
 import { encodeShareUrl } from '../services/chats';
 import { GraphHttpError } from '../services/graph';
 
-interface ModalHandle {
+export interface ModalHandle {
   el: HTMLElement;
   body: HTMLElement;
   close(): void;
 }
 
-function openModal(title: string, bodyHtml: string, opts: { onClose?: () => void } = {}): ModalHandle {
+/** The house sheet: portaled to body, scrim, Escape/backdrop/close-button
+ *  dismissal. Also the shell for the chat switcher dialog. */
+export function openModal(title: string, bodyHtml: string, opts: { onClose?: () => void } = {}): ModalHandle {
   const scrim = document.createElement('div');
   scrim.className = 'chat-modal-scrim';
   scrim.innerHTML = `

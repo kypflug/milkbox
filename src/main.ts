@@ -1,6 +1,6 @@
 import { initAuth, isSignedIn, tryRecoverAuth, refreshTokenOnResume, hasAccountHint, signInWithHint } from './services/auth';
 import { restoreMsalCacheIfNeeded, setupBackgroundBackup } from './services/msal-cache-backup';
-import { initBroadcast, postBroadcast } from './services/broadcast';
+import { initBroadcast, onBroadcast, postBroadcast } from './services/broadcast';
 import { drainShareInbox } from './services/share-inbox';
 import * as coordinator from './services/sync-coordinator';
 import { resumePendingAction, startCreateChatFlow, startJoinFlow, startReconnectFlow } from './services/chat-flows';
@@ -9,7 +9,7 @@ import { isValidShareToken } from './services/chats';
 import { renderSignIn } from './screens/sign-in';
 import { renderFeed, applySharePayload, teardownScreenListeners } from './screens/feed';
 import { showManageSheet } from './screens/chat-sheets';
-import { mountChatSwitcher } from './components/chat-switcher';
+import { showChatSwitcher, type ChatSwitcherHandlers } from './components/chat-switcher';
 import { showToast } from './components/toast';
 import { applyTheme } from './theme';
 import { escapeHtml } from './utils/storage';
@@ -206,6 +206,8 @@ async function attemptAutoRedirect(app: HTMLElement): Promise<void> {
   document.addEventListener('visibilitychange', handler);
 
   try {
+    // Base scopes only — this path never showed the invited disclosure, so
+    // the shared-chats consent stays with the in-app interstitial here.
     await signInWithHint();
   } catch {
     document.removeEventListener('visibilitychange', handler);
@@ -303,9 +305,10 @@ function selectScope(app: HTMLElement, scopeId: ScopeId): void {
   }
 }
 
-/** Mount the chat switcher beside the freshly rendered feed and wire its trigger. */
+/** Wire the header's chats button: opens the switcher dialog, carries the
+ *  unread badge. Re-run per route (the feed re-renders the header). */
 function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
-  const switcher = mountChatSwitcher(app, currentScopeId, {
+  const handlers: ChatSwitcherHandlers = {
     onSelect: scopeId => selectScope(app, scopeId),
     onCreate: () => startCreateChatFlow(),
     onManage: chatId =>
@@ -313,19 +316,45 @@ function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
         onGoneFromList: () => selectScope(app, 'private'),
       }),
     onReconnect: chatId => startReconnectFlow(chatId),
-  });
-  const trigger = app.querySelector<HTMLButtonElement>('.composer-chats');
-  const onTrigger = () => switcher.toggle();
+  };
+
+  const trigger = app.querySelector<HTMLButtonElement>('.feed-chats-btn');
+  const badge = app.querySelector<HTMLElement>('.feed-chats-badge');
+  const onTrigger = () => showChatSwitcher(currentScopeId, handlers);
   trigger?.addEventListener('click', onTrigger);
+
+  const paintBadge = async () => {
+    if (!badge) return;
+    const chats = await coordinator.loadChats();
+    const unread = chats.reduce((sum, chat) => sum + (chat.unreadCount ?? 0), 0);
+    badge.hidden = unread === 0;
+    badge.textContent = unread > 99 ? '99+' : String(unread);
+    // The button's aria-label overrides descendant text, so the count has to
+    // live in the label itself for screen readers.
+    const label = unread === 0 ? 'Chats' : `Chats — ${unread} unread`;
+    trigger?.setAttribute('aria-label', label);
+    trigger?.setAttribute('title', label);
+  };
+  const repaintBadge = () => void paintBadge().catch(err => console.debug('[Chats] Badge paint failed:', err));
+  const offCoordinator = coordinator.onCoordinatorEvent(event => {
+    if (event.type === 'chats-changed') repaintBadge();
+  });
+  const offBroadcast = onBroadcast(event => {
+    if (event.type === 'chats-changed') repaintBadge();
+  });
+  repaintBadge();
+
   return () => {
     trigger?.removeEventListener('click', onTrigger);
-    switcher.teardown();
+    offCoordinator();
+    offBroadcast();
   };
 }
 
 /**
- * Proactively refresh the access token when the app resumes from background,
- * with a hard floor between attempts.
+ * On resume from background: proactively refresh the access token and
+ * re-check OneDrive for chats created/joined on other devices while this
+ * one slept. Both self-limit; the hard floor here absorbs flapping.
  */
 function setupResumeHandler(): void {
   let lastRefresh = Date.now();
@@ -341,6 +370,7 @@ function setupResumeHandler(): void {
     refreshTokenOnResume().catch(() => {
       console.debug('[Auth] Resume token refresh failed — next Graph call will handle it');
     });
+    void coordinator.hydrateChatRegistry(true);
   });
 }
 
