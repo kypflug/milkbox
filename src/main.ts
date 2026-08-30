@@ -329,6 +329,11 @@ function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
     const unread = chats.reduce((sum, chat) => sum + (chat.unreadCount ?? 0), 0);
     badge.hidden = unread === 0;
     badge.textContent = unread > 99 ? '99+' : String(unread);
+    // The button's aria-label overrides descendant text, so the count has to
+    // live in the label itself for screen readers.
+    const label = unread === 0 ? 'Chats' : `Chats — ${unread} unread`;
+    trigger?.setAttribute('aria-label', label);
+    trigger?.setAttribute('title', label);
   };
   const offCoordinator = coordinator.onCoordinatorEvent(event => {
     if (event.type === 'chats-changed') void paintBadge();

@@ -79,7 +79,7 @@ export async function renderFeed(
           <span class="feed-mark">${iconBottle('1.15em')}</span>
           <span class="feed-wordmark">${escapeHtml(title)}</span>
           <button class="feed-chats-btn" title="Chats" aria-label="Chats" aria-haspopup="dialog">
-            ${iconChats('1.15em')}<span class="feed-chats-badge" hidden></span>
+            ${iconChats('1.15em')}<span class="feed-chats-badge" aria-hidden="true" hidden></span>
           </button>
         </div>
       </header>
