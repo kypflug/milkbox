@@ -31,6 +31,13 @@ const msalConfig: Configuration = {
  */
 const BASE_SCOPES = ['Files.ReadWrite.AppFolder', 'User.Read', 'offline_access'];
 const SHARE_SCOPES = ['Files.ReadWrite', 'User.Read', 'offline_access'];
+/**
+ * The share tier's delta over the base tier — passed as extraScopesToConsent
+ * on an invited sign-in so a first-time guest consents to everything in the
+ * one Microsoft round-trip. No token is minted for it at login; the later
+ * silent share-tier acquisition just succeeds without interaction.
+ */
+const SHARE_CONSENT_SCOPES = ['Files.ReadWrite'];
 
 export type TokenTier = 'base' | 'share';
 
@@ -222,13 +229,18 @@ export function getAccount(): AccountInfo | null {
  * for PWAs. The page navigates to Microsoft login, then back to the app.
  * On return, handleRedirectPromise() in initAuth() processes the response.
  *
+ * preConsentShare folds the shared-chats consent into this sign-in (an
+ * invited first-time guest joins in one round-trip); sign-in itself still
+ * requests only the base scopes, so solo sign-ins are unchanged.
+ *
  * Returns null since the page navigates away — callers should not proceed.
  */
-export async function signIn(): Promise<AccountInfo | null> {
+export async function signIn(opts: { preConsentShare?: boolean } = {}): Promise<AccountInfo | null> {
   const msal = getMsal();
   await msal.loginRedirect({
     scopes: BASE_SCOPES,
     prompt: 'select_account',
+    ...(opts.preConsentShare ? { extraScopesToConsent: SHARE_CONSENT_SCOPES } : {}),
   });
   // loginRedirect navigates away; this code won't continue.
   return null;
@@ -510,11 +522,12 @@ export async function refreshTokenOnResume(): Promise<void> {
  * Omits `prompt: 'select_account'` so Microsoft can auto-sign-in with
  * the hinted account if only one session is active.
  */
-export async function signInWithHint(): Promise<void> {
+export async function signInWithHint(opts: { preConsentShare?: boolean } = {}): Promise<void> {
   const msal = getMsal();
   const hint = getAccountHint();
   await msal.loginRedirect({
     scopes: BASE_SCOPES,
     ...(hint?.username ? { loginHint: hint.username } : {}),
+    ...(opts.preConsentShare ? { extraScopesToConsent: SHARE_CONSENT_SCOPES } : {}),
   });
 }

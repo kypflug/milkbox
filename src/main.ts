@@ -206,7 +206,9 @@ async function attemptAutoRedirect(app: HTMLElement): Promise<void> {
   document.addEventListener('visibilitychange', handler);
 
   try {
-    await signInWithHint();
+    // An invited user recovering a stale session gets the shared-chats
+    // consent folded into the same round-trip, like the sign-in button.
+    await signInWithHint({ preConsentShare: invitedSignIn });
   } catch {
     document.removeEventListener('visibilitychange', handler);
     renderSignIn(app, () => void enterApp(app), { invited: invitedSignIn });
