@@ -53,7 +53,7 @@ Setup & consent
 
 Join
 - [ ] GUEST scans the QR with the iOS camera → Milkbox opens → signs in (invited sign-in copy) → joins → lands in the chat.
-- [ ] GUEST on desktop opens the link signed-out → **one** Microsoft screen (sign-in with the OneDrive consent folded in via extraScopesToConsent) → join resumes automatically with no interstitial afterwards. Cancelling that screen returns to the invited sign-in sheet.
+- [ ] GUEST on desktop opens the link signed-out → **one** Microsoft screen (sign-in with the OneDrive consent folded in via extraScopesToConsent, disclosed on the invited sign-in sheet first) → join resumes automatically with no interstitial afterwards. Cancelling that screen returns to the invited sign-in sheet. (The silent auto-redirect recovery path deliberately stays base-tier — it never shows the disclosure — and uses the interstitial as before.)
 - [ ] Join while offline shows the offline copy and completes on next launch.
 - [ ] A rotated/dead link shows "This invite link doesn't work anymore."
 - [ ] HOST opens their **own** invite link on a second device → registers as host (no self-member file, host affordances present).

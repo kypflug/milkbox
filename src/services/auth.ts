@@ -522,12 +522,14 @@ export async function refreshTokenOnResume(): Promise<void> {
  * Omits `prompt: 'select_account'` so Microsoft can auto-sign-in with
  * the hinted account if only one session is active.
  */
-export async function signInWithHint(opts: { preConsentShare?: boolean } = {}): Promise<void> {
+export async function signInWithHint(): Promise<void> {
   const msal = getMsal();
   const hint = getAccountHint();
+  // Deliberately never preConsentShare here: auto-redirect skips the invited
+  // sign-in sheet, so the user would face the full-drive consent without ever
+  // seeing the disclosure. The in-app interstitial covers that path instead.
   await msal.loginRedirect({
     scopes: BASE_SCOPES,
     ...(hint?.username ? { loginHint: hint.username } : {}),
-    ...(opts.preConsentShare ? { extraScopesToConsent: SHARE_CONSENT_SCOPES } : {}),
   });
 }
