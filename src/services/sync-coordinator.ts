@@ -957,7 +957,7 @@ const HYDRATE_FLOOR_MS = 30_000;
  * the gate open so the next call retries.
  */
 export async function hydrateChatRegistry(eager = false): Promise<void> {
-  if (hydrating) return;
+  if (hydrating || Date.now() < throttledUntil) return;
   if (Date.now() - lastHydratedAt < (eager ? HYDRATE_FLOOR_MS : HYDRATE_INTERVAL_MS)) return;
   hydrating = true;
   try {
@@ -994,7 +994,9 @@ export async function hydrateChatRegistry(eager = false): Promise<void> {
       postBroadcast({ type: 'chats-changed' });
     }
   } catch (err) {
-    // lastHydratedAt untouched — the next call retries.
+    // lastHydratedAt untouched — the next call retries; a 429 raises the
+    // global gate above so the retry honors Retry-After.
+    noteThrottle(err);
     console.debug('[Chats] Registry hydration failed:', err);
   } finally {
     hydrating = false;
