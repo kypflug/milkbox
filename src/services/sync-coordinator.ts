@@ -770,7 +770,7 @@ export async function pollAll(activeScopeId: ScopeId): Promise<void> {
   // heard about, then pick up chats created/joined/left on other devices.
   // Both self-gate: the drain is a no-op with an empty queue, the registry
   // pass costs two cTag GETs unless something actually changed.
-  void drainRegistryOutbox().then(() => hydrateChatRegistry());
+  void catchUpRegistry();
   try {
     const outbox = await db.getOutbox();
     const pendingProfile = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
@@ -1044,8 +1044,19 @@ export async function removeChatLocally(chatId: string): Promise<void> {
 // ─── registry outbox drain ───
 
 let drainingRegistry = false;
+let drainRegistryAgain = false;
 const REGISTRY_BACKOFF_BASE_MS = 5_000;
 const REGISTRY_BACKOFF_CAP_MS = 30 * 60_000;
+
+/**
+ * Drain the registry outbox, then reconcile the registry — the pair every
+ * boot, poll tick, resume and reconnect runs. Neither half rejects, and a
+ * failed drain never skips the reconcile.
+ */
+export async function catchUpRegistry(eager = false): Promise<void> {
+  await drainRegistryOutbox();
+  await hydrateChatRegistry(eager);
+}
 
 async function performRegistryOp(entry: RegistryOp): Promise<void> {
   switch (entry.op) {
@@ -1072,33 +1083,50 @@ async function performRegistryOp(entry: RegistryOp): Promise<void> {
  * these are the writes that keep the account's devices agreeing about
  * which chats it is in, so they back off (capped, Retry-After honoured)
  * rather than fail. A share-tier consent gap parks the entry untouched.
+ *
+ * Serialized: a call that arrives mid-drain (a join or leave enqueued while
+ * an earlier drain is still writing) asks for one more pass instead of
+ * being dropped, so a fresh intent never waits for the next poll tick.
+ * Never rejects — a storage failure is logged and the caller carries on.
  */
 export async function drainRegistryOutbox(): Promise<void> {
-  if (drainingRegistry) return;
+  if (drainingRegistry) {
+    drainRegistryAgain = true;
+    return;
+  }
   drainingRegistry = true;
   try {
-    const now = Date.now();
-    if (now < throttledUntil) return;
-    for (const entry of await getRegistryOutbox()) {
-      if (entry.nextAt > now) continue;
-      try {
-        await performRegistryOp(entry);
-        await removeRegistryOp(entry.op, entry.chatId);
-      } catch (err) {
-        if (err instanceof ConsentRequiredError) continue; // wait for the reconnect flow
-        noteThrottle(err);
-        const attempts = entry.attempts + 1;
-        const retryAfter =
-          err instanceof graph.GraphHttpError && graph.isThrottleError(err) && err.retryAfterSeconds
-            ? err.retryAfterSeconds * 1000
-            : Math.min(REGISTRY_BACKOFF_BASE_MS * 2 ** (attempts - 1), REGISTRY_BACKOFF_CAP_MS);
-        await deferRegistryOp(entry.op, entry.chatId, attempts, Date.now() + retryAfter);
-        console.warn('[Chats] Registry %s for %s failed (attempt %d):', entry.op, entry.chatId, attempts, err);
-        if (graph.isThrottleError(err)) return;
-      }
-    }
+    do {
+      drainRegistryAgain = false;
+      await drainRegistryOnce();
+    } while (drainRegistryAgain);
+  } catch (err) {
+    console.warn('[Chats] Registry outbox drain failed:', err);
   } finally {
     drainingRegistry = false;
+  }
+}
+
+async function drainRegistryOnce(): Promise<void> {
+  const now = Date.now();
+  if (now < throttledUntil) return;
+  for (const entry of await getRegistryOutbox()) {
+    if (entry.nextAt > now) continue;
+    try {
+      await performRegistryOp(entry);
+      await removeRegistryOp(entry.op, entry.chatId);
+    } catch (err) {
+      if (err instanceof ConsentRequiredError) continue; // wait for the reconnect flow
+      noteThrottle(err);
+      const attempts = entry.attempts + 1;
+      const retryAfter =
+        err instanceof graph.GraphHttpError && graph.isThrottleError(err) && err.retryAfterSeconds
+          ? err.retryAfterSeconds * 1000
+          : Math.min(REGISTRY_BACKOFF_BASE_MS * 2 ** (attempts - 1), REGISTRY_BACKOFF_CAP_MS);
+      await deferRegistryOp(entry.op, entry.chatId, attempts, Date.now() + retryAfter);
+      console.warn('[Chats] Registry %s for %s failed (attempt %d):', entry.op, entry.chatId, attempts, err);
+      if (graph.isThrottleError(err)) return;
+    }
   }
 }
 

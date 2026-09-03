@@ -13,18 +13,21 @@
  * queue so a chat with a pending put is never removed and one with a
  * pending delete is never re-added.
  *
- * Storage is one settings row holding the whole (tiny) queue: at most one
- * entry per (op, chatId), and a put and a delete for the same chat cancel
- * each other — the newest intent wins.
+ * Storage is one settings row PER OP, keyed by (op, chatId), so every
+ * enqueue, defer and removal is a single-key write and two tabs can never
+ * lose each other's intent. A put and a delete for the same chat cancel
+ * each other in the same transaction — the newest intent wins.
  */
 
-import { deleteSetting, getSetting, putSetting } from './db';
+import { deleteSetting, getSettingsByPrefix, patchSetting, updateSettings } from './db';
 import type { JoinedChatPointer } from '../types';
 
-const KEY = 'milkbox:registry-outbox';
+const PREFIX = 'milkbox:registry-op:';
 
 interface RegistryOpBase {
   chatId: string;
+  /** Insertion time — the drain runs oldest first. */
+  enqueuedAt: number;
   attempts: number;
   /** Earliest time the drain may try this op again (backoff / Retry-After). */
   nextAt: number;
@@ -37,14 +40,14 @@ export type RegistryOp =
 
 export type RegistryOpKind = RegistryOp['op'];
 
-export async function getRegistryOutbox(): Promise<RegistryOp[]> {
-  const queue = await getSetting<RegistryOp[]>(KEY);
-  return Array.isArray(queue) ? queue : [];
-}
+const keyOf = (op: RegistryOpKind, chatId: string) => `${PREFIX}${op}:${chatId}`;
 
-async function saveRegistryOutbox(queue: RegistryOp[]): Promise<void> {
-  if (queue.length === 0) await deleteSetting(KEY);
-  else await putSetting(KEY, queue);
+export async function getRegistryOutbox(): Promise<RegistryOp[]> {
+  const rows = await getSettingsByPrefix<RegistryOp>(PREFIX);
+  return rows
+    .map(r => r.value)
+    .filter((v): v is RegistryOp => typeof v === 'object' && v !== null && typeof v.op === 'string')
+    .sort((a, b) => a.enqueuedAt - b.enqueuedAt);
 }
 
 type NewRegistryOp =
@@ -53,33 +56,28 @@ type NewRegistryOp =
   | { op: 'delete-member'; chatId: string; driveId: string; itemId: string; memberId: string };
 
 /** Record an intent. Replaces any queued op of the same kind for the chat
- *  and cancels the opposite pointer op, so the queue holds the latest wish. */
-export async function enqueueRegistryOp(entry: NewRegistryOp): Promise<void> {
-  const cancels: RegistryOpKind[] =
-    entry.op === 'put-pointer' ? ['put-pointer', 'delete-pointer']
-      : entry.op === 'delete-pointer' ? ['put-pointer', 'delete-pointer']
-        : ['delete-member'];
-  const queue = (await getRegistryOutbox()).filter(
-    q => !(q.chatId === entry.chatId && cancels.includes(q.op)),
+ *  and cancels the opposite pointer op, atomically. */
+export function enqueueRegistryOp(entry: NewRegistryOp): Promise<void> {
+  const opposite: RegistryOpKind | null =
+    entry.op === 'put-pointer' ? 'delete-pointer'
+      : entry.op === 'delete-pointer' ? 'put-pointer'
+        : null;
+  const row: RegistryOp = { ...entry, enqueuedAt: Date.now(), attempts: 0, nextAt: 0 };
+  return updateSettings(
+    [[keyOf(entry.op, entry.chatId), row]],
+    opposite ? [keyOf(opposite, entry.chatId)] : [],
   );
-  queue.push({ ...entry, attempts: 0, nextAt: 0 });
-  await saveRegistryOutbox(queue);
 }
 
-export async function removeRegistryOp(op: RegistryOpKind, chatId: string): Promise<void> {
-  const queue = await getRegistryOutbox();
-  const next = queue.filter(q => !(q.op === op && q.chatId === chatId));
-  if (next.length !== queue.length) await saveRegistryOutbox(next);
+export function removeRegistryOp(op: RegistryOpKind, chatId: string): Promise<void> {
+  return deleteSetting(keyOf(op, chatId));
 }
 
 /** Note a failed try so the drain leaves the op alone until `nextAt`. */
-export async function deferRegistryOp(op: RegistryOpKind, chatId: string, attempts: number, nextAt: number): Promise<void> {
-  const queue = await getRegistryOutbox();
-  const entry = queue.find(q => q.op === op && q.chatId === chatId);
-  if (!entry) return;
-  entry.attempts = attempts;
-  entry.nextAt = nextAt;
-  await saveRegistryOutbox(queue);
+export function deferRegistryOp(op: RegistryOpKind, chatId: string, attempts: number, nextAt: number): Promise<void> {
+  return patchSetting<RegistryOp>(keyOf(op, chatId), current =>
+    current ? { ...current, attempts, nextAt } : undefined,
+  );
 }
 
 /** Whether a chat has a queued op of this kind — the reconcile's guard. */

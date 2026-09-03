@@ -109,7 +109,7 @@ Revert the stuntcamp `build.ref` pin. Notes:
 
 - Drop JSON is forward-safe: old clients ignore the optional `author` field
   and never look inside `chats/` / `chats-joined/`.
-- The registry outbox (`milkbox:registry-outbox`), registry cTags and
+- The registry outbox rows (`milkbox:registry-op:*`), registry cTags and
   `ChatRecord.registeredAt` are local-only settings/fields; a rolled-back
   build ignores them and the on-disk pointer/descriptor JSON is unchanged.
   A pending pointer write is lost on rollback (the old build never retried
