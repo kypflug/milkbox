@@ -140,6 +140,12 @@ export interface ChatRecord {
   state?: 'active' | 'gone' | 'needs-consent';
   /** Host only: the last created invite link, for re-showing the QR. */
   shareUrl?: string;
+  /**
+   * When this install first stored the record. Registry reconciliation
+   * leaves records younger than its grace window alone, covering the gap
+   * between a local create/join and its OneDrive write landing.
+   */
+  registeredAt?: number;
 }
 
 /** OneDrive-side descriptor: chats/<id>/chat.json in the host's approot. */

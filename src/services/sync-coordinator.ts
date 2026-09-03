@@ -32,6 +32,14 @@ import * as device from './device';
 import * as notify from './notify';
 import { ConsentRequiredError } from './auth';
 import { postBroadcast } from './broadcast';
+import {
+  deferRegistryOp,
+  enqueueRegistryOp,
+  getRegistryOutbox,
+  hasPendingRegistryOp,
+  removeRegistryOp,
+  type RegistryOp,
+} from './registry-outbox';
 
 export type CoordinatorEvent =
   | { type: 'sync-start'; scopeId: ScopeId }
@@ -41,7 +49,9 @@ export type CoordinatorEvent =
   | { type: 'drop-progress'; scopeId: ScopeId; dropId: string; fraction: number }
   /** A queued chat edit lost its conditional write — the drop changed or was removed remotely. */
   | { type: 'drop-conflict'; scopeId: ScopeId; dropId: string }
-  | { type: 'chats-changed' };
+  | { type: 'chats-changed' }
+  /** A chat left the local registry because the account left or deleted it on another device. */
+  | { type: 'chat-removed'; chatId: string; name: string };
 
 type Handler = (event: CoordinatorEvent) => void;
 
@@ -377,6 +387,7 @@ interface ScopeSyncState {
   lastSyncAt: number;
   consecutiveGone: number;
   lastMembersFetch: number;
+  lastDescriptorFetch: number;
 }
 
 const scopeStates = new Map<ScopeId, ScopeSyncState>();
@@ -397,7 +408,15 @@ function noteThrottle(err: unknown): void {
 function stateFor(scopeId: ScopeId): ScopeSyncState {
   let st = scopeStates.get(scopeId);
   if (!st) {
-    st = { syncing: false, syncPromise: null, syncAgain: false, lastSyncAt: 0, consecutiveGone: 0, lastMembersFetch: 0 };
+    st = {
+      syncing: false,
+      syncPromise: null,
+      syncAgain: false,
+      lastSyncAt: 0,
+      consecutiveGone: 0,
+      lastMembersFetch: 0,
+      lastDescriptorFetch: 0,
+    };
     scopeStates.set(scopeId, st);
   }
   return st;
@@ -548,6 +567,26 @@ async function handleChatConsentLost(chatId: string): Promise<void> {
   emit({ type: 'chats-changed' });
 }
 
+/**
+ * Pick up a rename made on another device. A pass that moved no drops was
+ * triggered by something else under the chat folder (the folder cTag
+ * covers chat.json too), so that is when the descriptor is worth one GET;
+ * otherwise it is re-read on the members cadence. A changed name patches
+ * the record and tells the switcher, the feed header and the other tabs.
+ */
+async function refreshDescriptor(scope: ChatScope, st: ScopeSyncState, passChanged: boolean): Promise<void> {
+  const stale = Date.now() - st.lastDescriptorFetch > MEMBERS_REFRESH_MS;
+  if (passChanged && !stale) return;
+  const record = await db.getChat(scope.chatId);
+  if (!record) return;
+  const descriptor = await chatsApi.fetchChatDescriptor(record);
+  st.lastDescriptorFetch = Date.now();
+  if (!descriptor || descriptor.name === record.name) return;
+  await db.patchChat(scope.chatId, { name: descriptor.name });
+  emit({ type: 'chats-changed' });
+  postBroadcast({ type: 'chats-changed' });
+}
+
 /** Refresh the cached member roster when it's stale or the pass changed things. */
 async function refreshMembers(scope: ChatScope, st: ScopeSyncState, passChanged: boolean): Promise<void> {
   const scopeId = scopeIdOf(scope);
@@ -646,6 +685,11 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
           } catch (err) {
             console.debug('[Sync] Member refresh failed; roster is stale:', err);
           }
+          try {
+            await refreshDescriptor(scope, st, passChanged);
+          } catch (err) {
+            console.debug('[Sync] Descriptor refresh failed; name may be stale:', err);
+          }
           await trackUnread(scope, arrivals);
         }
 
@@ -722,9 +766,11 @@ async function pollScope(scopeId: ScopeId): Promise<void> {
  */
 export async function pollAll(activeScopeId: ScopeId): Promise<void> {
   if (Date.now() < throttledUntil) return;
-  // Pick up chats created/joined on other devices; self-gated to one pass
-  // per HYDRATE_INTERVAL_MS, and discoveries join the rotation next tick.
-  void hydrateChatRegistry();
+  // Land any join/leave the account made here that OneDrive has not yet
+  // heard about, then pick up chats created/joined/left on other devices.
+  // Both self-gate: the drain is a no-op with an empty queue, the registry
+  // pass costs two cTag GETs unless something actually changed.
+  void drainRegistryOutbox().then(() => hydrateChatRegistry());
   try {
     const outbox = await db.getOutbox();
     const pendingProfile = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
@@ -763,13 +809,39 @@ export function loadChats(): Promise<ChatRecord[]> {
 export async function createChat(name: string): Promise<ChatRecord> {
   const me = await ensureMe();
   if (!me) throw new Error('Your Microsoft profile has not loaded yet — check your connection.');
-  const record = await chatsApi.createChatFolder(name.trim() || 'Untitled chat', me);
+  const record: ChatRecord = {
+    ...(await chatsApi.createChatFolder(name.trim() || 'Untitled chat', me)),
+    registeredAt: Date.now(),
+  };
   await db.putChat(record);
   // The creator has read everything there is (nothing); prime notifications.
   await db.putSetting(notifyPrimedKey(`chat:${record.id}`), true);
   emit({ type: 'chats-changed' });
   postBroadcast({ type: 'chats-changed' });
   return record;
+}
+
+export const MAX_CHAT_NAME = 64;
+
+/**
+ * Host: rename a chat for everyone. The name lives in chat.json in the
+ * host's approot (base tier — no share consent involved); the host's other
+ * devices and every guest read it back on their next sync pass, which the
+ * folder-cTag change this write causes will trigger.
+ */
+export async function renameChat(chatId: string, name: string): Promise<void> {
+  const record = await db.getChat(chatId);
+  if (!record || record.role !== 'host') throw new Error('Only the host can rename a chat');
+  const trimmed = name.trim().slice(0, MAX_CHAT_NAME);
+  if (!trimmed) throw new Error('A chat needs a name');
+  if (trimmed === record.name) return;
+  // Re-read rather than rebuild: createdAt/host must round-trip untouched.
+  const current = await chatsApi.fetchChatDescriptor(record);
+  if (!current) throw new Error('The chat descriptor is missing');
+  await chatsApi.putChatDescriptor({ ...current, name: trimmed });
+  await db.patchChat(chatId, { name: trimmed });
+  emit({ type: 'chats-changed' });
+  postBroadcast({ type: 'chats-changed' });
 }
 
 /** Host: get (or mint) the invite link for a chat. Share tier. */
@@ -874,47 +946,74 @@ export async function joinChat(shareToken: string): Promise<ChatRecord> {
     host: descriptor.host,
     joinedAt,
     state: 'active',
+    registeredAt: joinedAt,
   };
 
   if (!isOwnChat) {
     await chatsApi.putMemberSelf(record, { v: 1, id: me.id, name: me.name, joinedAt, updatedAt: joinedAt });
-    // Roaming pointer in our own approot — best-effort, join succeeds without it.
-    await chatsApi.putJoinedPointer({
-      v: 1,
+    // Roaming pointer in our own approot, so the chat follows the account
+    // to its other devices. Queued before the local record exists: the
+    // registry reconcile never removes a chat whose pointer is still on its
+    // way, and the drain below retries until OneDrive has it.
+    await enqueueRegistryOp({
+      op: 'put-pointer',
       chatId: record.id,
-      name: record.name,
-      driveId: record.driveId,
-      itemId: record.itemId,
-      dropsItemId: record.dropsItemId,
-      host: record.host,
-      joinedAt,
-    }).catch(err => console.debug('[Chats] Roaming pointer write failed:', err));
+      pointer: {
+        v: 1,
+        chatId: record.id,
+        name: record.name,
+        driveId: record.driveId,
+        itemId: record.itemId,
+        dropsItemId: record.dropsItemId,
+        host: record.host,
+        joinedAt,
+      },
+    });
   }
 
   await db.putChat(record);
   emit({ type: 'chats-changed' });
   postBroadcast({ type: 'chats-changed' });
+  void drainRegistryOutbox();
   // The first sync primes notifications (per-scope primed key) so a joined
   // chat's backlog never lands as a notification wall.
   void requestSync(chatScopeOf(record), { force: true });
   return record;
 }
 
-/** Guest: leave a chat — best-effort remote cleanup, full local cleanup. */
+/**
+ * Guest: leave a chat. Local cleanup is immediate; the remote cleanup
+ * (member file, roaming pointer) is queued durably so the leave reaches
+ * the account's other devices even if this attempt is throttled or offline.
+ */
 export async function leaveChat(chatId: string): Promise<void> {
   const record = await db.getChat(chatId);
   if (!record) return;
   if (record.role === 'guest') {
     if (record.state !== 'gone') {
       const me = await ensureMe();
-      if (me) await chatsApi.deleteMemberFile(record, me.id).catch(() => {});
+      if (me) {
+        await enqueueRegistryOp({
+          op: 'delete-member',
+          chatId,
+          driveId: record.driveId,
+          itemId: record.itemId,
+          memberId: me.id,
+        });
+      }
     }
-    await chatsApi.deleteJoinedPointer(chatId).catch(() => {});
+    await enqueueRegistryOp({ op: 'delete-pointer', chatId });
   }
-  await db.clearScopeData(`chat:${chatId}`);
-  scopeStates.delete(`chat:${chatId}`);
+  await forgetChat(record);
+  void drainRegistryOutbox();
+}
+
+/** Drop a chat from this install and tell every listener, this tab's and the others'. */
+async function forgetChat(record: ChatRecord): Promise<void> {
+  await db.clearScopeData(`chat:${record.id}`);
+  scopeStates.delete(`chat:${record.id}`);
   emit({ type: 'chats-changed' });
-  postBroadcast({ type: 'chats-changed' });
+  postBroadcast({ type: 'chats-changed', removedChatId: record.id });
 }
 
 /** Host: delete the chat for everyone (removes the folder from OneDrive). */
@@ -928,77 +1027,210 @@ export async function deleteChatHosted(chatId: string): Promise<void> {
   postBroadcast({ type: 'chats-changed' });
 }
 
-/** Remove a gone chat from the list (local only — access already ended). */
+/**
+ * Remove a gone chat from the list. Access already ended, so there is no
+ * member file to clean up — but a guest's roaming pointer must still go,
+ * or the next registry pass would bring the dead chat back here and keep
+ * it on every other device.
+ */
 export async function removeChatLocally(chatId: string): Promise<void> {
-  await db.clearScopeData(`chat:${chatId}`);
-  scopeStates.delete(`chat:${chatId}`);
-  emit({ type: 'chats-changed' });
-  postBroadcast({ type: 'chats-changed' });
+  const record = await db.getChat(chatId);
+  if (!record) return;
+  if (record.role === 'guest') await enqueueRegistryOp({ op: 'delete-pointer', chatId });
+  await forgetChat(record);
+  void drainRegistryOutbox();
+}
+
+// ─── registry outbox drain ───
+
+let drainingRegistry = false;
+const REGISTRY_BACKOFF_BASE_MS = 5_000;
+const REGISTRY_BACKOFF_CAP_MS = 30 * 60_000;
+
+async function performRegistryOp(entry: RegistryOp): Promise<void> {
+  switch (entry.op) {
+    case 'put-pointer':
+      await chatsApi.putJoinedPointer(entry.pointer);
+      return;
+    case 'delete-pointer':
+      await chatsApi.deleteJoinedPointer(entry.chatId);
+      return;
+    case 'delete-member':
+      try {
+        await chatsApi.deleteMemberFile(entry, entry.memberId);
+      } catch (err) {
+        // Access already revoked (or the chat deleted) — nothing left to
+        // remove, and no consent will ever make this write possible.
+        if (!graph.isAccessLostError(err)) throw err;
+      }
+      return;
+  }
+}
+
+/**
+ * Land queued registry writes, oldest first. Never gives up on an entry:
+ * these are the writes that keep the account's devices agreeing about
+ * which chats it is in, so they back off (capped, Retry-After honoured)
+ * rather than fail. A share-tier consent gap parks the entry untouched.
+ */
+export async function drainRegistryOutbox(): Promise<void> {
+  if (drainingRegistry) return;
+  drainingRegistry = true;
+  try {
+    const now = Date.now();
+    if (now < throttledUntil) return;
+    for (const entry of await getRegistryOutbox()) {
+      if (entry.nextAt > now) continue;
+      try {
+        await performRegistryOp(entry);
+        await removeRegistryOp(entry.op, entry.chatId);
+      } catch (err) {
+        if (err instanceof ConsentRequiredError) continue; // wait for the reconnect flow
+        noteThrottle(err);
+        const attempts = entry.attempts + 1;
+        const retryAfter =
+          err instanceof graph.GraphHttpError && graph.isThrottleError(err) && err.retryAfterSeconds
+            ? err.retryAfterSeconds * 1000
+            : Math.min(REGISTRY_BACKOFF_BASE_MS * 2 ** (attempts - 1), REGISTRY_BACKOFF_CAP_MS);
+        await deferRegistryOp(entry.op, entry.chatId, attempts, Date.now() + retryAfter);
+        console.warn('[Chats] Registry %s for %s failed (attempt %d):', entry.op, entry.chatId, attempts, err);
+        if (graph.isThrottleError(err)) return;
+      }
+    }
+  } finally {
+    drainingRegistry = false;
+  }
 }
 
 let hydrating = false;
-let lastHydratedAt = 0;
-/** Background re-check cadence (each poll tick asks; this gates the work). */
-const HYDRATE_INTERVAL_MS = 5 * 60_000;
-/** Floor for eager re-checks (boot, foreground resume) — absorbs flapping. */
-const HYDRATE_FLOOR_MS = 30_000;
+let lastCheckedAt = 0;
+let lastReconciledAt = 0;
+/** Floor for the cTag probe on eager calls (resume, reconnect) — absorbs flapping. */
+const REGISTRY_CHECK_FLOOR_MS = 5_000;
+/** A full listing pass at least this often, whatever the cTags say. */
+const REGISTRY_FULL_INTERVAL_MS = 30 * 60_000;
+/** A record younger than this is never removed by a reconcile — its
+ *  OneDrive write (chat folder, roaming pointer) may still be in flight. */
+const REGISTRY_GRACE_MS = 60_000;
+const REGISTRY_CTAG_KEY = 'milkbox:registry-ctags';
 
 /**
- * Merge chats discovered in OneDrive into the local registry — chats this
- * account hosts (approot:/chats) and chats it joined elsewhere
- * (approot:/chats-joined roaming pointers). Both live in our own approot,
- * so discovery needs no share consent; syncing a discovered guest chat will
- * surface needs-consent on its own if the grant is missing.
+ * Reconcile the local chat registry with OneDrive — chats this account
+ * hosts (approot:/chats) and chats it joined (approot:/chats-joined roaming
+ * pointers). Both live in our own approot, so discovery needs no share
+ * consent; syncing a discovered guest chat surfaces needs-consent on its
+ * own if the grant is missing.
  *
- * This is how a chat created or joined on ANOTHER device shows up here, so
- * it must recur for the life of the process, not just at boot: pollAll calls
- * it every tick (gated to once per HYDRATE_INTERVAL_MS) and the resume
- * handler calls it eagerly (gated by HYDRATE_FLOOR_MS). A failed pass leaves
- * the gate open so the next call retries.
+ * This is how a chat created, joined, left or deleted on ANOTHER device
+ * shows up (or goes away) here, so it recurs for the life of the process:
+ * pollAll calls it every tick and the resume/online handlers call it
+ * eagerly. Each call is cheap — two cTag GETs — and the listings only run
+ * when a cTag moved (or on the slow full-pass fallback).
+ *
+ * The listings are the truth: a local record absent from them is removed,
+ * unless it is younger than the grace window or has a registry write still
+ * queued. A listing that fails aborts the pass without touching anything.
  */
 export async function hydrateChatRegistry(eager = false): Promise<void> {
   if (hydrating || Date.now() < throttledUntil) return;
-  if (Date.now() - lastHydratedAt < (eager ? HYDRATE_FLOOR_MS : HYDRATE_INTERVAL_MS)) return;
+  const now = Date.now();
+  if (eager && now - lastCheckedAt < REGISTRY_CHECK_FLOOR_MS) return;
   hydrating = true;
   try {
     const me = await ensureMe();
     if (!me) return;
-    const local = new Set((await db.getAllChats()).map(c => c.id));
-    let changed = false;
 
-    for (const record of await chatsApi.listHostChats(me, local)) {
-      if (local.has(record.id)) continue;
-      await db.putChat(record);
-      changed = true;
-    }
+    const ctags = await chatsApi.getRegistryCTags();
+    lastCheckedAt = Date.now();
+    const known = await db.getSetting<chatsApi.RegistryCTags>(REGISTRY_CTAG_KEY);
+    const dirty = !known || known.hosted !== ctags.hosted || known.joined !== ctags.joined;
+    const overdue = now - lastReconciledAt >= REGISTRY_FULL_INTERVAL_MS;
+    if (!dirty && !overdue) return;
 
-    for (const pointer of await chatsApi.listJoinedPointers(local)) {
-      if (local.has(pointer.chatId)) continue;
-      await db.putChat({
-        id: pointer.chatId,
-        name: pointer.name,
-        role: 'guest',
-        driveId: pointer.driveId,
-        itemId: pointer.itemId,
-        dropsItemId: pointer.dropsItemId,
-        host: pointer.host,
-        joinedAt: pointer.joinedAt,
-        state: 'active',
-      });
-      changed = true;
-    }
-
-    lastHydratedAt = Date.now();
-    if (changed) {
-      emit({ type: 'chats-changed' });
-      postBroadcast({ type: 'chats-changed' });
-    }
+    await reconcileChatRegistry(me);
+    lastReconciledAt = Date.now();
+    // Stored from before the listings: anything that changed while they ran
+    // moves the cTag past this value and the next tick lists again.
+    await db.putSetting(REGISTRY_CTAG_KEY, ctags);
   } catch (err) {
-    // lastHydratedAt untouched — the next call retries; a 429 raises the
-    // global gate above so the retry honors Retry-After.
+    // Nothing recorded — the next call retries; a 429 raises the global
+    // gate above so the retry honors Retry-After.
     noteThrottle(err);
-    console.debug('[Chats] Registry hydration failed:', err);
+    console.debug('[Chats] Registry pass failed:', err);
   } finally {
     hydrating = false;
+  }
+}
+
+async function reconcileChatRegistry(me: AuthorAttribution): Promise<void> {
+  const local = await db.getAllChats();
+  const localIds = new Set(local.map(c => c.id));
+  const queue = await getRegistryOutbox();
+
+  const hosted = await chatsApi.listHostChats(me, localIds);
+  const joined = await chatsApi.listJoinedPointers(localIds);
+
+  const now = Date.now();
+  let changed = false;
+  const discovered: ChatRecord[] = [];
+
+  for (const record of hosted.records) {
+    if (localIds.has(record.id)) continue;
+    discovered.push({ ...record, registeredAt: now });
+  }
+  for (const pointer of joined.pointers) {
+    if (localIds.has(pointer.chatId)) continue;
+    // A pointer we are in the middle of deleting is not a chat to re-add.
+    if (hasPendingRegistryOp(queue, 'delete-pointer', pointer.chatId)) continue;
+    discovered.push({
+      id: pointer.chatId,
+      name: pointer.name,
+      role: 'guest',
+      driveId: pointer.driveId,
+      itemId: pointer.itemId,
+      dropsItemId: pointer.dropsItemId,
+      host: pointer.host,
+      joinedAt: pointer.joinedAt,
+      state: 'active',
+      registeredAt: now,
+    });
+  }
+  for (const record of discovered) {
+    // Re-check: a join/create on this device may have raced the listings.
+    if (await db.getChat(record.id)) continue;
+    await db.putChat(record);
+    changed = true;
+  }
+
+  const removed: ChatRecord[] = [];
+  for (const record of local) {
+    if (record.registeredAt !== undefined && now - record.registeredAt < REGISTRY_GRACE_MS) continue;
+    const present = record.role === 'host' ? hosted.ids.has(record.id) : joined.ids.has(record.id);
+    if (present) continue;
+    if (record.role === 'guest' && hasPendingRegistryOp(queue, 'put-pointer', record.id)) continue;
+    // A pass mid-flight would write drops back under a cleared scope — let
+    // it finish; the next reconcile removes the chat.
+    if (scopeStates.get(`chat:${record.id}`)?.syncing) continue;
+    // Gone on every other device too: the host deleted it, or we left it.
+    const current = await db.getChat(record.id);
+    if (!current) continue; // already left/removed while we listed
+    await db.clearScopeData(`chat:${record.id}`);
+    scopeStates.delete(`chat:${record.id}`);
+    removed.push(current);
+    changed = true;
+  }
+
+  if (!changed) return;
+  emit({ type: 'chats-changed' });
+  for (const record of removed) {
+    emit({ type: 'chat-removed', chatId: record.id, name: record.name });
+    postBroadcast({ type: 'chats-changed', removedChatId: record.id });
+  }
+  if (removed.length === 0) postBroadcast({ type: 'chats-changed' });
+  // A discovered chat syncs now rather than waiting its turn in the
+  // background rotation: the first pass primes notifications (no backlog
+  // wall) and gives the switcher a chat with drops and a roster behind it.
+  for (const record of discovered) {
+    if (await db.getChat(record.id)) void requestSync(chatScopeOf(record), { force: true });
   }
 }
