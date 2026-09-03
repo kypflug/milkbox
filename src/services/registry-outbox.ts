@@ -20,6 +20,7 @@
  */
 
 import { deleteSetting, getSettingsByPrefix, patchSetting, updateSettings } from './db';
+import { isValidUlid, validateJoinedPointer } from './validate-drop';
 import type { JoinedChatPointer } from '../types';
 
 const PREFIX = 'milkbox:registry-op:';
@@ -42,12 +43,62 @@ export type RegistryOpKind = RegistryOp['op'];
 
 const keyOf = (op: RegistryOpKind, chatId: string) => `${PREFIX}${op}:${chatId}`;
 
+const MAX_ID = 256;
+
+function finiteNum(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function str(value: unknown, max: number): string | null {
+  return typeof value === 'string' && value.length > 0 && value.length <= max ? value : null;
+}
+
+/**
+ * Strict shape check for a stored row. Only a well-formed op is ever handed
+ * to the drain: a corrupted or partially written row must not turn the
+ * backoff bookkeeping (`attempts + 1`, `nextAt`) into NaN, and the op's own
+ * fields are what the Graph calls are built from.
+ */
+export function validateRegistryOp(raw: unknown): RegistryOp | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const body = raw as Record<string, unknown>;
+  if (!isValidUlid(body.chatId)) return null;
+  const enqueuedAt = finiteNum(body.enqueuedAt);
+  const attempts = finiteNum(body.attempts);
+  const nextAt = finiteNum(body.nextAt);
+  if (enqueuedAt === null || attempts === null || nextAt === null) return null;
+  const base: RegistryOpBase = { chatId: body.chatId, enqueuedAt, attempts, nextAt };
+
+  switch (body.op) {
+    case 'put-pointer': {
+      const pointer = validateJoinedPointer(body.pointer);
+      if (!pointer || pointer.chatId !== base.chatId) return null;
+      return { ...base, op: 'put-pointer', pointer };
+    }
+    case 'delete-pointer':
+      return { ...base, op: 'delete-pointer' };
+    case 'delete-member': {
+      const driveId = str(body.driveId, MAX_ID);
+      const itemId = str(body.itemId, MAX_ID);
+      const memberId = str(body.memberId, MAX_ID);
+      if (!driveId || !itemId || !memberId) return null;
+      return { ...base, op: 'delete-member', driveId, itemId, memberId };
+    }
+    default:
+      return null;
+  }
+}
+
+/** Every well-formed queued op, oldest first. Malformed rows are skipped. */
 export async function getRegistryOutbox(): Promise<RegistryOp[]> {
-  const rows = await getSettingsByPrefix<RegistryOp>(PREFIX);
-  return rows
-    .map(r => r.value)
-    .filter((v): v is RegistryOp => typeof v === 'object' && v !== null && typeof v.op === 'string')
-    .sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+  const rows = await getSettingsByPrefix<unknown>(PREFIX);
+  const ops: RegistryOp[] = [];
+  for (const row of rows) {
+    const op = validateRegistryOp(row.value);
+    if (op) ops.push(op);
+    else console.debug('[Chats] Ignoring malformed registry outbox row: %s', row.key);
+  }
+  return ops.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
 }
 
 type NewRegistryOp =
@@ -75,9 +126,10 @@ export function removeRegistryOp(op: RegistryOpKind, chatId: string): Promise<vo
 
 /** Note a failed try so the drain leaves the op alone until `nextAt`. */
 export function deferRegistryOp(op: RegistryOpKind, chatId: string, attempts: number, nextAt: number): Promise<void> {
-  return patchSetting<RegistryOp>(keyOf(op, chatId), current =>
-    current ? { ...current, attempts, nextAt } : undefined,
-  );
+  return patchSetting<unknown>(keyOf(op, chatId), current => {
+    const valid = validateRegistryOp(current);
+    return valid ? { ...valid, attempts, nextAt } : undefined;
+  });
 }
 
 /** Whether a chat has a queued op of this kind — the reconcile's guard. */
