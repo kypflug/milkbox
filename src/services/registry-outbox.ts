@@ -45,8 +45,10 @@ const keyOf = (op: RegistryOpKind, chatId: string) => `${PREFIX}${op}:${chatId}`
 
 const MAX_ID = 256;
 
-function finiteNum(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+/** Counters and timestamps: non-negative safe integers, so `attempts + 1`,
+ *  `2 ** (attempts - 1)` and the oldest-first sort stay well-defined. */
+function counter(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 function str(value: unknown, max: number): string | null {
@@ -63,9 +65,9 @@ export function validateRegistryOp(raw: unknown): RegistryOp | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const body = raw as Record<string, unknown>;
   if (!isValidUlid(body.chatId)) return null;
-  const enqueuedAt = finiteNum(body.enqueuedAt);
-  const attempts = finiteNum(body.attempts);
-  const nextAt = finiteNum(body.nextAt);
+  const enqueuedAt = counter(body.enqueuedAt);
+  const attempts = counter(body.attempts);
+  const nextAt = counter(body.nextAt);
   if (enqueuedAt === null || attempts === null || nextAt === null) return null;
   const base: RegistryOpBase = { chatId: body.chatId, enqueuedAt, attempts, nextAt };
 
@@ -89,14 +91,25 @@ export function validateRegistryOp(raw: unknown): RegistryOp | null {
   }
 }
 
-/** Every well-formed queued op, oldest first. Malformed rows are skipped. */
+/**
+ * Every well-formed queued op, oldest first. A row that fails validation,
+ * or whose contents disagree with the key it was stored under, can never
+ * be acted on — and since the drain removes an op by the key derived from
+ * its contents, a mismatched row would otherwise survive every drain as a
+ * ghost. Such rows are deleted (best-effort) rather than skipped.
+ */
 export async function getRegistryOutbox(): Promise<RegistryOp[]> {
   const rows = await getSettingsByPrefix<unknown>(PREFIX);
   const ops: RegistryOp[] = [];
+  const junk: string[] = [];
   for (const row of rows) {
     const op = validateRegistryOp(row.value);
-    if (op) ops.push(op);
-    else console.debug('[Chats] Ignoring malformed registry outbox row: %s', row.key);
+    if (op && keyOf(op.op, op.chatId) === row.key) ops.push(op);
+    else junk.push(row.key);
+  }
+  if (junk.length) {
+    console.debug('[Chats] Dropping malformed registry outbox rows:', junk);
+    await updateSettings([], junk).catch(err => console.debug('[Chats] Could not drop them:', err));
   }
   return ops.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
 }
