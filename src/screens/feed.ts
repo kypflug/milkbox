@@ -572,8 +572,21 @@ export async function renderFeed(
 
   // ── sync wiring ──
 
+  // The chat we are showing left the registry (left or deleted on another
+  // device, or in another tab): say so and fall back to the private feed.
+  const leaveRemovedChat = (chatId: string, name: string | undefined) => {
+    if (!isChat || chatId !== scope.chatId) return;
+    showToast(`${name ?? scope.name} is no longer on this account`);
+    history.replaceState(null, '', '/');
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+  };
+
   const offCoordinator = coordinator.onCoordinatorEvent(event => {
     if (event.type === 'chats-changed') return; // the switcher's concern
+    if (event.type === 'chat-removed') {
+      leaveRemovedChat(event.chatId, event.name);
+      return;
+    }
     if (event.scopeId !== scopeId) return;
     switch (event.type) {
       case 'sync-start':
@@ -610,6 +623,8 @@ export async function renderFeed(
     if (event.type === 'sync-complete' || event.type === 'drop-mutated') {
       // Old builds broadcast without a scopeId — treat those as ours.
       coordinator.refreshFromCache(event.scopeId ?? scopeId);
+    } else if (event.type === 'chats-changed' && event.removedChatId) {
+      leaveRemovedChat(event.removedChatId, undefined);
     }
   });
   teardownFns.push(offBroadcast);

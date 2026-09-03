@@ -355,26 +355,76 @@ export async function deleteJoinedPointer(chatId: string): Promise<void> {
   }
 }
 
-export async function listJoinedPointers(skipChatIds?: ReadonlySet<string>): Promise<JoinedChatPointer[]> {
+/**
+ * One registry folder as OneDrive currently holds it. `ids` is every entry
+ * the listing named — the complete remote registry, which reconciliation
+ * compares local records against — while `pointers`/`records` carry only
+ * the entries the caller did not already know, fully resolved. Keeping the
+ * two apart matters: an entry whose body failed to download is still
+ * present remotely and must never read as a removal.
+ */
+export interface JoinedPointerListing {
+  ids: Set<string>;
+  pointers: JoinedChatPointer[];
+}
+
+export async function listJoinedPointers(skipChatIds?: ReadonlySet<string>): Promise<JoinedPointerListing> {
+  const ids = new Set<string>();
+  const pointers: JoinedChatPointer[] = [];
   let items: GraphChildItem[];
   try {
     items = await listChildren(APPROOT, JOINED_FOLDER, 'id,name,file,@microsoft.graph.downloadUrl', 'base');
   } catch (err) {
-    if (isGoneError(err)) return [];
+    if (isGoneError(err)) return { ids, pointers }; // folder never created — no joined chats
     throw err;
   }
-  const pointers: JoinedChatPointer[] = [];
   for (const item of items) {
     if (!item.file || !item.name?.endsWith('.json')) continue;
     // Pointer files are named <chatId>.json — chats the caller already knows
     // need no download, keeping recurring hydration to the one listing GET.
-    if (skipChatIds?.has(item.name.slice(0, -5))) continue;
+    const chatId = item.name.slice(0, -5);
+    ids.add(chatId);
+    if (skipChatIds?.has(chatId)) continue;
     try {
       const pointer = validateJoinedPointer(await downloadJson(item, undefined, 'base'));
-      if (pointer) pointers.push(pointer);
-    } catch { /* skip unreadable pointer */ }
+      if (pointer && pointer.chatId === chatId) pointers.push(pointer);
+    } catch { /* skip unreadable pointer — it stays in ids, so it is not a removal */ }
   }
-  return pointers;
+  return { ids, pointers };
+}
+
+export interface HostChatListing {
+  ids: Set<string>;
+  records: ChatRecord[];
+}
+
+/**
+ * The cTags of the two registry folders, one tiny GET each — the cheap
+ * "did the registry change?" probe the poll tick runs before paying for a
+ * listing. A folder that does not exist yet reports the 'missing' sentinel
+ * so its later creation still reads as a change.
+ */
+export interface RegistryCTags {
+  hosted: string;
+  joined: string;
+}
+
+export const REGISTRY_FOLDER_MISSING = 'missing';
+
+async function folderCTag(path: string): Promise<string> {
+  try {
+    const res = await graphFetch(`${itemByPathUrl(APPROOT, path)}?$select=cTag`);
+    const data = await res.json();
+    return typeof data.cTag === 'string' && data.cTag ? data.cTag : `unknown:${Date.now()}`;
+  } catch (err) {
+    if (isGoneError(err)) return REGISTRY_FOLDER_MISSING;
+    throw err;
+  }
+}
+
+export async function getRegistryCTags(): Promise<RegistryCTags> {
+  const [hosted, joined] = await Promise.all([folderCTag(CHATS_FOLDER), folderCTag(JOINED_FOLDER)]);
+  return { hosted, joined };
 }
 
 /**
@@ -382,19 +432,21 @@ export async function listJoinedPointers(skipChatIds?: ReadonlySet<string>): Pro
  * the registry on a fresh device and, on the recurring hydration passes,
  * picks up chats created on other devices while this one was running.
  */
-export async function listHostChats(me: AuthorAttribution, skipChatIds?: ReadonlySet<string>): Promise<ChatRecord[]> {
+export async function listHostChats(me: AuthorAttribution, skipChatIds?: ReadonlySet<string>): Promise<HostChatListing> {
+  const ids = new Set<string>();
+  const records: ChatRecord[] = [];
   let items: GraphChildItem[];
   try {
     items = await listChildren(APPROOT, CHATS_FOLDER, 'id,name,folder,parentReference', 'base');
   } catch (err) {
-    if (isGoneError(err)) return [];
+    if (isGoneError(err)) return { ids, records }; // folder never created — no hosted chats
     throw err;
   }
-  const records: ChatRecord[] = [];
   for (const item of items) {
     if (!item.folder || !item.name) continue;
     // Folders are named by chat id — chats the caller already knows need no
     // descriptor/drops reads, keeping recurring hydration to the listing GET.
+    ids.add(item.name);
     if (skipChatIds?.has(item.name)) continue;
     try {
       const descRes = await graphFetch(contentUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/chat.json`));
@@ -415,9 +467,9 @@ export async function listHostChats(me: AuthorAttribution, skipChatIds?: Readonl
         joinedAt: descriptor.createdAt,
         state: 'active',
       });
-    } catch { /* skip a chat folder we can't read */ }
+    } catch { /* skip a chat folder we can't read — it stays in ids, so it is not a removal */ }
   }
-  return records;
+  return { ids, records };
 }
 
 // ─── sync: delta with listing fallback ───

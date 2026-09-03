@@ -226,10 +226,11 @@ async function enterApp(app: HTMLElement): Promise<void> {
   await handleShareTarget();
   setupResumeHandler();
   setupBackgroundBackup();
-  // Warm the author identity and pull chats this account has elsewhere
-  // (hosted folders + roaming pointers) into the local registry.
+  // Warm the author identity, land any registry write a previous session
+  // left queued, and reconcile the local registry with the chats this
+  // account has elsewhere (hosted folders + roaming pointers).
   void coordinator.ensureMe();
-  void coordinator.hydrateChatRegistry();
+  void coordinator.drainRegistryOutbox().then(() => coordinator.hydrateChatRegistry());
 
   // A notification tap on an already-open window arrives as a worker
   // message — route to the scope it named.
@@ -352,16 +353,24 @@ function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
 }
 
 /**
- * On resume from background: proactively refresh the access token and
- * re-check OneDrive for chats created/joined on other devices while this
- * one slept. Both self-limit; the hard floor here absorbs flapping.
+ * On resume from background: proactively refresh the access token, land any
+ * queued registry writes, and re-check OneDrive for chats created, joined
+ * or left on other devices while this one slept. The registry check is a
+ * pair of cTag GETs with its own short floor, so it runs on every resume;
+ * only the token refresh keeps the longer floor. Coming back online does
+ * the same, since a join or leave made offline is waiting to be written.
  */
 function setupResumeHandler(): void {
   let lastRefresh = Date.now();
   const REFRESH_FLOOR_MS = 30_000;
 
+  const catchUpRegistry = () => {
+    void coordinator.drainRegistryOutbox().then(() => coordinator.hydrateChatRegistry(true));
+  };
+
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
+    catchUpRegistry();
 
     const now = Date.now();
     if (now - lastRefresh < REFRESH_FLOOR_MS) return;
@@ -370,8 +379,8 @@ function setupResumeHandler(): void {
     refreshTokenOnResume().catch(() => {
       console.debug('[Auth] Resume token refresh failed — next Graph call will handle it');
     });
-    void coordinator.hydrateChatRegistry(true);
   });
+  window.addEventListener('online', catchUpRegistry);
 }
 
 /**

@@ -59,7 +59,8 @@ Join
 - [ ] A rotated/dead link shows "This invite link doesn't work anymore."
 - [ ] HOST opens their **own** invite link on a second device → registers as host (no self-member file, host affordances present).
 - [ ] GUEST's **second device** shows the joined chat without re-joining (roaming pointer), after sign-in + one sync.
-- [ ] A chat created or joined while the **other device's app was already running** appears there without a restart: within ~30 s of bringing that app back to the foreground, or within ~5 min if it stays foregrounded the whole time (recurring registry hydration).
+- [ ] A chat created or joined while the **other device's app was already running** appears there without a restart: on the next foreground resume, or within one poll tick (~45 s) if it stays foregrounded (registry cTag probe each tick) — and it already has drops and a member roster, not an empty row.
+- [ ] GUEST joins with the network cut right after the join completes locally (DevTools offline as the progress sheet closes); reconnect; the laptop shows the chat within a tick without a manual re-join (registry outbox retried the roaming pointer).
 
 Messaging
 - [ ] Text, link, image, file (>4 MB for the upload session) in both directions.
@@ -71,14 +72,18 @@ Messaging
 - [ ] Notifications (iOS standalone, notify on): "<chat> · <author>" fires for a backgrounded app; tapping opens the right chat; joining a chat with history does **not** replay the backlog.
 
 Lifecycle
-- [ ] Leave (guest): chat disappears locally and from the guest's other devices; member file best-effort removed.
+- [ ] Leave (guest): chat disappears locally at once and from the guest's other devices within one tick / on resume; a tab showing that chat on another device gets the "no longer on this account" toast and lands on the private feed; member file removed. Five minutes later the chat has **not** come back on the device that left.
+- [ ] Remove from list (guest, on a gone chat): removed on the other device too, and it never resurrects as active.
+- [ ] Delete chat (host) on one device: the host's **other** device removes the row outright (not "Access ended"); the guest still flips to "Access ended" (next row).
+- [ ] A throttled registry pass (429) leaves every local chat intact; the next pass reconciles.
 - [ ] Remove member (host): per matrix 2d — either removes access, or shows the reset-link guidance.
 - [ ] Reset link: old link dead for new joins; record 2e's member effect.
 - [ ] Delete chat (host): guest flips to "Access ended" read-only within ~3 poll cycles; Remove from list clears it.
-- [ ] Sign-out wipes chats, drops, and per-scope state; sign-in restores hosted chats + joined pointers from OneDrive.
+- [ ] Sign-out wipes chats, drops, and per-scope state; sign-in restores exactly the remote list: hosted chats + joined pointers from OneDrive.
 
 Migration & upgrade
 - [ ] An install with existing v2 data upgrades: private feed intact, thumbnails re-fetch, queued outbox drops still send.
+- [ ] Upgrade from the additive-hydration build: the first registry pass removes a guest chat whose roaming pointer never landed under the old fire-and-forget write (it was only ever on that one device). Expected — OneDrive is the truth — and recoverable by re-joining from the invite link. Every other chat survives.
 - [ ] Two-tab upgrade: the new-build tab upgrades cleanly; the old-build tab degrades without corrupting and recovers on reload.
 
 ## 4. Deployment (stuntcamp)
@@ -102,6 +107,11 @@ Revert the stuntcamp `build.ref` pin. Notes:
 
 - Drop JSON is forward-safe: old clients ignore the optional `author` field
   and never look inside `chats/` / `chats-joined/`.
+- The registry outbox (`milkbox:registry-outbox`), registry cTags and
+  `ChatRecord.registeredAt` are local-only settings/fields; a rolled-back
+  build ignores them and the on-disk pointer/descriptor JSON is unchanged.
+  A pending pointer write is lost on rollback (the old build never retried
+  it either).
 - IndexedDB **v3 does not downgrade**. A client that ran the new build fails
   `openDb` on a pre-v3 build. Do not roll back to a pre-migration SHA once
   this has shipped; if forced to, users recover by sign-out/sign-in (OneDrive

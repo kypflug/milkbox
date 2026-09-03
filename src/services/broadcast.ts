@@ -8,7 +8,9 @@
  * - `sync-complete`: Drops were synced; other tabs should refresh from cache
  * - `drop-mutated`: A single drop was created/updated/deleted
  * - `auth-changed`: Auth state changed (sign-in/sign-out)
- * - `chats-changed`: The chat registry changed (create/join/leave/gone)
+ * - `chats-changed`: The chat registry changed (create/join/leave/gone);
+ *   carries `removedChatId` when a chat left the registry, so a tab showing
+ *   that chat can leave it
  *
  * scopeId is optional on the sync variants so tabs running an older build
  * still understand the events (they just refresh the whole feed).
@@ -20,7 +22,7 @@ export type BroadcastEvent =
   | { type: 'sync-complete'; scopeId?: ScopeId }
   | { type: 'drop-mutated'; dropId: string; action: 'upsert' | 'delete'; scopeId?: ScopeId }
   | { type: 'auth-changed'; signedIn: boolean }
-  | { type: 'chats-changed' };
+  | { type: 'chats-changed'; removedChatId?: string };
 
 type BroadcastHandler = (event: BroadcastEvent) => void;
 

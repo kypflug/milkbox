@@ -1,8 +1,8 @@
 # Plan: keep the chat list consistent across a signed-in account's devices
 
-Status: proposal (not yet implemented). Scope: the local chat registry
-(`chats` IDB store) and its reconciliation with OneDrive. Drop sync inside a
-chat is out of scope and already works.
+Status: implemented (see "What shipped" at the end). Scope: the local chat
+registry (`chats` IDB store) and its reconciliation with OneDrive. Drop sync
+inside a chat is out of scope and already works.
 
 ## Symptom
 
@@ -203,3 +203,27 @@ Each step ships independently and is safe to revert on its own.
   folders across ticks if this shows up in throttling.
 - **Older builds.** Old clients ignore the new settings keys and never read
   `registeredAt`; the on-disk JSON in OneDrive is unchanged.
+
+## What shipped
+
+Everything in §1–§5 except name patching, which is deferred until a rename
+feature exists (there is nothing today that changes a chat's name, and
+reading every known descriptor each pass would defeat the one-listing-GET
+budget). Where the code lives:
+
+- `src/services/registry-outbox.ts` — the durable queue (§2): one settings
+  row, one entry per (op, chat), put/delete pointer ops cancel each other.
+- `src/services/sync-coordinator.ts` — `drainRegistryOutbox` (capped
+  backoff, Retry-After, consent gap parks the entry; 403/404/410 on a member
+  delete is success), `hydrateChatRegistry` (cTag probe each tick, listing
+  only when dirty or 30 min overdue) and `reconcileChatRegistry` (§1 rules,
+  grace window, pending-op exemptions, in-flight-sync exemption, forced
+  first sync for discoveries, `chat-removed` event). `joinChat`, `leaveChat`
+  and `removeChatLocally` go through the queue.
+- `src/services/chats.ts` — listings return the full remote id set apart
+  from the resolved new entries; `getRegistryCTags` is the probe.
+- `src/screens/feed.ts` — a removed chat that is on screen toasts and falls
+  back to the private feed, in this tab and (via `removedChatId` on the
+  `chats-changed` broadcast) in others.
+- `src/main.ts` — boot, resume and `online` drain the queue and probe the
+  registry; the resume floor now applies only to the token refresh.
