@@ -20,6 +20,7 @@
  */
 
 import { deleteSetting, getSettingsByPrefix, patchSetting, updateSettings } from './db';
+import { isValidUlid, validateJoinedPointer } from './validate-drop';
 import type { JoinedChatPointer } from '../types';
 
 const PREFIX = 'milkbox:registry-op:';
@@ -42,12 +43,75 @@ export type RegistryOpKind = RegistryOp['op'];
 
 const keyOf = (op: RegistryOpKind, chatId: string) => `${PREFIX}${op}:${chatId}`;
 
+const MAX_ID = 256;
+
+/** Counters and timestamps: non-negative safe integers, so `attempts + 1`,
+ *  `2 ** (attempts - 1)` and the oldest-first sort stay well-defined. */
+function counter(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function str(value: unknown, max: number): string | null {
+  return typeof value === 'string' && value.length > 0 && value.length <= max ? value : null;
+}
+
+/**
+ * Strict shape check for a stored row. Only a well-formed op is ever handed
+ * to the drain: a corrupted or partially written row must not turn the
+ * backoff bookkeeping (`attempts + 1`, `nextAt`) into NaN, and the op's own
+ * fields are what the Graph calls are built from.
+ */
+export function validateRegistryOp(raw: unknown): RegistryOp | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const body = raw as Record<string, unknown>;
+  if (!isValidUlid(body.chatId)) return null;
+  const enqueuedAt = counter(body.enqueuedAt);
+  const attempts = counter(body.attempts);
+  const nextAt = counter(body.nextAt);
+  if (enqueuedAt === null || attempts === null || nextAt === null) return null;
+  const base: RegistryOpBase = { chatId: body.chatId, enqueuedAt, attempts, nextAt };
+
+  switch (body.op) {
+    case 'put-pointer': {
+      const pointer = validateJoinedPointer(body.pointer);
+      if (!pointer || pointer.chatId !== base.chatId) return null;
+      return { ...base, op: 'put-pointer', pointer };
+    }
+    case 'delete-pointer':
+      return { ...base, op: 'delete-pointer' };
+    case 'delete-member': {
+      const driveId = str(body.driveId, MAX_ID);
+      const itemId = str(body.itemId, MAX_ID);
+      const memberId = str(body.memberId, MAX_ID);
+      if (!driveId || !itemId || !memberId) return null;
+      return { ...base, op: 'delete-member', driveId, itemId, memberId };
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Every well-formed queued op, oldest first. A row that fails validation,
+ * or whose contents disagree with the key it was stored under, can never
+ * be acted on — and since the drain removes an op by the key derived from
+ * its contents, a mismatched row would otherwise survive every drain as a
+ * ghost. Such rows are deleted (best-effort) rather than skipped.
+ */
 export async function getRegistryOutbox(): Promise<RegistryOp[]> {
-  const rows = await getSettingsByPrefix<RegistryOp>(PREFIX);
-  return rows
-    .map(r => r.value)
-    .filter((v): v is RegistryOp => typeof v === 'object' && v !== null && typeof v.op === 'string')
-    .sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+  const rows = await getSettingsByPrefix<unknown>(PREFIX);
+  const ops: RegistryOp[] = [];
+  const junk: string[] = [];
+  for (const row of rows) {
+    const op = validateRegistryOp(row.value);
+    if (op && keyOf(op.op, op.chatId) === row.key) ops.push(op);
+    else junk.push(row.key);
+  }
+  if (junk.length) {
+    console.debug('[Chats] Dropping malformed registry outbox rows:', junk);
+    await updateSettings([], junk).catch(err => console.debug('[Chats] Could not drop them:', err));
+  }
+  return ops.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
 }
 
 type NewRegistryOp =
@@ -73,11 +137,26 @@ export function removeRegistryOp(op: RegistryOpKind, chatId: string): Promise<vo
   return deleteSetting(keyOf(op, chatId));
 }
 
-/** Note a failed try so the drain leaves the op alone until `nextAt`. */
+/** Fallback backoff when a caller hands the write boundary a bad value. */
+const DEFER_FALLBACK_MS = 60_000;
+
+/**
+ * Note a failed try so the drain leaves the op alone until `nextAt`. The
+ * same counter invariant the read path enforces is applied here: a bad
+ * value from a caller (a NaN from an odd Retry-After, say) must not turn a
+ * valid queued op into a row the next read would drop, so it falls back to
+ * the persisted counter plus one and a fixed delay instead.
+ */
 export function deferRegistryOp(op: RegistryOpKind, chatId: string, attempts: number, nextAt: number): Promise<void> {
-  return patchSetting<RegistryOp>(keyOf(op, chatId), current =>
-    current ? { ...current, attempts, nextAt } : undefined,
-  );
+  return patchSetting<unknown>(keyOf(op, chatId), current => {
+    const valid = validateRegistryOp(current);
+    if (!valid) return undefined;
+    return {
+      ...valid,
+      attempts: counter(attempts) ?? valid.attempts + 1,
+      nextAt: counter(Math.ceil(nextAt)) ?? Date.now() + DEFER_FALLBACK_MS,
+    };
+  });
 }
 
 /** Whether a chat has a queued op of this kind — the reconcile's guard. */
