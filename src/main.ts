@@ -230,7 +230,7 @@ async function enterApp(app: HTMLElement): Promise<void> {
   // left queued, and reconcile the local registry with the chats this
   // account has elsewhere (hosted folders + roaming pointers).
   void coordinator.ensureMe();
-  void coordinator.drainRegistryOutbox().then(() => coordinator.hydrateChatRegistry());
+  void coordinator.catchUpRegistry();
 
   // A notification tap on an already-open window arrives as a worker
   // message — route to the scope it named.
@@ -364,9 +364,7 @@ function setupResumeHandler(): void {
   let lastRefresh = Date.now();
   const REFRESH_FLOOR_MS = 30_000;
 
-  const catchUpRegistry = () => {
-    void coordinator.drainRegistryOutbox().then(() => coordinator.hydrateChatRegistry(true));
-  };
+  const catchUpRegistry = () => void coordinator.catchUpRegistry(true);
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;

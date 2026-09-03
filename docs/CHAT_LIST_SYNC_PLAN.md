@@ -155,7 +155,8 @@ one poll tick (45 s) while foregrounded, or immediately on resume.
 
 - `ChatRecord`: add `registeredAt: number` (local insert time, for the grace
   window). Optional so existing v3 records need no migration.
-- New settings keys: `milkbox:registry-outbox`, `milkbox:registry-ctag:*`.
+- New settings keys: `milkbox:registry-op:<op>:<chatId>` (one per queued
+  write), `milkbox:registry-ctags`.
   Add them to `clearAllData` implicitly (settings store is cleared) and make
   sure `clearScopeData` does not touch them.
 - No IDB version bump.
@@ -214,7 +215,9 @@ descriptor when the pass moved no drops (or on the five-minute members
 cadence). Where the code lives:
 
 - `src/services/registry-outbox.ts` — the durable queue (§2): one settings
-  row, one entry per (op, chat), put/delete pointer ops cancel each other.
+  row per (op, chat) so every write is a single-key IndexedDB transaction
+  and two tabs cannot lose each other's intent; put/delete pointer ops
+  cancel each other in the same transaction.
 - `src/services/sync-coordinator.ts` — `drainRegistryOutbox` (capped
   backoff, Retry-After, consent gap parks the entry; 403/404/410 on a member
   delete is success), `hydrateChatRegistry` (cTag probe each tick, listing

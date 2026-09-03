@@ -340,6 +340,64 @@ export function deleteSetting(key: string): Promise<void> {
   return tx('settings', 'readwrite', s => { s.delete(key); });
 }
 
+/** Every setting whose key starts with `prefix`, as key/value pairs. */
+export async function getSettingsByPrefix<T>(prefix: string): Promise<Array<{ key: string; value: T }>> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const t = db.transaction('settings', 'readonly');
+    const store = t.objectStore('settings');
+    const range = IDBKeyRange.bound(prefix, prefix + RANGE_CEIL);
+    const keysReq = store.getAllKeys(range);
+    const valuesReq = store.getAll(range);
+    t.oncomplete = () => {
+      const keys = keysReq.result as string[];
+      const values = valuesReq.result as T[];
+      resolve(keys.map((key, i) => ({ key, value: values[i] })));
+    };
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
+
+/**
+ * Put and delete several settings in one transaction — atomic across tabs,
+ * since IndexedDB serializes readwrite transactions on a store.
+ */
+export async function updateSettings(puts: Array<[string, unknown]>, deletes: string[]): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const t = db.transaction('settings', 'readwrite');
+    const store = t.objectStore('settings');
+    for (const key of deletes) store.delete(key);
+    for (const [key, value] of puts) store.put(value, key);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
+
+/**
+ * Read-modify-write one setting inside a single transaction, so a
+ * concurrent writer in another tab can neither be clobbered nor clobber
+ * us. `fn` returning undefined deletes the key.
+ */
+export async function patchSetting<T>(key: string, fn: (current: T | undefined) => T | undefined): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const t = db.transaction('settings', 'readwrite');
+    const store = t.objectStore('settings');
+    const req = store.get(key) as IDBRequest<T | undefined>;
+    req.onsuccess = () => {
+      const next = fn(req.result);
+      if (next === undefined) store.delete(key);
+      else store.put(next, key);
+    };
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
+
 // ─── wipes ───
 
 /** The per-scope settings keys that leave/delete must clean up. */
