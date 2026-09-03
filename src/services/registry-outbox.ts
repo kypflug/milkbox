@@ -137,11 +137,25 @@ export function removeRegistryOp(op: RegistryOpKind, chatId: string): Promise<vo
   return deleteSetting(keyOf(op, chatId));
 }
 
-/** Note a failed try so the drain leaves the op alone until `nextAt`. */
+/** Fallback backoff when a caller hands the write boundary a bad value. */
+const DEFER_FALLBACK_MS = 60_000;
+
+/**
+ * Note a failed try so the drain leaves the op alone until `nextAt`. The
+ * same counter invariant the read path enforces is applied here: a bad
+ * value from a caller (a NaN from an odd Retry-After, say) must not turn a
+ * valid queued op into a row the next read would drop, so it falls back to
+ * the persisted counter plus one and a fixed delay instead.
+ */
 export function deferRegistryOp(op: RegistryOpKind, chatId: string, attempts: number, nextAt: number): Promise<void> {
   return patchSetting<unknown>(keyOf(op, chatId), current => {
     const valid = validateRegistryOp(current);
-    return valid ? { ...valid, attempts, nextAt } : undefined;
+    if (!valid) return undefined;
+    return {
+      ...valid,
+      attempts: counter(attempts) ?? valid.attempts + 1,
+      nextAt: counter(Math.ceil(nextAt)) ?? Date.now() + DEFER_FALLBACK_MS,
+    };
   });
 }
 
