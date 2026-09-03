@@ -387,6 +387,7 @@ interface ScopeSyncState {
   lastSyncAt: number;
   consecutiveGone: number;
   lastMembersFetch: number;
+  lastDescriptorFetch: number;
 }
 
 const scopeStates = new Map<ScopeId, ScopeSyncState>();
@@ -407,7 +408,15 @@ function noteThrottle(err: unknown): void {
 function stateFor(scopeId: ScopeId): ScopeSyncState {
   let st = scopeStates.get(scopeId);
   if (!st) {
-    st = { syncing: false, syncPromise: null, syncAgain: false, lastSyncAt: 0, consecutiveGone: 0, lastMembersFetch: 0 };
+    st = {
+      syncing: false,
+      syncPromise: null,
+      syncAgain: false,
+      lastSyncAt: 0,
+      consecutiveGone: 0,
+      lastMembersFetch: 0,
+      lastDescriptorFetch: 0,
+    };
     scopeStates.set(scopeId, st);
   }
   return st;
@@ -558,6 +567,26 @@ async function handleChatConsentLost(chatId: string): Promise<void> {
   emit({ type: 'chats-changed' });
 }
 
+/**
+ * Pick up a rename made on another device. A pass that moved no drops was
+ * triggered by something else under the chat folder (the folder cTag
+ * covers chat.json too), so that is when the descriptor is worth one GET;
+ * otherwise it is re-read on the members cadence. A changed name patches
+ * the record and tells the switcher, the feed header and the other tabs.
+ */
+async function refreshDescriptor(scope: ChatScope, st: ScopeSyncState, passChanged: boolean): Promise<void> {
+  const stale = Date.now() - st.lastDescriptorFetch > MEMBERS_REFRESH_MS;
+  if (passChanged && !stale) return;
+  const record = await db.getChat(scope.chatId);
+  if (!record) return;
+  const descriptor = await chatsApi.fetchChatDescriptor(record);
+  st.lastDescriptorFetch = Date.now();
+  if (!descriptor || descriptor.name === record.name) return;
+  await db.patchChat(scope.chatId, { name: descriptor.name });
+  emit({ type: 'chats-changed' });
+  postBroadcast({ type: 'chats-changed' });
+}
+
 /** Refresh the cached member roster when it's stale or the pass changed things. */
 async function refreshMembers(scope: ChatScope, st: ScopeSyncState, passChanged: boolean): Promise<void> {
   const scopeId = scopeIdOf(scope);
@@ -655,6 +684,11 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
             await refreshMembers(scope, st, passChanged);
           } catch (err) {
             console.debug('[Sync] Member refresh failed; roster is stale:', err);
+          }
+          try {
+            await refreshDescriptor(scope, st, passChanged);
+          } catch (err) {
+            console.debug('[Sync] Descriptor refresh failed; name may be stale:', err);
           }
           await trackUnread(scope, arrivals);
         }
@@ -785,6 +819,29 @@ export async function createChat(name: string): Promise<ChatRecord> {
   emit({ type: 'chats-changed' });
   postBroadcast({ type: 'chats-changed' });
   return record;
+}
+
+export const MAX_CHAT_NAME = 64;
+
+/**
+ * Host: rename a chat for everyone. The name lives in chat.json in the
+ * host's approot (base tier — no share consent involved); the host's other
+ * devices and every guest read it back on their next sync pass, which the
+ * folder-cTag change this write causes will trigger.
+ */
+export async function renameChat(chatId: string, name: string): Promise<void> {
+  const record = await db.getChat(chatId);
+  if (!record || record.role !== 'host') throw new Error('Only the host can rename a chat');
+  const trimmed = name.trim().slice(0, MAX_CHAT_NAME);
+  if (!trimmed) throw new Error('A chat needs a name');
+  if (trimmed === record.name) return;
+  // Re-read rather than rebuild: createdAt/host must round-trip untouched.
+  const current = await chatsApi.fetchChatDescriptor(record);
+  if (!current) throw new Error('The chat descriptor is missing');
+  await chatsApi.putChatDescriptor({ ...current, name: trimmed });
+  await db.patchChat(chatId, { name: trimmed });
+  emit({ type: 'chats-changed' });
+  postBroadcast({ type: 'chats-changed' });
 }
 
 /** Host: get (or mint) the invite link for a chat. Share tier. */

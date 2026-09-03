@@ -206,10 +206,12 @@ Each step ships independently and is safe to revert on its own.
 
 ## What shipped
 
-Everything in §1–§5 except name patching, which is deferred until a rename
-feature exists (there is nothing today that changes a chat's name, and
-reading every known descriptor each pass would defeat the one-listing-GET
-budget). Where the code lives:
+Everything in §1–§5. Name propagation does not ride the registry pass
+(reading every known descriptor each pass would defeat the one-listing-GET
+budget); instead a host rename rewrites `chat.json`, which moves the chat
+folder's cTag, and each device's next sync pass for that chat re-reads the
+descriptor when the pass moved no drops (or on the five-minute members
+cadence). Where the code lives:
 
 - `src/services/registry-outbox.ts` — the durable queue (§2): one settings
   row, one entry per (op, chat), put/delete pointer ops cancel each other.
@@ -221,7 +223,10 @@ budget). Where the code lives:
   first sync for discoveries, `chat-removed` event). `joinChat`, `leaveChat`
   and `removeChatLocally` go through the queue.
 - `src/services/chats.ts` — listings return the full remote id set apart
-  from the resolved new entries; `getRegistryCTags` is the probe.
+  from the resolved new entries; `getRegistryCTags` is the probe;
+  `fetchChatDescriptor`/`putChatDescriptor` back rename.
+- `src/screens/chat-sheets.ts` — Rename chat (host only) in Chat options;
+  `src/screens/feed.ts` retitles the open chat in place.
 - `src/screens/feed.ts` — a removed chat that is on screen toasts and falls
   back to the private feed, in this tab and (via `removedChatId` on the
   `chats-changed` broadcast) in others.

@@ -19,6 +19,8 @@ export interface ComposerApi {
   setSyncState(state: 'syncing' | 'synced' | 'error'): void;
   /** Grey out sending (a gone chat) — refresh/settings/chats stay usable. */
   setDisabled(disabled: boolean, placeholder?: string): void;
+  /** Change the idle placeholder (a renamed chat) without touching disabled state. */
+  setPlaceholder(placeholder: string): void;
   teardown(): void;
 }
 
@@ -215,6 +217,10 @@ export function mountComposer(
       inputEl.placeholder = disabled
         ? (placeholder || 'No access')
         : (opts.placeholder || 'Drop something…');
+    },
+    setPlaceholder(placeholder: string) {
+      opts.placeholder = placeholder;
+      if (!inputEl.disabled) inputEl.placeholder = placeholder;
     },
     teardown() {
       document.removeEventListener('paste', onPaste);

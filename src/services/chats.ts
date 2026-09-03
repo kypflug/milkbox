@@ -169,6 +169,25 @@ export async function createChatFolder(name: string, me: AuthorAttribution): Pro
   return record;
 }
 
+/**
+ * The chat's descriptor as OneDrive currently holds it — the one place a
+ * chat's name lives, so every device (host's or guest's) reads it back from
+ * here. Null when the body is not a valid descriptor for this chat.
+ */
+export async function fetchChatDescriptor(
+  chat: { id: string; driveId: string; itemId: string; role: 'host' | 'guest' },
+): Promise<ChatDescriptor | null> {
+  const tier = chat.role === 'host' ? 'base' : 'share';
+  const res = await graphFetch(contentUrl(chatRef(chat), 'chat.json'), undefined, tier);
+  const descriptor = validateChatDescriptor(await res.json());
+  return descriptor && descriptor.id === chat.id ? descriptor : null;
+}
+
+/** Host: rewrite the descriptor in the own approot (base tier). */
+export function putChatDescriptor(descriptor: ChatDescriptor): Promise<void> {
+  return putJson(APPROOT, `${CHATS_FOLDER}/${descriptor.id}/chat.json`, descriptor, 'base');
+}
+
 /** Host: delete the whole chat folder — ends the chat for everyone. */
 export async function deleteChatFolder(chatId: string): Promise<void> {
   try {

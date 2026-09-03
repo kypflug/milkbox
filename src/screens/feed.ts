@@ -581,8 +581,26 @@ export async function renderFeed(
     window.dispatchEvent(new HashChangeEvent('hashchange'));
   };
 
+  // The chat was renamed (here, on another device, or in another tab):
+  // retitle in place rather than re-rendering the feed.
+  const applyRename = async () => {
+    if (scope.kind !== 'chat') return;
+    const record = await db.getChat(scope.chatId);
+    if (!record || record.name === scope.name) return;
+    scope.name = record.name;
+    const wordmark = app.querySelector<HTMLElement>('.feed-wordmark');
+    if (wordmark) wordmark.textContent = record.name;
+    listEl.setAttribute('aria-label', `Drops in ${record.name}`);
+    if (chatState === 'active') composerApi?.setPlaceholder(`Message ${record.name}`);
+    if (feed.length === 0) void refresh();
+  };
+  const onChatsChanged = () => void applyRename().catch(err => console.debug('[Chats] Retitle failed:', err));
+
   const offCoordinator = coordinator.onCoordinatorEvent(event => {
-    if (event.type === 'chats-changed') return; // the switcher's concern
+    if (event.type === 'chats-changed') {
+      onChatsChanged(); // the list itself is the switcher's concern
+      return;
+    }
     if (event.type === 'chat-removed') {
       leaveRemovedChat(event.chatId, event.name);
       return;
@@ -623,8 +641,9 @@ export async function renderFeed(
     if (event.type === 'sync-complete' || event.type === 'drop-mutated') {
       // Old builds broadcast without a scopeId — treat those as ours.
       coordinator.refreshFromCache(event.scopeId ?? scopeId);
-    } else if (event.type === 'chats-changed' && event.removedChatId) {
-      leaveRemovedChat(event.removedChatId, undefined);
+    } else if (event.type === 'chats-changed') {
+      if (event.removedChatId) leaveRemovedChat(event.removedChatId, undefined);
+      else onChatsChanged();
     }
   });
   teardownFns.push(offBroadcast);

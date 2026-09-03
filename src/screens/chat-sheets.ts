@@ -100,6 +100,51 @@ export function showConsentInterstitial(onContinue: () => void): void {
   });
 }
 
+// ─── rename ───
+
+export function showRenameChatSheet(chat: { id: string; name: string }): void {
+  const modal = openModal('Rename chat', `
+    <label class="chat-field-label" for="chatRenameInput">Chat name</label>
+    <input class="chat-field-input" id="chatRenameInput" type="text" maxlength="${coordinator.MAX_CHAT_NAME}"
+           value="${escapeAttr(chat.name)}" autocomplete="off">
+    <p class="chat-modal-hint">Everyone in the chat sees the new name on their next sync.</p>
+    <div class="chat-modal-actions">
+      <button class="chat-modal-primary" data-action="rename">Rename</button>
+    </div>
+  `);
+  const input = modal.body.querySelector<HTMLInputElement>('#chatRenameInput')!;
+  const button = modal.body.querySelector<HTMLButtonElement>('[data-action="rename"]')!;
+  input.focus();
+  input.select();
+  const submit = async () => {
+    const name = input.value.trim();
+    if (!name) {
+      input.focus();
+      return;
+    }
+    if (name === chat.name) {
+      modal.close();
+      return;
+    }
+    button.disabled = true;
+    input.disabled = true;
+    try {
+      await coordinator.renameChat(chat.id, name);
+      modal.close();
+      showToast(`Renamed to ${name}`);
+    } catch (err) {
+      console.warn('[Chats] Rename failed:', err);
+      button.disabled = false;
+      input.disabled = false;
+      showToast('Couldn’t rename the chat. Try again.', 'error');
+    }
+  };
+  button.addEventListener('click', () => void submit());
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') void submit();
+  });
+}
+
 // ─── invite ───
 
 export async function showInviteSheet(chatId: string): Promise<void> {
@@ -202,6 +247,7 @@ export async function showManageSheet(
     <div class="chat-modal-actions chat-modal-actions--column">
       ${isHost ? `
         <button class="chat-modal-secondary" data-action="invite">Show invite link</button>
+        <button class="chat-modal-secondary" data-action="rename">Rename chat</button>
         <button class="chat-modal-danger" data-action="delete">Delete chat for everyone</button>
       ` : `
         <button class="chat-modal-danger" data-action="leave">Leave chat</button>
@@ -235,6 +281,9 @@ export async function showManageSheet(
     if (action === 'invite') {
       modal.close();
       void showInviteSheet(chatId);
+    } else if (action === 'rename') {
+      modal.close();
+      showRenameChatSheet(chat);
     } else if (action === 'delete') {
       if (!confirm(`Delete ${chat.name} for everyone? All drops and files in this chat will be permanently deleted from your OneDrive.`)) return;
       modal.close();

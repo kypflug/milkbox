@@ -72,6 +72,8 @@ Messaging
 - [ ] Notifications (iOS standalone, notify on): "<chat> · <author>" fires for a backgrounded app; tapping opens the right chat; joining a chat with history does **not** replay the backlog.
 
 Lifecycle
+- [ ] Rename (host, Chat options → Rename chat): the header, composer placeholder and switcher row retitle at once on that device; the host's other device and GUEST retitle within one poll tick (chat-folder cTag moves → sync pass re-reads `chat.json`); the invite sheet and manage sheet open with the new name. GUEST has no Rename button.
+- [ ] Rename while GUEST is offline: GUEST retitles on the first sync after reconnect. A chat idle for over five minutes re-reads the descriptor on its next pass regardless.
 - [ ] Leave (guest): chat disappears locally at once and from the guest's other devices within one tick / on resume; a tab showing that chat on another device gets the "no longer on this account" toast and lands on the private feed; member file removed. Five minutes later the chat has **not** come back on the device that left.
 - [ ] Remove from list (guest, on a gone chat): removed on the other device too, and it never resurrects as active.
 - [ ] Delete chat (host) on one device: the host's **other** device removes the row outright (not "Access ended"); the guest still flips to "Access ended" (next row).
