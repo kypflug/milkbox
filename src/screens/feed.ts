@@ -76,11 +76,13 @@ export async function renderFeed(
     <div class="feed-screen">
       <header class="feed-header">
         <div class="feed-header-row">
-          <span class="feed-mark">${iconBottle('1.15em')}</span>
+          <div class="feed-header-lead">
+            <span class="feed-mark">${iconBottle('1.15em')}</span>
+            <button class="feed-chats-btn" title="Chats" aria-label="Chats" aria-haspopup="dialog">
+              ${iconChats('1.15em')}<span class="feed-chats-badge" aria-hidden="true" hidden></span>
+            </button>
+          </div>
           <span class="feed-wordmark">${escapeHtml(title)}</span>
-          <button class="feed-chats-btn" title="Chats" aria-label="Chats" aria-haspopup="dialog">
-            ${iconChats('1.15em')}<span class="feed-chats-badge" aria-hidden="true" hidden></span>
-          </button>
         </div>
       </header>
       <div class="chat-banner" id="chatBanner" hidden></div>

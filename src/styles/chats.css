@@ -1,10 +1,12 @@
 /*
- * Shared chats: the header chats button (top right, mirroring the logomark),
- * the switcher dialog it opens, and the chat modals (create / consent /
- * invite / manage / join progress).
+ * Shared chats: the header chats button (top right, mirroring the logomark;
+ * beside the logomark on the left under window-controls-overlay), the
+ * switcher dialog it opens, and the chat modals (create / consent / invite /
+ * manage / join progress).
  *
- * z-ladder (see feed/global css): WCO header 40 → drag overlay 50 →
- * WCO chats button 55 → lightbox 60 → chat modals 70 → toast 100.
+ * z-ladder (see feed/global css): drag overlay 50 → WCO header row 55
+ * (pointer-transparent except the chats button) → lightbox 60 →
+ * chat modals 70 → toast 100.
  */
 
 /* ── header chats button ── */
@@ -43,38 +45,41 @@
 }
 
 /*
- * Window-controls-overlay: the drag overlay (z-50) sits above the fixed
- * header row (z-40), so a button inside that stacking context can never be
- * clicked. Lift the trigger out as its own fixed element above the overlay
- * (the drag-region comment in global.css sanctions interactive titlebar
- * content above z-50), inset past the window controls on whichever side
- * they occupy. The logomark gets the matching left inset.
+ * Window-controls-overlay: the chats button joins the logomark on the left
+ * of the title strip instead of crowding the window controls, and the pair
+ * is inset past the controls when they sit on that side (macOS, RTL Windows).
+ *
+ * The header row is fixed, so it is its own stacking context: a z-index on
+ * the button alone can never lift it over the drag overlay (z-50). Instead
+ * the whole row rides above the overlay at z-55 with pointer-events: none,
+ * and .feed-header gives up its own z-index so it stops capping the row
+ * (both in global.css). The button alone opts back in — so it takes the
+ * click, while the wordmark and the empty strip pass drags through to the
+ * overlay. no-drag keeps the button's own rect out of the draggable region.
  */
 @media (display-mode: window-controls-overlay) {
   .feed-header-row {
     --wco-inset-left: env(titlebar-area-x, 0px);
-    --wco-inset-right: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw));
   }
 
-  .feed-mark {
+  .feed-header-lead {
+    grid-column: 1;
+    justify-self: start;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     margin-left: max(0px, calc(var(--wco-inset-left) - 20px));
   }
 
-  .feed-chats-btn {
-    position: fixed;
-    top: env(titlebar-area-y, 0px);
-    right: max(14px, var(--wco-inset-right));
-    height: var(--wco-title-strip-height);
-    width: 36px;
-    border-radius: 0;
-    z-index: 55;
-    -webkit-app-region: no-drag;
-    app-region: no-drag;
+  .feed-mark {
+    grid-column: auto;
   }
 
-  .feed-chats-btn:hover {
-    background: transparent;
-    color: var(--accent-hover);
+  .feed-chats-btn {
+    grid-column: auto;
+    pointer-events: auto;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
   }
 }
 

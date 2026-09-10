@@ -218,13 +218,22 @@ body {
       auto
       minmax(var(--wco-controls-inset), 1fr);
     padding: 0 20px;
-    z-index: 40;
+    /* Above the drag overlay (z-50) so the chats button is reachable: a fixed
+     * row is its own stacking context, so nothing inside it could otherwise
+     * out-stack the overlay. The row itself ignores the pointer, so drags on
+     * the wordmark and the empty strip still land on the overlay; only the
+     * chats button opts back in (chats.css). */
+    z-index: 55;
+    pointer-events: none;
     -webkit-user-select: none;
     user-select: none;
   }
   .feed-header {
     height: var(--wco-title-strip-height);
     background: transparent;
+    /* Its resting z-index: 2 would make it a stacking context and cap the
+     * fixed row at level 2, back under the drag overlay. */
+    z-index: auto;
   }
 }
 

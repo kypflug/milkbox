@@ -1,6 +1,7 @@
 /**
  * The chat switcher — a dialog opened from the chats button in the feed
- * header (top right, mirroring the logomark). Built on the same modal shell
+ * header (top right, mirroring the logomark; beside it on the left under
+ * window-controls-overlay). Built on the same modal shell
  * as the other chat sheets, so it dismisses like settings: scrim, Escape,
  * close button. Repaints live while open when the registry changes.
  */

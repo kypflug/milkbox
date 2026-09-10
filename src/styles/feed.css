@@ -34,6 +34,12 @@
   padding: 0 20px;
 }
 
+/* The lead group holds the logomark and the chats button. Outside
+ * window-controls-overlay it dissolves into the grid so the mark keeps the
+ * left rail and the button the right one; under the overlay it becomes a
+ * real flex row on the left (see chats.css). */
+.feed-header-lead { display: contents; }
+
 .feed-mark {
   grid-column: 1;
   justify-self: start;
@@ -47,10 +53,11 @@
   letter-spacing: -0.01em;
 }
 
-/* Both rails are occupied now (bottle left, chats button right), so the old
- * controls-left side-swap is gone; under window-controls-overlay each corner
- * item takes a side-aware inset instead (see chats.css). The wordmark stays
- * in the middle column, so it is centred either way. */
+/* Both rails are occupied outside the overlay (bottle left, chats button
+ * right), so the old controls-left side-swap is gone; under
+ * window-controls-overlay the lead group keeps both on the left, inset past
+ * the window controls when they sit there (see chats.css). The wordmark
+ * stays in the middle column, so it is centred either way. */
 
 /* ── scroll area ── */
 
