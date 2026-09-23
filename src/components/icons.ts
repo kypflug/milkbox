@@ -52,9 +52,9 @@ export const iconClose = (size = '1em') =>
 export const iconSignOut = (size = '1em') =>
   svg('<path d="M14 4H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h7"/><path d="M17 8.5 20.5 12 17 15.5M20 12H10"/>', size);
 
-/** Two speech bubbles — the chat switcher. */
-export const iconChats = (size = '1em') =>
-  svg('<path d="M4 5.5h11a1.5 1.5 0 0 1 1.5 1.5v6a1.5 1.5 0 0 1-1.5 1.5H9L5.5 18v-3.5H4A1.5 1.5 0 0 1 2.5 13V7A1.5 1.5 0 0 1 4 5.5Z"/><path d="M19 9.5h1A1.5 1.5 0 0 1 21.5 11v5a1.5 1.5 0 0 1-1.5 1.5h-1V21l-3.5-3.5H12"/>', size);
+/** Downward chevron — the title's chat menu. */
+export const iconChevronDown = (size = '1em') =>
+  svg('<path d="m6.5 9.5 5.5 5.5 5.5-5.5"/>', size);
 
 export const iconPlus = (size = '1em') =>
   svg('<path d="M12 5v14M5 12h14"/>', size);

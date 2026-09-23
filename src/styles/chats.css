@@ -1,40 +1,58 @@
 /*
- * Shared chats: the header chats button (top right, mirroring the logomark),
- * the switcher dialog it opens, and the chat modals (create / consent /
- * invite / manage / join progress).
+ * Shared chats: the feed title that doubles as the chat menu trigger, the
+ * dropdown it opens, and the chat modals (create / consent / invite /
+ * manage / join progress).
  *
- * z-ladder (see feed/global css): WCO header 40 → drag overlay 50 →
- * WCO chats button 55 → lightbox 60 → chat modals 70 → toast 100.
+ * z-ladder (see feed/global css): drag overlay 50 → WCO header row 55
+ * (pointer-transparent except the title button) → lightbox 60 →
+ * chat modals 70 → toast 100. The chat menu is a popover, so it renders in
+ * the top layer above all of these.
  */
 
-/* ── header chats button ── */
+/* ── the title: current scope + chat menu trigger ── */
 
-.feed-chats-btn {
-  grid-column: 3;
-  justify-self: end;
-  position: relative;
+.feed-title-btn {
+  grid-column: 2;
+  min-width: 0;
+  max-width: 100%;
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
+  gap: 6px;
+  padding: 4px 8px;
   border: none;
   border-radius: var(--radius-chip);
   background: transparent;
-  color: var(--accent);
+  color: var(--ink);
   cursor: pointer;
 }
 
-.feed-chats-btn:hover {
+.feed-title-btn:hover,
+.feed-title-btn[aria-expanded="true"] {
   background: var(--surface-sunk);
 }
 
-.feed-chats-badge {
-  position: absolute;
-  top: -2px;
-  right: -4px;
-  min-width: 15px;
-  padding: 1px 4px;
+.feed-title-btn .feed-wordmark {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feed-title-chevron {
+  flex: none;
+  display: inline-flex;
+  color: var(--ink-2);
+  transition: transform var(--ease);
+}
+
+.feed-title-btn[aria-expanded="true"] .feed-title-chevron {
+  transform: rotate(180deg);
+}
+
+.feed-title-badge {
+  flex: none;
+  min-width: 18px;
+  padding: 2px 5px;
   border-radius: 999px;
   background: var(--accent);
   color: var(--on-accent);
@@ -43,42 +61,82 @@
 }
 
 /*
- * Window-controls-overlay: the drag overlay (z-50) sits above the fixed
- * header row (z-40), so a button inside that stacking context can never be
- * clicked. Lift the trigger out as its own fixed element above the overlay
- * (the drag-region comment in global.css sanctions interactive titlebar
- * content above z-50), inset past the window controls on whichever side
- * they occupy. The logomark gets the matching left inset.
+ * Window-controls-overlay. The title sits in the middle of the strip, which
+ * the rails keep clear of the window controls on either side, so it never
+ * needs a side-aware inset of its own.
+ *
+ * The header row is fixed, so it is its own stacking context: a z-index on
+ * the title alone can never lift it over the drag overlay (z-50). Instead
+ * the whole row rides above the overlay at z-55 with pointer-events: none,
+ * and .feed-header gives up its own z-index so it stops capping the row
+ * (both in global.css). The title alone opts back in, so it takes the
+ * click while the bottle and the empty strip pass drags through to the
+ * overlay. no-drag keeps the title's own rect out of the draggable region.
  */
 @media (display-mode: window-controls-overlay) {
-  .feed-header-row {
-    --wco-inset-left: env(titlebar-area-x, 0px);
-    --wco-inset-right: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw));
-  }
-
-  .feed-mark {
-    margin-left: max(0px, calc(var(--wco-inset-left) - 20px));
-  }
-
-  .feed-chats-btn {
-    position: fixed;
-    top: env(titlebar-area-y, 0px);
-    right: max(14px, var(--wco-inset-right));
-    height: var(--wco-title-strip-height);
-    width: 36px;
-    border-radius: 0;
-    z-index: 55;
+  .feed-title-btn {
+    pointer-events: auto;
     -webkit-app-region: no-drag;
     app-region: no-drag;
   }
-
-  .feed-chats-btn:hover {
-    background: transparent;
-    color: var(--accent-hover);
-  }
 }
 
-/* ── switcher dialog rows (inside a chat-modal) ── */
+/* ── the chat menu (a popover hung off the title) ── */
+
+.chat-menu {
+  /* Reset the UA popover box. chat-switcher.ts sets top, left and
+   * max-height from the title's position. */
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  width: min(320px, calc(100vw - 32px));
+  padding: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--hairline));
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-pop), var(--card-highlight);
+}
+
+.chat-menu:popover-open {
+  animation: chat-menu-in 160ms var(--ease-curve);
+}
+
+@keyframes chat-menu-in {
+  from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.chat-menu-actions {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--hairline);
+}
+
+.chat-menu-new {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: var(--radius-input);
+  color: var(--accent);
+  text-align: left;
+}
+
+.chat-menu-new svg {
+  width: 1.1em;
+  height: 1.1em;
+}
+
+.chat-menu-new:hover {
+  background: var(--surface-sunk);
+  color: var(--accent-hover);
+}
+
+/* ── chat menu rows ── */
 
 .chat-list {
   display: flex;

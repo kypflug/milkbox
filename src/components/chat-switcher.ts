@@ -1,15 +1,16 @@
 /**
- * The chat switcher — a dialog opened from the chats button in the feed
- * header (top right, mirroring the logomark). Built on the same modal shell
- * as the other chat sheets, so it dismisses like settings: scrim, Escape,
- * close button. Repaints live while open when the registry changes.
+ * The chat switcher — a dropdown hanging off the feed title. The title names
+ * the current scope ("Milkbox" or the chat's name), so the menu that changes
+ * it lives on it. Built on the native Popover API: a shown popover renders in
+ * the top layer, above every z-index, so the window-controls-overlay drag
+ * strip can never cover it, and light dismiss and Escape come for free.
+ * Repaints live while open when the registry changes.
  */
 
 import { escapeAttr, escapeHtml } from '../utils/storage';
 import * as coordinator from '../services/sync-coordinator';
 import { onBroadcast } from '../services/broadcast';
-import { openModal } from '../screens/chat-sheets';
-import { iconBottle, iconPeople } from './icons';
+import { iconBottle, iconPeople, iconPlus } from './icons';
 import type { ChatRecord, ScopeId } from '../types';
 
 export interface ChatSwitcherHandlers {
@@ -28,32 +29,55 @@ function chatSubline(chat: ChatRecord): string {
   return `Hosted by ${chat.host.name}`;
 }
 
-export function showChatSwitcher(currentScopeId: ScopeId, handlers: ChatSwitcherHandlers): void {
-  let offCoordinator: () => void = () => {};
-  let offBroadcast: () => void = () => {};
+export interface ChatMenuApi {
+  teardown(): void;
+}
 
-  const modal = openModal('Chats', `
+/** Gap between the title strip and the menu, and the viewport gutter. */
+const MENU_GAP = 6;
+const VIEWPORT_GUTTER = 16;
+
+/**
+ * Hang the chat menu off `trigger` (the feed title). The popover mounts in
+ * `mount`, which must sit outside the header row: under window-controls-overlay
+ * that row is pointer-events: none, and the property inherits.
+ */
+export function mountChatMenu(
+  trigger: HTMLButtonElement,
+  mount: HTMLElement,
+  currentScopeId: ScopeId,
+  handlers: ChatSwitcherHandlers,
+): ChatMenuApi {
+  const menu = document.createElement('div');
+  menu.className = 'chat-menu';
+  menu.id = 'chatMenu';
+  menu.popover = 'auto';
+  menu.setAttribute('role', 'dialog');
+  menu.setAttribute('aria-label', 'Chats');
+  menu.innerHTML = `
     <div class="chat-list"></div>
-    <div class="chat-modal-actions">
-      <button class="chat-modal-primary" data-action="new-chat">New chat</button>
+    <div class="chat-menu-actions">
+      <button class="chat-menu-new" data-action="new-chat">${iconPlus('1em')}<span>New chat</span></button>
     </div>
-  `, {
-    onClose: () => {
-      offCoordinator();
-      offBroadcast();
-    },
-  });
+  `;
+  mount.appendChild(menu);
 
-  const listEl = modal.body.querySelector<HTMLElement>('.chat-list')!;
+  trigger.setAttribute('aria-haspopup', 'dialog');
+  trigger.setAttribute('aria-controls', menu.id);
+  trigger.setAttribute('aria-expanded', 'false');
+
+  const listEl = menu.querySelector<HTMLElement>('.chat-list')!;
+  const isOpen = () => menu.matches(':popover-open');
 
   async function paint(): Promise<void> {
     const chats = (await coordinator.loadChats()).sort((a, b) => a.joinedAt - b.joinedAt);
 
     const rows: string[] = [];
-    const privateSelected = currentScopeId === 'private' ? ' chat-item--selected' : '';
+    const privateSelected = currentScopeId === 'private';
     rows.push(`
       <div class="chat-row">
-        <button class="chat-item chat-item--private${privateSelected}" data-scope="private">
+        <button class="chat-item chat-item--private${privateSelected ? ' chat-item--selected' : ''}"
+                data-scope="private"${privateSelected ? ' aria-current="true"' : ''}>
           <span class="chat-item-glyph">${iconBottle('1.1em')}</span>
           <span class="chat-item-text">
             <span class="chat-item-name">My milkbox</span>
@@ -63,12 +87,13 @@ export function showChatSwitcher(currentScopeId: ScopeId, handlers: ChatSwitcher
 
     for (const chat of chats) {
       const scopeId: ScopeId = `chat:${chat.id}`;
-      const selected = scopeId === currentScopeId ? ' chat-item--selected' : '';
+      const selected = scopeId === currentScopeId;
       const goneClass = chat.state === 'gone' ? ' chat-item--gone' : '';
       const unread = chat.unreadCount ?? 0;
       rows.push(`
         <div class="chat-row">
-          <button class="chat-item${selected}${goneClass}" data-scope="${escapeAttr(scopeId)}">
+          <button class="chat-item${selected ? ' chat-item--selected' : ''}${goneClass}"
+                  data-scope="${escapeAttr(scopeId)}"${selected ? ' aria-current="true"' : ''}>
             <span class="chat-item-glyph">${iconPeople('1.1em')}</span>
             <span class="chat-item-text">
               <span class="chat-item-name">${escapeHtml(chat.name)}</span>
@@ -80,50 +105,147 @@ export function showChatSwitcher(currentScopeId: ScopeId, handlers: ChatSwitcher
         </div>`);
     }
 
+    // Repaints while open would otherwise drop keyboard focus on the floor.
+    const focusedScope = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>('[data-scope]')?.dataset.scope;
     listEl.innerHTML = rows.join('');
+    if (focusedScope && isOpen()) {
+      listEl.querySelector<HTMLElement>(`[data-scope="${CSS.escape(focusedScope)}"]`)?.focus();
+    }
+    if (isOpen()) position();
   }
 
-  modal.body.addEventListener('click', e => {
+  const repaint = () => void paint().catch(err => console.debug('[Chats] Menu paint failed:', err));
+
+  /** Centre under the title, clamped to the viewport; cap the height to the
+   *  space below so a long list scrolls inside the menu. */
+  function position(): void {
+    const anchor = trigger.getBoundingClientRect();
+    const header = trigger.closest<HTMLElement>('.feed-header-row')?.getBoundingClientRect();
+    const top = Math.max(anchor.bottom, header?.bottom ?? anchor.bottom) + MENU_GAP;
+    const width = menu.offsetWidth;
+    const centre = anchor.left + anchor.width / 2;
+    const maxLeft = window.innerWidth - VIEWPORT_GUTTER - width;
+    const left = Math.max(VIEWPORT_GUTTER, Math.min(centre - width / 2, maxLeft));
+    menu.style.top = `${top}px`;
+    menu.style.left = `${left}px`;
+    menu.style.maxHeight = `${Math.max(160, window.innerHeight - top - VIEWPORT_GUTTER)}px`;
+  }
+
+  const close = (restoreFocus: boolean) => {
+    if (isOpen()) menu.hidePopover();
+    if (restoreFocus) trigger.focus();
+  };
+
+  // The trigger toggles by hand rather than via popovertarget so the menu
+  // can live outside the header (see the mount note above). Light dismiss
+  // fires on pointerdown, before this click, so a click that closed the menu
+  // must not immediately reopen it.
+  let closedByTriggerPress = false;
+  const onTriggerPointerDown = () => { closedByTriggerPress = isOpen(); };
+  const onTriggerClick = () => {
+    if (closedByTriggerPress) {
+      closedByTriggerPress = false;
+      return;
+    }
+    if (isOpen()) menu.hidePopover();
+    else open();
+  };
+  // A keyboard press never has a pointerdown, so clear any flag a cancelled
+  // pointer press left behind.
+  const onTriggerKeyDown = () => { closedByTriggerPress = false; };
+  trigger.addEventListener('pointerdown', onTriggerPointerDown);
+  trigger.addEventListener('keydown', onTriggerKeyDown);
+  trigger.addEventListener('click', onTriggerClick);
+
+  // Position and focus in the same task as showPopover, so no frame ever
+  // paints the menu at the UA default spot before it moves under the title.
+  function open(): void {
+    menu.showPopover();
+    position();
+    trigger.setAttribute('aria-expanded', 'true');
+    (listEl.querySelector<HTMLElement>('[aria-current="true"]') ?? listEl.querySelector<HTMLElement>('.chat-item'))?.focus();
+  }
+
+  // Closing can come from light dismiss or Escape as well as from here.
+  menu.addEventListener('toggle', e => {
+    if ((e as ToggleEvent).newState === 'closed') trigger.setAttribute('aria-expanded', 'false');
+  });
+
+  const onResize = () => { if (isOpen()) position(); };
+  window.addEventListener('resize', onResize);
+
+  // Escape is handled by the popover itself; this only returns focus to the
+  // title, which light dismiss does not do.
+  menu.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      close(true);
+      return;
+    }
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;
+    const items = [...menu.querySelectorAll<HTMLElement>('.chat-item, .chat-menu-new')];
+    if (items.length === 0) return;
+    e.preventDefault();
+    const index = items.indexOf(document.activeElement as HTMLElement);
+    let next: number;
+    if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = items.length - 1;
+    else if (index === -1) next = e.key === 'ArrowDown' ? 0 : items.length - 1;
+    else next = (index + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+    items[next].focus();
+  });
+
+  menu.addEventListener('click', e => {
     const target = e.target as HTMLElement;
     const manageBtn = target.closest<HTMLElement>('[data-manage]');
     if (manageBtn) {
-      modal.close();
+      close(false);
       handlers.onManage(manageBtn.dataset.manage!);
       return;
     }
     if (target.closest<HTMLElement>('[data-action="new-chat"]')) {
-      modal.close();
+      close(false);
       handlers.onCreate();
       return;
     }
     const item = target.closest<HTMLElement>('[data-scope]');
     if (!item) return;
     const scopeId = item.dataset.scope! as ScopeId;
+    close(false);
     if (scopeId.startsWith('chat:')) {
       void coordinator.loadChats().then(chats => {
         const chat = chats.find(c => `chat:${c.id}` === scopeId);
-        modal.close();
         if (chat?.state === 'needs-consent') handlers.onReconnect(chat.id);
         else handlers.onSelect(scopeId);
       }).catch(err => {
-        console.debug('[Chats] Switcher selection failed:', err);
-        modal.close();
+        console.debug('[Chats] Menu selection failed:', err);
         handlers.onSelect(scopeId);
       });
     } else {
-      modal.close();
       handlers.onSelect(scopeId);
     }
   });
 
-  const repaint = () => void paint().catch(err => console.debug('[Chats] Switcher paint failed:', err));
-
-  offCoordinator = coordinator.onCoordinatorEvent(event => {
+  // Keep the list painted whether or not the menu is open, so opening is
+  // instant and never flashes an empty list.
+  const offCoordinator = coordinator.onCoordinatorEvent(event => {
     if (event.type === 'chats-changed') repaint();
   });
-  offBroadcast = onBroadcast(event => {
+  const offBroadcast = onBroadcast(event => {
     if (event.type === 'chats-changed') repaint();
   });
-
   repaint();
+
+  return {
+    teardown() {
+      offCoordinator();
+      offBroadcast();
+      window.removeEventListener('resize', onResize);
+      trigger.removeEventListener('pointerdown', onTriggerPointerDown);
+      trigger.removeEventListener('keydown', onTriggerKeyDown);
+      trigger.removeEventListener('click', onTriggerClick);
+      if (isOpen()) menu.hidePopover();
+      menu.remove();
+    },
+  };
 }

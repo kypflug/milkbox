@@ -20,6 +20,8 @@ export function renderSignIn(
   const fine = opts.invited
     ? 'Chats live in a folder in the host’s OneDrive, so Microsoft will ask you to let Milkbox access your OneDrive files. Your private drops stay in a private app folder of your own.'
     : 'Your private drops live in your own OneDrive, in a private app folder. Shared chats live in their host’s OneDrive.';
+  // The feed retitles the window per chat; signed out, it is just the app.
+  document.title = 'Milkbox';
   app.innerHTML = `
     <div class="sign-in-screen">
       <div class="boot-titlebar" aria-hidden="true"></div>

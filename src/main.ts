@@ -9,7 +9,7 @@ import { isValidShareToken } from './services/chats';
 import { renderSignIn } from './screens/sign-in';
 import { renderFeed, applySharePayload, teardownScreenListeners } from './screens/feed';
 import { showManageSheet } from './screens/chat-sheets';
-import { showChatSwitcher, type ChatSwitcherHandlers } from './components/chat-switcher';
+import { mountChatMenu, type ChatSwitcherHandlers } from './components/chat-switcher';
 import { showToast } from './components/toast';
 import { applyTheme } from './theme';
 import { escapeHtml } from './utils/storage';
@@ -306,8 +306,8 @@ function selectScope(app: HTMLElement, scopeId: ScopeId): void {
   }
 }
 
-/** Wire the header's chats button: opens the switcher dialog, carries the
- *  unread badge. Re-run per route (the feed re-renders the header). */
+/** Wire the feed title: it opens the chat menu and carries the unread
+ *  badge. Re-run per route (the feed re-renders the header). */
 function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
   const handlers: ChatSwitcherHandlers = {
     onSelect: scopeId => selectScope(app, scopeId),
@@ -319,22 +319,21 @@ function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
     onReconnect: chatId => startReconnectFlow(chatId),
   };
 
-  const trigger = app.querySelector<HTMLButtonElement>('.feed-chats-btn');
-  const badge = app.querySelector<HTMLElement>('.feed-chats-badge');
-  const onTrigger = () => showChatSwitcher(currentScopeId, handlers);
-  trigger?.addEventListener('click', onTrigger);
+  const trigger = app.querySelector<HTMLButtonElement>('.feed-title-btn');
+  const mount = app.querySelector<HTMLElement>('.chat-menu-mount');
+  const badge = app.querySelector<HTMLElement>('.feed-title-badge');
+  const menu = trigger && mount ? mountChatMenu(trigger, mount, currentScopeId, handlers) : null;
 
   const paintBadge = async () => {
     if (!badge) return;
     const chats = await coordinator.loadChats();
     const unread = chats.reduce((sum, chat) => sum + (chat.unreadCount ?? 0), 0);
     badge.hidden = unread === 0;
-    badge.textContent = unread > 99 ? '99+' : String(unread);
-    // The button's aria-label overrides descendant text, so the count has to
-    // live in the label itself for screen readers.
-    const label = unread === 0 ? 'Chats' : `Chats — ${unread} unread`;
-    trigger?.setAttribute('aria-label', label);
-    trigger?.setAttribute('title', label);
+    // The title button has no aria-label: its content (name, "switch chat",
+    // this count) is its accessible name, so a rename or a new count needs no
+    // label bookkeeping.
+    badge.innerHTML = `${unread > 99 ? '99+' : unread}<span class="visually-hidden"> unread</span>`;
+    trigger?.setAttribute('title', unread === 0 ? 'Switch chat' : `Switch chat — ${unread} unread`);
   };
   const repaintBadge = () => void paintBadge().catch(err => console.debug('[Chats] Badge paint failed:', err));
   const offCoordinator = coordinator.onCoordinatorEvent(event => {
@@ -346,7 +345,7 @@ function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
   repaintBadge();
 
   return () => {
-    trigger?.removeEventListener('click', onTrigger);
+    menu?.teardown();
     offCoordinator();
     offBroadcast();
   };
