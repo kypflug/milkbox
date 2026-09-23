@@ -30,7 +30,7 @@ import { mountComposer, type ComposerApi } from '../components/composer';
 import { mountSettingsFlyout, type SettingsFlyoutApi } from './settings';
 import { startReconnectFlow } from '../services/chat-flows';
 import { showToast } from '../components/toast';
-import { iconBottle, iconChats, iconClose } from '../components/icons';
+import { iconBottle, iconChevronDown, iconClose } from '../components/icons';
 
 const PAGE_SIZE = 100;
 
@@ -72,19 +72,22 @@ export async function renderFeed(
   const chatRecord = isChat ? await db.getChat(scope.chatId) : undefined;
   const chatState = chatRecord?.state ?? 'active';
 
+  // The OS window title (taskbar, window switcher) follows the scope too.
+  document.title = title;
+
   app.innerHTML = `
     <div class="feed-screen">
       <header class="feed-header">
         <div class="feed-header-row">
-          <div class="feed-header-lead">
-            <span class="feed-mark">${iconBottle('1.15em')}</span>
-            <button class="feed-chats-btn" title="Chats" aria-label="Chats" aria-haspopup="dialog">
-              ${iconChats('1.15em')}<span class="feed-chats-badge" aria-hidden="true" hidden></span>
-            </button>
-          </div>
-          <span class="feed-wordmark">${escapeHtml(title)}</span>
+          <span class="feed-mark">${iconBottle('1.15em')}</span>
+          <button class="feed-title-btn" title="Switch chat">
+            <span class="feed-wordmark">${escapeHtml(title)}</span><span class="visually-hidden">, switch chat</span>
+            <span class="feed-title-chevron">${iconChevronDown('1em')}</span>
+            <span class="feed-title-badge" hidden></span>
+          </button>
         </div>
       </header>
+      <div class="chat-menu-mount"></div>
       <div class="chat-banner" id="chatBanner" hidden></div>
       <div class="feed-scroll" id="feedScroll">
         <div class="feed-sentinel" id="feedSentinel"></div>
@@ -592,6 +595,7 @@ export async function renderFeed(
     scope.name = record.name;
     const wordmark = app.querySelector<HTMLElement>('.feed-wordmark');
     if (wordmark) wordmark.textContent = record.name;
+    document.title = record.name;
     listEl.setAttribute('aria-label', `Drops in ${record.name}`);
     if (chatState === 'active') composerApi?.setPlaceholder(`Message ${record.name}`);
     if (feed.length === 0) void refresh();
