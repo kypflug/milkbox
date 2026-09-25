@@ -105,13 +105,27 @@ export function mountChatMenu(
         </div>`);
     }
 
-    // Repaints while open would otherwise drop keyboard focus on the floor.
-    const focusedScope = (document.activeElement as HTMLElement | null)?.closest<HTMLElement>('[data-scope]')?.dataset.scope;
+    // Replacing the rows would otherwise drop keyboard focus on the floor:
+    // note which row or options button had it, and put it back after.
+    const active = document.activeElement as HTMLElement | null;
+    const focusedScope = active?.closest<HTMLElement>('[data-scope]')?.dataset.scope;
+    const focusedManage = active?.closest<HTMLElement>('[data-manage]')?.dataset.manage;
     listEl.innerHTML = rows.join('');
-    if (focusedScope && isOpen()) {
+    if (!isOpen()) return;
+    if (focusedScope) {
       listEl.querySelector<HTMLElement>(`[data-scope="${CSS.escape(focusedScope)}"]`)?.focus();
+    } else if (focusedManage) {
+      listEl.querySelector<HTMLElement>(`[data-manage="${CSS.escape(focusedManage)}"]`)?.focus();
     }
-    if (isOpen()) position();
+    // Opened before the first paint landed: open() found no rows and left
+    // focus on the title, so hand it to the menu now that rows exist.
+    if (!menu.contains(document.activeElement)) focusInitialItem();
+    position();
+  }
+
+  /** The current scope's row, else the first row. */
+  function focusInitialItem(): void {
+    (listEl.querySelector<HTMLElement>('[aria-current="true"]') ?? listEl.querySelector<HTMLElement>('.chat-item'))?.focus();
   }
 
   const repaint = () => void paint().catch(err => console.debug('[Chats] Menu paint failed:', err));
@@ -163,7 +177,7 @@ export function mountChatMenu(
     menu.showPopover();
     position();
     trigger.setAttribute('aria-expanded', 'true');
-    (listEl.querySelector<HTMLElement>('[aria-current="true"]') ?? listEl.querySelector<HTMLElement>('.chat-item'))?.focus();
+    focusInitialItem();
   }
 
   // Closing can come from light dismiss or Escape as well as from here.
