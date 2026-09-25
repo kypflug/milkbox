@@ -12,9 +12,8 @@
 /* ── the title: current scope + chat menu trigger ── */
 
 .feed-title-btn {
-  grid-column: 2;
+  flex: 0 1 auto;
   min-width: 0;
-  max-width: 100%;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -61,9 +60,9 @@
 }
 
 /*
- * Window-controls-overlay. The title sits in the middle of the strip, which
- * the rails keep clear of the window controls on either side, so it never
- * needs a side-aware inset of its own.
+ * Window-controls-overlay. The header row's padding keeps the title clear of
+ * the window controls on either side (global.css), so it needs no
+ * side-aware inset of its own.
  *
  * The header row is fixed, so it is its own stacking context: a z-index on
  * the title alone can never lift it over the drag overlay (z-50). Instead

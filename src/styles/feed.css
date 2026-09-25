@@ -24,43 +24,29 @@
   z-index: 2;
 }
 
-/* Three columns so the title centres on the strip itself, independent of
- * the mark's width — the two 1fr rails stay equal whatever sits in them.
- * The middle track may shrink to nothing, so a long chat name truncates
- * inside the title instead of shoving the rails aside. */
+/* The bottle, then the title beside it, both on the left. Nothing sits on
+ * the right, so under window-controls-overlay the controls on either side
+ * only ever cost the title width, never a collision (global.css). A long
+ * chat name truncates inside the title rather than overflowing the row. */
 .feed-header-row {
-  /* Floor for both rails under window-controls-overlay (global.css), where
-   * a zero-width control inset would otherwise let a long title cover the
-   * bottle. Matches the bottle icon's rendered size. */
-  --feed-mark-size: 1.15em;
   min-height: var(--title-strip-height);
-  display: grid;
-  grid-template-columns: 1fr minmax(0, auto) 1fr;
-  column-gap: 8px;
+  display: flex;
   align-items: center;
+  gap: 4px;
   padding: 0 20px;
 }
 
 .feed-mark {
-  grid-column: 1;
-  justify-self: start;
+  flex: none;
   display: inline-flex;
   color: var(--accent);
 }
 
 /* The wordmark lives inside the title button (chats.css), which opens the
- * chat menu. The right rail is empty, so it is centred either way. */
+ * chat menu. */
 .feed-wordmark {
   font: var(--type-wordmark);
   letter-spacing: -0.01em;
-}
-
-/* Under window-controls-overlay the bottle steps past the controls when
- * they sit on the left (macOS, right-to-left Windows). */
-@media (display-mode: window-controls-overlay) {
-  .feed-mark {
-    margin-left: max(0px, calc(env(titlebar-area-x, 0px) - 20px));
-  }
 }
 
 /* ── scroll area ── */
@@ -75,7 +61,7 @@
   padding: 0 20px;
   /* Reserve the scrollbar on both edges so the feed's content box stays
    * centred on the pane — otherwise the day dividers sit half a scrollbar
-   * left of the centred wordmark, and the column shifts when the feed
+   * off the pane's centre line, and the column shifts when the feed
    * becomes scrollable. No-op where scrollbars overlay (macOS, touch). */
   scrollbar-gutter: stable both-edges;
   /* Quiet scrollbar: no track paint, hairline thumb, only when needed. */

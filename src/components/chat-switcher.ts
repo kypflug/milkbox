@@ -130,16 +130,14 @@ export function mountChatMenu(
 
   const repaint = () => void paint().catch(err => console.debug('[Chats] Menu paint failed:', err));
 
-  /** Centre under the title, clamped to the viewport; cap the height to the
-   *  space below so a long list scrolls inside the menu. */
+  /** Hang from the title's left edge, clamped to the viewport; cap the
+   *  height to the space below so a long list scrolls inside the menu. */
   function position(): void {
     const anchor = trigger.getBoundingClientRect();
     const header = trigger.closest<HTMLElement>('.feed-header-row')?.getBoundingClientRect();
     const top = Math.max(anchor.bottom, header?.bottom ?? anchor.bottom) + MENU_GAP;
-    const width = menu.offsetWidth;
-    const centre = anchor.left + anchor.width / 2;
-    const maxLeft = window.innerWidth - VIEWPORT_GUTTER - width;
-    const left = Math.max(VIEWPORT_GUTTER, Math.min(centre - width / 2, maxLeft));
+    const maxLeft = window.innerWidth - VIEWPORT_GUTTER - menu.offsetWidth;
+    const left = Math.max(VIEWPORT_GUTTER, Math.min(anchor.left, maxLeft));
     menu.style.top = `${top}px`;
     menu.style.left = `${left}px`;
     menu.style.maxHeight = `${Math.max(160, window.innerHeight - top - VIEWPORT_GUTTER)}px`;

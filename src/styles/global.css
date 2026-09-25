@@ -196,28 +196,24 @@ body {
     user-select: none;
   }
 
-  /* The overlay rect stops where the window controls begin, so centring
-   * inside it lands the wordmark off-window-centre — visibly left on Windows,
-   * right on macOS. Span the whole window instead and centre there. The rails
-   * reserve whichever side the controls occupy, so the wordmark still cannot
-   * slide under them on a narrow window, and the bottle keeps its corner
-   * because it is pinned to the rail's outer edge, not its full width. */
+  /* The row spans the window, and its padding grows to cover whichever
+   * side the window controls occupy, plus an 8px breath: the overlay rect
+   * starts after them when they sit on the left (macOS, right-to-left
+   * Windows) and stops before them on the right. The bottle keeps its usual
+   * 20px corner unless the controls push it further in, and the
+   * left-aligned title can shrink up to the controls without ever sliding
+   * under them. */
   .feed-header-row {
-    --wco-controls-inset: max(
-      env(titlebar-area-x, 0px),
-      calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw))
-    );
     position: fixed;
     top: env(titlebar-area-y, 0px);
     left: 0;
     width: 100%;
     height: var(--wco-title-strip-height);
     min-height: var(--wco-title-strip-height);
-    grid-template-columns:
-      minmax(max(var(--wco-controls-inset), var(--feed-mark-size)), 1fr)
-      minmax(0, auto)
-      minmax(max(var(--wco-controls-inset), var(--feed-mark-size)), 1fr);
-    padding: 0 20px;
+    padding: 0
+      max(20px, calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw) + 8px))
+      0
+      max(20px, calc(env(titlebar-area-x, 0px) + 8px));
     /* Above the drag overlay (z-50) so the title button is reachable: a fixed
      * row is its own stacking context, so nothing inside it could otherwise
      * out-stack the overlay. The row itself ignores the pointer, so drags on
