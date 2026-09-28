@@ -48,7 +48,7 @@ switcher/header in all four layout combos where noted: window-controls-overlay
 Setup & consent
 - [ ] Solo account that never touches chats is **never** shown the broad consent.
 - [ ] HOST creates a chat → consent interstitial → Microsoft prompt appears **exactly once**; invite sheet opens with QR + link.
-- [ ] The header title ("Milkbox" or the chat's name, with a chevron) opens the chat menu under it and is clickable in all four WCO × pane layout combos; in window-controls-overlay the rest of the strip still drags the window, and a long chat name truncates rather than running under the window controls or the bottle (check an installed app on Windows and macOS, since real control insets only exist there). Choosing a chat retitles the header and the OS window title; the unread badge shows beside the chevron.
+- [ ] The header title ("Milkbox" or the chat's name, with a chevron), left-aligned beside the bottle, opens the chat menu under it and is clickable in all four WCO × pane layout combos; in window-controls-overlay the rest of the strip still drags the window, and a long chat name truncates rather than running under the window controls or the bottle (check an installed app on Windows and macOS, since real control insets only exist there). Choosing a chat retitles the header and the OS window title; the unread badge shows beside the chevron.
 - [ ] Consent denial (cancel at Microsoft) lands the "You can try again anytime" toast — no redirect loop.
 - [ ] iOS standalone PWA: consent opens the in-app sheet; closing it resumes the create/join without a reload.
 
