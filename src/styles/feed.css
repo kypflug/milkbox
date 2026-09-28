@@ -17,8 +17,12 @@
 
 /* ── header ── */
 
+/* viewport-fit=cover lets an installed iOS app draw under the status bar,
+ * where the system blurs whatever sits there. The inset keeps the header
+ * row below it; it is 0 everywhere the status bar doesn't overlap. */
 .feed-header {
   flex: none;
+  padding-top: env(safe-area-inset-top, 0px);
   background: var(--ground);
   position: relative;
   z-index: 2;

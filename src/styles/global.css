@@ -250,6 +250,8 @@ body {
     box-shadow: var(--shadow-sheet), var(--card-highlight);
     overflow: hidden;
   }
+  /* The pane floats clear of the status bar, so no inset inside it. */
+  .feed-header { padding-top: 0; }
 }
 
 @media (display-mode: window-controls-overlay) and (min-height: 600px) and (min-width: 800px) {
