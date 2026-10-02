@@ -433,6 +433,23 @@ export async function clearScopeData(scopeId: ScopeId): Promise<void> {
   });
 }
 
+/**
+ * Remove a scope's synced drops and cached media, keeping its outbox,
+ * settings and chat record — the local half of a re-sync from scratch.
+ */
+export async function clearScopeDrops(scopeId: ScopeId): Promise<void> {
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const t = db.transaction(['drops', 'thumbs', 'blobs'], 'readwrite');
+    t.objectStore('drops').delete(scopeRange(scopeId));
+    t.objectStore('thumbs').delete(mediaRange(scopeId));
+    t.objectStore('blobs').delete(mediaRange(scopeId));
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
+
 /** Wipe all local data (sign-out). */
 export async function clearAllData(): Promise<void> {
   const db = await openDb();

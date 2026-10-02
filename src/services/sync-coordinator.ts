@@ -32,6 +32,7 @@ import * as device from './device';
 import * as notify from './notify';
 import { ConsentRequiredError } from './auth';
 import { postBroadcast } from './broadcast';
+import { errorLabel, newPassCounts, recordPass, requestCount, type PassStats } from './sync-stats';
 import {
   deferRegistryOp,
   enqueueRegistryOp,
@@ -422,7 +423,7 @@ function stateFor(scopeId: ScopeId): ScopeSyncState {
   return st;
 }
 
-async function syncDeviceProfiles(): Promise<string | undefined> {
+async function syncDeviceProfiles(): Promise<{ cTag?: string; count: number }> {
   const local = await ensureCurrentDeviceProfile();
   const pending = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
   if (pending) {
@@ -453,7 +454,7 @@ async function syncDeviceProfiles(): Promise<string | undefined> {
     emit({ type: 'feed-updated', scopeId: PRIVATE_SCOPE_ID });
     postBroadcast({ type: 'sync-complete', scopeId: PRIVATE_SCOPE_ID });
   }
-  return snapshot.cTag;
+  return { cTag: snapshot.cTag, count: profiles.length };
 }
 
 /**
@@ -609,6 +610,7 @@ export function requestSync(scope: Scope, opts: { force?: boolean } = {}): Promi
     if (opts.force) st.syncAgain = true;
     return st.syncPromise;
   }
+  if (resettingScopes.has(scopeId)) return Promise.resolve();
   const now = Date.now();
   if (!opts.force && now - st.lastSyncAt < SYNC_FLOOR_MS) return Promise.resolve();
   if (now < throttledUntil) return Promise.resolve();
@@ -625,20 +627,37 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
       st.lastSyncAt = Date.now();
       emit({ type: 'sync-start', scopeId });
 
+      // Diagnostics for this pass (Settings › Sync diagnostics).
+      const counts = newPassCounts();
+      const startedAt = Date.now();
+      const t0 = performance.now();
+      const requestsBefore = requestCount();
+      let mode: PassStats['mode'] = 'incremental';
+      let firstCommitMs: number | undefined;
+      let devicesMs: number | undefined;
+      let devices: number | undefined;
+      let removed = 0;
+      let outcome: PassStats['outcome'] = 'ok';
+      let error: string | undefined;
+
       try {
         let deviceCTag: string | undefined;
         if (scope.kind === 'private') {
+          const td = performance.now();
           try {
-            deviceCTag = await syncDeviceProfiles();
+            const synced = await syncDeviceProfiles();
+            deviceCTag = synced.cTag;
+            devices = synced.count;
           } catch (err) {
             console.warn('[Sync] Device profile sync failed; continuing with drops:', err);
           }
+          devicesMs = performance.now() - td;
         }
         await drainOutbox(scopeId);
 
         let result: graph.DeltaResult;
         if (scope.kind === 'private') {
-          result = await graph.runDelta(scope);
+          result = await graph.runDelta(scope, { stats: counts });
         } else {
           const record = await db.getChat(scope.chatId);
           if (!record || record.state === 'gone') {
@@ -646,12 +665,14 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
             return;
           }
           const known = await db.getScopeDropETags(scopeId);
-          const synced = await chatsApi.runChatSync(scope, record.syncStrategy, known);
+          const synced = await chatsApi.runChatSync(scope, record.syncStrategy, known, counts);
           result = synced.result;
+          if (synced.strategy === 'listing') mode = 'listing';
           if (synced.strategy !== (record.syncStrategy ?? 'delta')) {
             await db.patchChat(scope.chatId, { syncStrategy: synced.strategy });
           }
         }
+        if (result.fullResync) mode = 'full';
 
         // Snapshot novelty before the writes below land — afterwards every
         // upsert is present in IDB and indistinguishable from one we held.
@@ -668,6 +689,8 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
             await db.deleteCachedBlob(scopeId, id).catch(() => {});
           }
         }
+        firstCommitMs = performance.now() - t0;
+        removed = result.removals.length;
 
         await graph.markFeedClean(scope);
         if (scope.kind === 'private' && deviceCTag) await graph.markDeviceRegistryClean(deviceCTag);
@@ -705,6 +728,8 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
         }
         emit({ type: 'sync-complete', scopeId });
       } catch (err) {
+        outcome = 'error';
+        error = errorLabel(err);
         noteThrottle(err);
         if (scope.kind === 'chat' && graph.isAccessLostError(err)) {
           st.consecutiveGone++;
@@ -715,6 +740,21 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
         console.warn('[Sync] Sync pass failed (%s):', scopeId, err);
         emit({ type: 'sync-error', scopeId, error: err });
       }
+
+      void recordPass({
+        ...counts,
+        scope: scope.kind,
+        mode,
+        outcome,
+        error,
+        startedAt,
+        totalMs: performance.now() - t0,
+        firstCommitMs,
+        devicesMs,
+        devices,
+        removed,
+        requests: requestCount() - requestsBefore,
+      }).catch(err => console.debug('[Sync] Could not record pass stats:', err));
     } while (st.syncAgain);
   } finally {
     st.syncing = false;
@@ -725,6 +765,33 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
 /** Re-read a scope's feed from IDB after another tab synced (no network). */
 export function refreshFromCache(scopeId: ScopeId): void {
   emit({ type: 'feed-updated', scopeId });
+}
+
+const resettingScopes = new Set<ScopeId>();
+
+/**
+ * Forget what this device holds for a scope and sync it again from nothing:
+ * Settings' "Re-sync from scratch", which reproduces a fresh install's first
+ * sync without signing out. Queued sends stay queued.
+ *
+ * The notification primer is cleared too, so the re-sync primes quietly
+ * instead of announcing the whole feed as new.
+ */
+export async function resetScope(scope: Scope): Promise<void> {
+  const scopeId = scopeIdOf(scope);
+  const st = stateFor(scopeId);
+  resettingScopes.add(scopeId);
+  try {
+    // Let a running pass finish, or it would write back over the reset.
+    while (st.syncPromise) await st.syncPromise.catch(() => {});
+    await graph.forgetSyncState(scope);
+    await db.deleteSetting(notifyPrimedKey(scopeId));
+    await db.clearScopeDrops(scopeId);
+  } finally {
+    resettingScopes.delete(scopeId);
+  }
+  emit({ type: 'feed-updated', scopeId });
+  await requestSync(scope, { force: true });
 }
 
 // ─── polling ───

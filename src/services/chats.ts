@@ -22,10 +22,12 @@ import {
   isGoneError,
   itemByPathUrl,
   runDelta,
+  storageFetch,
   type DeltaResult,
   type DriveRef,
 } from './graph';
 import { validateChatDescriptor, validateChatMember, validateDropMeta, validateJoinedPointer } from './validate-drop';
+import type { PassCounts } from './sync-stats';
 import { ulid } from '../utils/ulid';
 import type {
   AuthorAttribution,
@@ -88,7 +90,7 @@ async function downloadJson(item: GraphChildItem, driveId: string | undefined, t
     ? `${GRAPH_BASE}/drives/${driveId}/items/${item.id}/content`
     : `${GRAPH_BASE}/me/drive/items/${item.id}/content`;
   const url = item['@microsoft.graph.downloadUrl'] || fallback;
-  const res = item['@microsoft.graph.downloadUrl'] ? await fetch(url) : await graphFetch(url, undefined, tier);
+  const res = item['@microsoft.graph.downloadUrl'] ? await storageFetch(url) : await graphFetch(url, undefined, tier);
   if (!res.ok) throw new GraphHttpError(res.status, url, 'JSON download failed');
   return res.json();
 }
@@ -502,6 +504,7 @@ export async function listHostChats(me: AuthorAttribution, skipChatIds?: Readonl
 export async function listChatDrops(
   scope: ChatScope,
   known: Map<string, string | undefined>,
+  stats?: PassCounts,
 ): Promise<DeltaResult> {
   let url = `${GRAPH_BASE}/drives/${scope.driveId}/items/${scope.dropsItemId}/children?$select=id,name,file,eTag,@microsoft.graph.downloadUrl`;
   const upserts: DropRecord[] = [];
@@ -510,16 +513,26 @@ export async function listChatDrops(
   while (url) {
     const res = await graphFetch(url, undefined, 'share');
     const data: { value: GraphChildItem[]; '@odata.nextLink'?: string } = await res.json();
+    if (stats) stats.pages++;
     for (const item of data.value) {
       const name = item.name || '';
       if (!item.file || !name.endsWith('.json')) continue;
       const id = name.slice(0, -5);
       seen.add(id);
-      if (known.has(id) && known.get(id) === item.eTag) continue;
+      if (stats) stats.enumerated++;
+      if (known.has(id) && known.get(id) === item.eTag) {
+        if (stats) stats.skipped++;
+        continue;
+      }
       const parsed = await downloadJson(item, scope.driveId, 'share');
+      if (stats) {
+        stats.downloaded++;
+        if (!item['@microsoft.graph.downloadUrl']) stats.fallbacks++;
+      }
       const meta = validateDropMeta(parsed, { expectedId: id, requireAuthor: true });
       if (!meta) {
         console.debug('[Sync] Discarding malformed drop JSON: %s', name);
+        if (stats) stats.malformed++;
         continue;
       }
       upserts.push({ meta, eTag: item.eTag });
@@ -543,14 +556,15 @@ export async function runChatSync(
   scope: ChatScope,
   strategy: 'delta' | 'listing' | undefined,
   known: Map<string, string | undefined>,
+  stats?: PassCounts,
 ): Promise<{ result: DeltaResult; strategy: 'delta' | 'listing' }> {
   if (strategy !== 'listing') {
     try {
-      return { result: await runDelta(scope), strategy: 'delta' };
+      return { result: await runDelta(scope, { stats }), strategy: 'delta' };
     } catch (err) {
       if (!isDeltaUnsupportedError(err)) throw err;
       console.debug('[Sync] Delta unsupported for chat %s — falling back to children listing', scope.chatId);
     }
   }
-  return { result: await listChatDrops(scope, known), strategy: 'listing' };
+  return { result: await listChatDrops(scope, known, stats), strategy: 'listing' };
 }

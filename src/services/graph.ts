@@ -14,6 +14,7 @@
 import { getAccessToken, type TokenTier } from './auth';
 import { getSetting, putSetting, deleteSetting } from './db';
 import { validateDropMeta } from './validate-drop';
+import { counters, type PassCounts } from './sync-stats';
 import { scopeIdOf, type DeviceProfile, type DropMeta, type DropRecord, type Scope } from '../types';
 
 export const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
@@ -55,11 +56,13 @@ async function authHeaders(tier: TokenTier): Promise<Record<string, string>> {
 
 export async function graphFetch(url: string, init?: RequestInit, tier: TokenTier = 'base'): Promise<Response> {
   const headers = await authHeaders(tier);
+  counters.graph++;
   const res = await fetch(url, {
     ...init,
     headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
   });
   if (!res.ok) {
+    if (res.status === 429 || res.status === 503) counters.throttles++;
     const retryAfter = res.headers.get('Retry-After');
     throw new GraphHttpError(
       res.status,
@@ -69,6 +72,34 @@ export async function graphFetch(url: string, init?: RequestInit, tier: TokenTie
     );
   }
   return res;
+}
+
+/**
+ * Fetch from OneDrive's content host — a pre-authenticated download or
+ * upload-session URL, so no token. Counted apart from Graph calls.
+ */
+export function storageFetch(url: string, init?: RequestInit): Promise<Response> {
+  counters.storage++;
+  return fetch(url, init);
+}
+
+// ─── DEV fault injection ───
+
+/**
+ * Make drop-body downloads slow or flaky on purpose, to exercise interrupted
+ * and retried passes on a desktop. Driven from window.__milkboxChatDev; the
+ * hook below compiles to nothing in production builds.
+ */
+const devFaults = { bodyFailRate: 0, bodyDelayMs: 0 };
+
+export function setDevFaults(faults: Partial<typeof devFaults>): void {
+  Object.assign(devFaults, faults);
+}
+
+async function injectBodyFault(): Promise<void> {
+  if (!import.meta.env.DEV) return;
+  if (devFaults.bodyDelayMs > 0) await new Promise(r => setTimeout(r, devFaults.bodyDelayMs));
+  if (Math.random() < devFaults.bodyFailRate) throw new TypeError('Injected network failure');
 }
 
 /**
@@ -236,7 +267,7 @@ export async function listDeviceProfiles(): Promise<DeviceProfileSnapshot> {
         item['@microsoft.graph.downloadUrl'] ||
         `${GRAPH_BASE}/me/drive/items/${item.id}/content`;
       const bodyRes = item['@microsoft.graph.downloadUrl']
-        ? await fetch(downloadUrl)
+        ? await storageFetch(downloadUrl)
         : await graphFetch(downloadUrl);
       if (!bodyRes.ok) {
         throw new GraphHttpError(bodyRes.status, downloadUrl, 'Device profile download failed');
@@ -305,7 +336,7 @@ export async function uploadToSession(
 ): Promise<UploadedItem> {
   // Ask the session where to resume (fresh sessions expect range 0-)
   let nextStart = 0;
-  const statusRes = await fetch(uploadUrl);
+  const statusRes = await storageFetch(uploadUrl);
   if (statusRes.ok) {
     const status = await statusRes.json();
     const ranges: string[] = status.nextExpectedRanges || ['0-'];
@@ -317,7 +348,7 @@ export async function uploadToSession(
   while (nextStart < blob.size) {
     const end = Math.min(nextStart + CHUNK_SIZE, blob.size);
     const chunk = blob.slice(nextStart, end);
-    const res = await fetch(uploadUrl, {
+    const res = await storageFetch(uploadUrl, {
       method: 'PUT',
       headers: {
         'Content-Range': `bytes ${nextStart}-${end - 1}/${blob.size}`,
@@ -402,7 +433,7 @@ export async function fetchThumbnail(scope: Scope, itemId: string): Promise<Blob
     );
     const data = await res.json();
     if (!data.url) return null;
-    const imgRes = await fetch(data.url);
+    const imgRes = await storageFetch(data.url);
     if (!imgRes.ok) return null;
     return imgRes.blob();
   } catch (err) {
@@ -459,7 +490,8 @@ export function isAccessLostError(err: unknown): boolean {
  * A missing folder is an empty private feed, but for a chat it means access
  * was revoked or the chat deleted — that propagates to the caller.
  */
-export async function runDelta(scope: Scope): Promise<DeltaResult> {
+export async function runDelta(scope: Scope, opts: { stats?: PassCounts } = {}): Promise<DeltaResult> {
+  const stats = opts.stats;
   const tokenKey = deltaTokenKey(scope);
   const tier = scopeTier(scope);
   const isChat = scope.kind === 'chat';
@@ -476,13 +508,14 @@ export async function runDelta(scope: Scope): Promise<DeltaResult> {
     try {
       const res = await graphFetch(url, undefined, tier);
       data = await res.json();
+      if (stats) stats.pages++;
     } catch (err) {
       if (isGoneError(err)) {
         if (savedToken) {
           // Token expired — clear it and restart as a full delta
           console.debug('[Sync] Delta token expired — full resync');
           await deleteSetting(tokenKey);
-          return runDelta(scope);
+          return runDelta(scope, opts);
         }
         if (isChat) throw err; // revoked / deleted — the caller decides
         // Folder doesn't exist yet — empty feed, not an error
@@ -494,10 +527,14 @@ export async function runDelta(scope: Scope): Promise<DeltaResult> {
     for (const item of data.value) {
       const name = item.name || '';
       if (item.deleted) {
-        if (name.endsWith('.json')) removals.push(name.slice(0, -5));
+        if (name.endsWith('.json')) {
+          removals.push(name.slice(0, -5));
+          if (stats) stats.enumerated++;
+        }
         continue;
       }
       if (!item.file || !name.endsWith('.json')) continue;
+      if (stats) stats.enumerated++;
 
       // Prefer the pre-authenticated downloadUrl from the delta response —
       // no extra token round-trip per item.
@@ -505,14 +542,20 @@ export async function runDelta(scope: Scope): Promise<DeltaResult> {
         ? `${GRAPH_BASE}/me/drive/items/${item.id}/content`
         : `${GRAPH_BASE}/drives/${scope.driveId}/items/${item.id}/content`;
       const downloadUrl = item['@microsoft.graph.downloadUrl'] || fallbackUrl;
+      await injectBodyFault();
       const bodyRes = item['@microsoft.graph.downloadUrl']
-        ? await fetch(downloadUrl)
+        ? await storageFetch(downloadUrl)
         : await graphFetch(downloadUrl, undefined, tier);
       if (!bodyRes.ok) throw new GraphHttpError(bodyRes.status, downloadUrl, 'Drop JSON download failed');
+      if (stats) {
+        stats.downloaded++;
+        if (!item['@microsoft.graph.downloadUrl']) stats.fallbacks++;
+      }
       const parsed: unknown = await bodyRes.json();
       const meta = validateDropMeta(parsed, { expectedId: name.slice(0, -5), requireAuthor: isChat });
       if (!meta) {
         console.debug('[Sync] Discarding malformed drop JSON: %s', name);
+        if (stats) stats.malformed++;
         continue;
       }
       upserts.push({ meta, eTag: item.eTag });
@@ -535,6 +578,17 @@ export async function runDelta(scope: Scope): Promise<DeltaResult> {
 
 export function clearDeltaToken(scope: Scope): Promise<void> {
   return deleteSetting(deltaTokenKey(scope));
+}
+
+/**
+ * Drop the delta token and change markers for a scope, so its next pass
+ * enumerates everything as a fresh install would. For the private feed that
+ * includes the device registry's marker, so device profiles re-list too.
+ */
+export async function forgetSyncState(scope: Scope): Promise<void> {
+  await deleteSetting(deltaTokenKey(scope));
+  await deleteSetting(folderCtagKey(scope));
+  if (scope.kind === 'private') await deleteSetting(DEVICES_CTAG_KEY);
 }
 
 // ─── fast-path dirty check ───

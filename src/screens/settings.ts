@@ -5,7 +5,8 @@ import { clearAllData } from '../services/db';
 import { escapeAttr, escapeHtml } from '../utils/storage';
 import { showToast } from '../components/toast';
 import { iconClose } from '../components/icons';
-import { renameCurrentDevice } from '../services/sync-coordinator';
+import { renameCurrentDevice, resetScope } from '../services/sync-coordinator';
+import { getDiagnostics, type Diagnostics, type PassStats } from '../services/sync-stats';
 import {
   isNotifySupported,
   isNotifyEnabled,
@@ -13,7 +14,7 @@ import {
   setNotifyEnabled,
   requestNotifyPermission,
 } from '../services/notify';
-import type { Theme } from '../types';
+import { PRIVATE_SCOPE, type Theme } from '../types';
 
 const NOTIFY_HINT =
   'Announce drops from your other devices while Milkbox is in the background.';
@@ -22,6 +23,57 @@ const NOTIFY_BLOCKED_HINT =
 
 function notifyHint(): string {
   return getNotifyPermission() === 'denied' ? NOTIFY_BLOCKED_HINT : NOTIFY_HINT;
+}
+
+// ─── sync diagnostics ───
+
+function formatSeconds(ms: number): string {
+  return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
+}
+
+function formatWhen(ts: number): string {
+  return new Date(ts).toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+/** "94.2 s · 312 downloaded · 4 skipped · 318 requests · first drops at 93.8 s" */
+function describePass(pass: PassStats): string {
+  const parts = [
+    pass.outcome === 'error' ? `Failed (${pass.error ?? 'error'}) after ${formatSeconds(pass.totalMs)}` : formatSeconds(pass.totalMs),
+    `${pass.downloaded} downloaded`,
+  ];
+  if (pass.skipped) parts.push(`${pass.skipped} skipped`);
+  parts.push(`${pass.requests} requests`);
+  if (pass.firstCommitMs !== undefined && pass.mode === 'full') {
+    parts.push(`first drops at ${formatSeconds(pass.firstCommitMs)}`);
+  }
+  return parts.join(' · ');
+}
+
+function diagnosticsRows(d: Diagnostics): Array<[string, string]> {
+  const last = d.passes.at(-1);
+  return [
+    ['Last full sync', d.lastFull ? `${describePass(d.lastFull)} · ${formatWhen(d.lastFull.startedAt)}` : 'None recorded yet'],
+    ['Last sync', last ? `${describePass(last)} · ${formatWhen(last.startedAt)}` : 'None recorded yet'],
+    ['On this device', `${d.drops} drops · ${d.devices} device profiles`],
+    [
+      'Since launch',
+      `${d.sinceLaunch.graph} Graph · ${d.sinceLaunch.storage} content requests · ` +
+        `${d.sinceLaunch.throttles} throttled · ${d.sinceLaunch.backups} sign-in backups`,
+    ],
+  ];
+}
+
+/** Everything the panel shows, plus enough context to read it elsewhere. */
+function diagnosticsReport(d: Diagnostics): string {
+  const standalone =
+    window.matchMedia('(display-mode: standalone)').matches ||
+    (navigator as unknown as { standalone?: boolean }).standalone === true;
+  return JSON.stringify({ at: new Date().toISOString(), userAgent: navigator.userAgent, standalone, ...d }, null, 2);
 }
 
 export interface SettingsFlyoutApi {
@@ -106,6 +158,15 @@ export function mountSettingsFlyout(
             courtesy, not OneDrive enforcement.
           </p>
         </section>
+
+        <section class="settings-section">
+          <h3 class="settings-label">Sync diagnostics</h3>
+          <dl class="settings-stats" data-sync-stats></dl>
+          <div class="settings-actions">
+            <button class="settings-button" data-settings-action="copy-report">Copy report</button>
+            <button class="settings-button" data-settings-action="resync">Re-sync from scratch</button>
+          </div>
+        </section>
       </div>
     </section>
   `;
@@ -113,9 +174,27 @@ export function mountSettingsFlyout(
   const panel = container.querySelector<HTMLElement>('.settings-flyout')!;
   const closeButton = panel.querySelector<HTMLButtonElement>('.settings-close')!;
   const deviceInput = panel.querySelector<HTMLInputElement>('.settings-input')!;
+  const statsEl = panel.querySelector<HTMLElement>('[data-sync-stats]')!;
   const resizeObserver = new ResizeObserver(() => {
     if (!panel.hidden) positionPanel();
   });
+
+  /** Built on open, so "Copy report" can write it inside the tap itself —
+   *  Safari refuses clipboard writes that happen after an await. */
+  let report = '';
+
+  async function paintDiagnostics(): Promise<void> {
+    try {
+      const diagnostics = await getDiagnostics();
+      statsEl.innerHTML = diagnosticsRows(diagnostics)
+        .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`)
+        .join('');
+      report = diagnosticsReport(diagnostics);
+    } catch (err) {
+      console.debug('[Settings] Diagnostics unavailable:', err);
+      statsEl.innerHTML = '<div><dd>Diagnostics are unavailable right now.</dd></div>';
+    }
+  }
 
   trigger.setAttribute('aria-controls', panel.id);
   trigger.setAttribute('aria-expanded', 'false');
@@ -135,6 +214,7 @@ export function mountSettingsFlyout(
     trigger.setAttribute('aria-expanded', 'true');
     positionPanel();
     closeButton.focus();
+    void paintDiagnostics();
   }
 
   function close(): void {
@@ -215,6 +295,27 @@ export function mountSettingsFlyout(
         console.warn('Failed to clear local data during sign-out:', err);
       }
       await signOut();
+    });
+
+  panel.querySelector<HTMLButtonElement>('[data-settings-action="copy-report"]')!
+    .addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(report);
+        showToast('Sync report copied');
+      } catch {
+        showToast('Copy failed', 'error');
+      }
+    });
+
+  panel.querySelector<HTMLButtonElement>('[data-settings-action="resync"]')!
+    .addEventListener('click', () => {
+      if (!confirm('Download your private drops from OneDrive again, as a new install would? Drops waiting to send are kept.')) return;
+      close();
+      showToast('Re-syncing from OneDrive…');
+      resetScope(PRIVATE_SCOPE).catch(err => {
+        console.warn('[Settings] Re-sync failed to start:', err);
+        showToast('Could not start the re-sync', 'error');
+      });
     });
 
   deviceInput.addEventListener('change', async () => {

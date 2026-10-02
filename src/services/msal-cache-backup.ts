@@ -11,6 +11,7 @@
  */
 
 import { CLIENT_ID, ACCOUNT_HINT_KEY } from './auth-config';
+import { counters } from './sync-stats';
 
 const DB_NAME = 'milkbox-msal-backup';
 const DB_VERSION = 1;
@@ -87,6 +88,7 @@ export async function backupMsalCache(): Promise<void> {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       tx.objectStore(STORE_NAME).put(snapshot, SNAPSHOT_KEY);
       tx.oncomplete = () => {
+        counters.backups++;
         console.debug('[AuthBackup] Saved %d MSAL keys to IndexedDB', Object.keys(snapshot).length);
         resolve();
       };
