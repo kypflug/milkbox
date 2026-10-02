@@ -21,7 +21,7 @@ declare const self: ServiceWorkerGlobalScope;
 
 import { precacheAndRoute, cleanupOutdatedCaches } from 'workbox-precaching';
 import { registerRoute } from 'workbox-routing';
-import { CacheFirst, NetworkOnly } from 'workbox-strategies';
+import { CacheFirst } from 'workbox-strategies';
 import { ExpirationPlugin } from 'workbox-expiration';
 
 precacheAndRoute(self.__WB_MANIFEST);
@@ -63,9 +63,10 @@ self.addEventListener('message', event => {
   }
 });
 
-// Never intercept authed API or login traffic
-registerRoute(/^https:\/\/graph\.microsoft\.com\/.*/i, new NetworkOnly());
-registerRoute(/^https:\/\/login\.microsoftonline\.com\/.*/i, new NetworkOnly());
+// Graph, login and OneDrive content requests deliberately match no route:
+// workbox then never calls respondWith, and the browser fetches them itself.
+// (A NetworkOnly route would re-issue each one from inside the worker — a
+// detour every sync request paid, for no caching benefit.)
 
 // Favicons for link drops — small, immutable-ish, fine to cache by URL
 registerRoute(

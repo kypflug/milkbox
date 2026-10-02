@@ -48,8 +48,12 @@ function isInteractionStateKey(key: string): boolean {
   return key.includes('interaction.status') || key.includes('request.params');
 }
 
+let dbPromise: Promise<IDBDatabase> | null = null;
+
+/** One connection for the page's lifetime, reopened if it is ever lost. */
 function openBackupDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
@@ -57,16 +61,58 @@ function openBackupDB(): Promise<IDBDatabase> {
         db.createObjectStore(STORE_NAME);
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      // Another tab upgrading, or WebKit closing the connection while the
+      // app sat suspended: forget it so the next backup reopens.
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      db.onclose = () => {
+        dbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      dbPromise = null;
+      reject(req.error);
+    };
   });
+  return dbPromise;
 }
+
+/** The snapshot last written, so an unchanged cache costs no write. */
+let lastSnapshot = '';
+let backupRunning: Promise<void> | null = null;
+let backupAgain = false;
 
 /**
  * Snapshot all MSAL-related localStorage entries to IndexedDB.
  * Call after successful sign-in and token acquisition.
+ *
+ * One write at a time: a call that arrives mid-write asks for one more pass
+ * afterwards, so the last change always lands without stacking writes.
  */
-export async function backupMsalCache(): Promise<void> {
+export function backupMsalCache(): Promise<void> {
+  if (backupRunning) {
+    backupAgain = true;
+    return backupRunning;
+  }
+  backupRunning = (async () => {
+    try {
+      do {
+        backupAgain = false;
+        await writeSnapshot();
+      } while (backupAgain);
+    } finally {
+      backupRunning = null;
+    }
+  })();
+  return backupRunning;
+}
+
+async function writeSnapshot(): Promise<void> {
   try {
     const snapshot: Record<string, string> = {};
     for (let i = 0; i < localStorage.length; i++) {
@@ -83,18 +129,24 @@ export async function backupMsalCache(): Promise<void> {
     );
     if (!hasTokenData) return;
 
+    const serialized = JSON.stringify(snapshot);
+    if (serialized === lastSnapshot) return;
+
     const db = await openBackupDB();
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       tx.objectStore(STORE_NAME).put(snapshot, SNAPSHOT_KEY);
       tx.oncomplete = () => {
+        lastSnapshot = serialized;
         counters.backups++;
         console.debug('[AuthBackup] Saved %d MSAL keys to IndexedDB', Object.keys(snapshot).length);
         resolve();
       };
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   } catch (err) {
+    dbPromise = null; // a dead connection throws on transaction(); reopen next time
     console.warn('[AuthBackup] Failed to backup MSAL cache:', err);
   }
 }
@@ -158,6 +210,7 @@ export async function restoreMsalCacheIfNeeded(): Promise<boolean> {
  * Clear the IndexedDB backup (call on explicit sign-out).
  */
 export async function clearMsalCacheBackup(): Promise<void> {
+  lastSnapshot = '';
   try {
     const db = await openBackupDB();
     return new Promise((resolve, reject) => {

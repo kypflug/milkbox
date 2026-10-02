@@ -181,17 +181,55 @@ export async function getScopeDropETags(scopeId: ScopeId): Promise<Map<string, s
   return new Map(records.map(r => [r.meta.id, r.eTag]));
 }
 
-/** Replace one scope's drops (full re-delta reconcile). Scope-bounded — a
- *  chat resync can never touch the private feed or another chat. */
-export async function replaceScopeDrops(scopeId: ScopeId, records: DropRecord[]): Promise<void> {
+export interface DropCommit {
+  puts?: DropRecord[];
+  /** Drop ids to remove, with their cached thumbnails and image bytes. */
+  deletes?: string[];
+  /** Settings written alongside — a pass's delta token and cTag. */
+  settingsPut?: Array<[string, unknown]>;
+  settingsDelete?: string[];
+}
+
+/**
+ * Apply a sync pass's changes to one scope in a single transaction, so the
+ * delta token and cTag can never be stored without the drops they describe
+ * (a killed app would otherwise resume past drops it never wrote).
+ *
+ * Puts land before deletes. For a chat scope the write is skipped entirely
+ * when the chat record is gone — a pass that outlived a leave or delete must
+ * not write drops back under the cleared scope. Resolves false then.
+ */
+export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): Promise<boolean> {
   const db = await openDb();
+  const chatId = scopeId.startsWith('chat:') ? scopeId.slice(5) : null;
+  const stores = ['drops', 'thumbs', 'blobs', 'settings', ...(chatId ? ['chats'] : [])];
   return new Promise((resolve, reject) => {
-    const t = db.transaction('drops', 'readwrite');
-    const s = t.objectStore('drops');
-    s.delete(scopeRange(scopeId));
-    for (const r of records) s.put({ ...r, scopeId } satisfies StoredDropRecord);
-    t.oncomplete = () => resolve();
+    const t = db.transaction(stores, 'readwrite');
+    let written = false;
+    const write = () => {
+      const drops = t.objectStore('drops');
+      for (const r of commit.puts ?? []) drops.put({ ...r, scopeId } satisfies StoredDropRecord);
+      for (const id of commit.deletes ?? []) {
+        drops.delete([scopeId, id]);
+        t.objectStore('thumbs').delete(mediaKey(scopeId, id));
+        t.objectStore('blobs').delete(mediaKey(scopeId, id));
+      }
+      const settings = t.objectStore('settings');
+      for (const [key, value] of commit.settingsPut ?? []) settings.put(value, key);
+      for (const key of commit.settingsDelete ?? []) settings.delete(key);
+      written = true;
+    };
+    if (chatId) {
+      const req = t.objectStore('chats').get(chatId);
+      req.onsuccess = () => {
+        if (req.result) write();
+      };
+    } else {
+      write();
+    }
+    t.oncomplete = () => resolve(written);
     t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
   });
 }
 
@@ -298,6 +336,7 @@ export async function replaceAllDeviceProfiles(profiles: DeviceProfile[]): Promi
     for (const profile of profiles) s.put(profile);
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
   });
 }
 
@@ -459,5 +498,6 @@ export async function clearAllData(): Promise<void> {
     for (const s of stores) t.objectStore(s).clear();
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
   });
 }

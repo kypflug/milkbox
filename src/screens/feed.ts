@@ -31,6 +31,7 @@ import { mountSettingsFlyout, type SettingsFlyoutApi } from './settings';
 import { startReconnectFlow } from '../services/chat-flows';
 import { showToast } from '../components/toast';
 import { iconBottle, iconChevronDown, iconClose } from '../components/icons';
+import { createLimiter } from '../utils/limit';
 
 const PAGE_SIZE = 100;
 
@@ -40,6 +41,11 @@ let settingsFlyoutApi: SettingsFlyoutApi | null = null;
 
 /** Object URLs for thumbnails, keyed by `${scopeId}/${dropId}` — survive re-renders. */
 const thumbUrls = new Map<string, string>();
+/** Preview downloads in flight, keyed like thumbUrls — a re-render mid-download
+ *  waits on the same request instead of starting another. */
+const thumbInFlight = new Map<string, Promise<Blob | undefined>>();
+/** Previews compete with sync for the connection, so only a few at a time. */
+const thumbLimiter = createLimiter(3);
 /** Drops whose delete is pending the undo window, keyed by `${scopeId}/${dropId}`. */
 const pendingDeletes = new Map<string, ReturnType<typeof setTimeout>>();
 /**
@@ -105,6 +111,8 @@ export async function renderFeed(
 
   let visibleCount = PAGE_SIZE;
   let feed: DropRecord[] = [];
+  /** The last pass failed — the first-sync copy says so while it retries. */
+  let syncFailed = false;
   const mkey = (id: string) => `${scopeId}/${id}`;
 
   // Author identity for chat attribution. Resolved from IDB after the first
@@ -152,10 +160,18 @@ export async function renderFeed(
 
     let html = '';
     if (visible.length === 0) {
-      const emptyTitle = isChat ? 'Say hello' : 'The milkbox is empty';
-      const emptyDek = isChat
+      // Before the first pass lands, empty means "not here yet", not "nothing".
+      const fetching = chatState === 'active' && (await coordinator.isFirstSyncPending(scopeId));
+      let emptyTitle = isChat ? 'Say hello' : 'The milkbox is empty';
+      let emptyDek = isChat
         ? `Drops shared here appear for everyone in ${escapeHtml(scope.name)}.`
         : 'Drop a note, a link, or a file below. It shows up on every device you sign in on.';
+      if (fetching) {
+        emptyTitle = isChat ? `Fetching ${escapeHtml(scope.name)}` : 'Fetching your drops';
+        emptyDek = syncFailed
+          ? 'Couldn’t reach OneDrive yet — retrying.'
+          : 'First sync on this device — keep Milkbox open until it finishes.';
+      }
       html = `
         <div class="feed-empty">
           <div class="feed-empty-glyph">${iconBottle('40px')}</div>
@@ -208,11 +224,57 @@ export async function renderFeed(
   /**
    * Load preview bytes for image drops: memory → IDB → Graph thumbnail →
    * (fallback) the full image itself. Graph may not have generated a
-   * thumbnail yet for a fresh upload, so a miss schedules one retry rather
+   * thumbnail yet for a fresh upload, so a miss earns one retry rather
    * than leaving the card blank forever.
    */
   const FULL_IMAGE_PREVIEW_LIMIT = 10 * 1024 * 1024;
   const thumbRetried = new Set<string>();
+  let thumbRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  teardownFns.push(() => clearTimeout(thumbRetryTimer));
+
+  /** One retry sweep for every preview that missed, not one per image. */
+  function scheduleThumbRetry(): void {
+    if (thumbRetryTimer) return;
+    thumbRetryTimer = setTimeout(() => {
+      thumbRetryTimer = undefined;
+      if (listEl.isConnected) hydrateImages();
+    }, 4000);
+  }
+
+  function loadPreview(id: string): Promise<Blob | undefined> {
+    const key = mkey(id);
+    let pending = thumbInFlight.get(key);
+    if (!pending) {
+      pending = fetchPreview(id).finally(() => thumbInFlight.delete(key));
+      thumbInFlight.set(key, pending);
+    }
+    return pending;
+  }
+
+  async function fetchPreview(id: string): Promise<Blob | undefined> {
+    const file = feed.find(r => r.meta.id === id)?.meta.file;
+    const itemId = file?.itemId;
+    if (!file || !itemId || coordinator.isThrottled()) return undefined;
+    try {
+      return await thumbLimiter(async () => {
+        const fetched = await fetchThumbnail(scope, itemId);
+        if (fetched) {
+          await db.putThumb(scopeId, id, fetched).catch(() => {});
+          return fetched;
+        }
+        // No thumbnail (not generated yet, or unsupported format) — the
+        // image itself is small enough to be its own preview.
+        if (file.size > FULL_IMAGE_PREVIEW_LIMIT) return undefined;
+        const blob = await downloadDropFile(scope, itemId);
+        await db.putCachedBlob(scopeId, id, blob).catch(() => {});
+        return blob;
+      });
+    } catch (err) {
+      // Offline or transient; a throttle also pauses sync and polling.
+      coordinator.noteThrottle(err);
+      return undefined;
+    }
+  }
 
   function hydrateImages(): void {
     listEl.querySelectorAll<HTMLImageElement>('img[data-thumb-id]').forEach(async img => {
@@ -226,31 +288,19 @@ export async function renderFeed(
       let blob = (await db.getThumb(scopeId, id).catch(() => undefined))
         || (await db.getCachedBlob(scopeId, id).catch(() => undefined));
       if (!blob) {
-        const record = feed.find(r => r.meta.id === id);
-        const file = record?.meta.file;
-        if (!file?.itemId) return;
-        try {
-          const fetched = await fetchThumbnail(scope, file.itemId);
-          if (fetched) {
-            blob = fetched;
-            await db.putThumb(scopeId, id, fetched).catch(() => {});
-          } else if (file.size <= FULL_IMAGE_PREVIEW_LIMIT) {
-            // No thumbnail (not generated yet, or unsupported format) —
-            // the image itself is small enough to be its own preview.
-            blob = await downloadDropFile(scope, file.itemId);
-            await db.putCachedBlob(scopeId, id, blob).catch(() => {});
-          }
-        } catch { /* offline or transient — retry below */ }
+        blob = await loadPreview(id);
         if (!blob && !thumbRetried.has(id)) {
           thumbRetried.add(id);
-          setTimeout(() => {
-            if (listEl.isConnected) hydrateImages();
-          }, 4000);
+          scheduleThumbRetry();
         }
       }
       if (blob) {
-        const url = URL.createObjectURL(blob);
-        thumbUrls.set(mkey(id), url);
+        // Two cards waiting on one download share one object URL.
+        let url = thumbUrls.get(mkey(id));
+        if (!url) {
+          url = URL.createObjectURL(blob);
+          thumbUrls.set(mkey(id), url);
+        }
         img.src = url;
         img.classList.add('loaded');
       }
@@ -618,9 +668,16 @@ export async function renderFeed(
         break;
       case 'sync-complete':
         composerApi?.setSyncState('synced');
+        if (syncFailed) {
+          syncFailed = false;
+          if (feed.length === 0) void refresh();
+        }
         break;
       case 'sync-error':
         composerApi?.setSyncState('error');
+        syncFailed = true;
+        // An empty first-sync screen says it is retrying.
+        if (feed.length === 0) void refresh();
         break;
       case 'feed-updated':
         void refresh();
@@ -666,8 +723,9 @@ export async function renderFeed(
   }, 45_000);
   teardownFns.push(() => clearInterval(poll));
 
+  // Back from the background: a cTag probe decides whether a pass is needed.
   const onVisible = () => {
-    if (document.visibilityState === 'visible') void coordinator.requestSync(scope);
+    if (document.visibilityState === 'visible') void coordinator.syncIfDirty(scope);
   };
   document.addEventListener('visibilitychange', onVisible);
   teardownFns.push(() => document.removeEventListener('visibilitychange', onVisible));

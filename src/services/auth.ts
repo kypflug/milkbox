@@ -287,8 +287,9 @@ export async function getAccessToken(tier: TokenTier = 'base'): Promise<string> 
     if (!result.accessToken) {
       throw new InteractionRequiredAuthError('empty_token', 'Silent token acquisition returned empty access token');
     }
-    // Keep IndexedDB backup fresh after every successful token acquisition
-    backupMsalCache().catch(() => {});
+    // Keep the IndexedDB backup fresh — but only when MSAL actually minted a
+    // token. A cache hit (nearly every Graph call) changed nothing to back up.
+    if (!result.fromCache) backupMsalCache().catch(() => {});
     return result.accessToken;
   } catch (err) {
     // In PWA standalone/WCO mode, iframe-based silent renewal often fails
@@ -360,14 +361,20 @@ export function getUserEmail(): string {
 
 // ─── Account hint (iOS process-kill recovery) ───
 
+/** The hint this page last wrote — getAccount() runs on every Graph call. */
+let savedHint = '';
+
 /** Persist a lightweight marker so we know a user was previously signed in. */
 function saveAccountHint(account: AccountInfo): void {
+  const hint = JSON.stringify({
+    username: account.username,
+    name: account.name,
+    homeAccountId: account.homeAccountId,
+  });
+  if (hint === savedHint) return;
   try {
-    localStorage.setItem(ACCOUNT_HINT_KEY, JSON.stringify({
-      username: account.username,
-      name: account.name,
-      homeAccountId: account.homeAccountId,
-    }));
+    localStorage.setItem(ACCOUNT_HINT_KEY, hint);
+    savedHint = hint;
   } catch { /* localStorage may be unavailable */ }
 }
 
@@ -382,6 +389,7 @@ export function hasAccountHint(): boolean {
 
 /** Clear the account hint (on explicit sign-out). */
 function clearAccountHint(): void {
+  savedHint = '';
   try {
     localStorage.removeItem(ACCOUNT_HINT_KEY);
   } catch { /* */ }

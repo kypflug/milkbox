@@ -389,6 +389,8 @@ interface ScopeSyncState {
   consecutiveGone: number;
   lastMembersFetch: number;
   lastDescriptorFetch: number;
+  /** A pass finished this session — the feed's "fetching" copy can go. */
+  completedOnce: boolean;
 }
 
 const scopeStates = new Map<ScopeId, ScopeSyncState>();
@@ -400,10 +402,15 @@ const GONE_THRESHOLD = 3;
  *  so one 429 pauses every scope's polling and syncing. */
 let throttledUntil = 0;
 
-function noteThrottle(err: unknown): void {
+/** Raise the gate on a 429/503 — thumbnail loads report theirs here too. */
+export function noteThrottle(err: unknown): void {
   if (!graph.isThrottleError(err)) return;
   const seconds = err instanceof graph.GraphHttpError && err.retryAfterSeconds ? err.retryAfterSeconds : 60;
   throttledUntil = Math.max(throttledUntil, Date.now() + seconds * 1000);
+}
+
+export function isThrottled(): boolean {
+  return Date.now() < throttledUntil;
 }
 
 function stateFor(scopeId: ScopeId): ScopeSyncState {
@@ -417,6 +424,7 @@ function stateFor(scopeId: ScopeId): ScopeSyncState {
       consecutiveGone: 0,
       lastMembersFetch: 0,
       lastDescriptorFetch: 0,
+      completedOnce: false,
     };
     scopeStates.set(scopeId, st);
   }
@@ -435,7 +443,9 @@ async function syncDeviceProfiles(): Promise<{ cTag?: string; count: number }> {
   }
 
   const before = await db.getAllDeviceProfiles();
-  const snapshot = await graph.listDeviceProfiles();
+  // Unchanged since the last listing: one cTag GET, no downloads.
+  const snapshot = await graph.listDeviceProfiles(await graph.getKnownDeviceRegistryCTag());
+  if (!snapshot.profiles) return { cTag: snapshot.cTag, count: before.length };
   const remote = snapshot.profiles;
   const remoteLocal = remote.find(profile => profile.id === local.id);
   const current = remoteLocal && remoteLocal.updatedAt > local.updatedAt ? remoteLocal : local;
@@ -455,6 +465,24 @@ async function syncDeviceProfiles(): Promise<{ cTag?: string; count: number }> {
     postBroadcast({ type: 'sync-complete', scopeId: PRIVATE_SCOPE_ID });
   }
   return { cTag: snapshot.cTag, count: profiles.length };
+}
+
+/**
+ * The private feed's device profiles, synced alongside its drops rather than
+ * ahead of them: they only label drops, so neither the feed nor a send should
+ * wait on them. Never rejects. The registry cTag was read before the listing,
+ * so marking it clean here can't hide a change that landed meanwhile.
+ */
+async function runDevicesPhase(): Promise<{ ms: number; count?: number }> {
+  const t0 = performance.now();
+  try {
+    const synced = await syncDeviceProfiles();
+    if (synced.cTag) await graph.markDeviceRegistryClean(synced.cTag);
+    return { ms: performance.now() - t0, count: synced.count };
+  } catch (err) {
+    console.warn('[Sync] Device profile sync failed; drops sync on:', err);
+    return { ms: performance.now() - t0 };
+  }
 }
 
 /**
@@ -602,8 +630,11 @@ async function refreshMembers(scope: ChatScope, st: ScopeSyncState, passChanged:
 /**
  * Run a sync pass for a scope: drain its outbox, then delta (or listing
  * fallback) into IDB. Serialized and rate-floored per scope.
+ *
+ * `knownCTag` is a folder cTag the caller read just now (a poll tick's dirty
+ * check), committed with the pass instead of asking for it again.
  */
-export function requestSync(scope: Scope, opts: { force?: boolean } = {}): Promise<void> {
+export function requestSync(scope: Scope, opts: { force?: boolean; knownCTag?: string } = {}): Promise<void> {
   const scopeId = scopeIdOf(scope);
   const st = stateFor(scopeId);
   if (st.syncPromise) {
@@ -614,11 +645,11 @@ export function requestSync(scope: Scope, opts: { force?: boolean } = {}): Promi
   const now = Date.now();
   if (!opts.force && now - st.lastSyncAt < SYNC_FLOOR_MS) return Promise.resolve();
   if (now < throttledUntil) return Promise.resolve();
-  st.syncPromise = runScopeSync(scope, st);
+  st.syncPromise = runScopeSync(scope, st, opts.knownCTag);
   return st.syncPromise;
 }
 
-async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
+async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string): Promise<void> {
   const scopeId = scopeIdOf(scope);
   st.syncing = true;
   try {
@@ -634,41 +665,41 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
       const requestsBefore = requestCount();
       let mode: PassStats['mode'] = 'incremental';
       let firstCommitMs: number | undefined;
-      let devicesMs: number | undefined;
-      let devices: number | undefined;
       let removed = 0;
       let outcome: PassStats['outcome'] = 'ok';
       let error: string | undefined;
 
+      const devicesTask = scope.kind === 'private' ? runDevicesPhase() : undefined;
+
       try {
-        let deviceCTag: string | undefined;
-        if (scope.kind === 'private') {
-          const td = performance.now();
-          try {
-            const synced = await syncDeviceProfiles();
-            deviceCTag = synced.cTag;
-            devices = synced.count;
-          } catch (err) {
-            console.warn('[Sync] Device profile sync failed; continuing with drops:', err);
+        let chatRecord: ChatRecord | undefined;
+        if (scope.kind === 'chat') {
+          chatRecord = await db.getChat(scope.chatId);
+          if (!chatRecord || chatRecord.state === 'gone') {
+            emit({ type: 'sync-complete', scopeId });
+            return;
           }
-          devicesMs = performance.now() - td;
         }
+
         await drainOutbox(scopeId);
+
+        // The cTag this pass will commit, read BEFORE the delta (see
+        // graph.readFeedCTag). A poll tick's value is only good for the
+        // first iteration; a repeat reads afresh.
+        const cTag = knownCTag ?? (await graph.readFeedCTag(scope).catch(() => undefined));
+        knownCTag = undefined;
+        const preIds = new Set(await db.getScopeDropIds(scopeId));
 
         let result: graph.DeltaResult;
         if (scope.kind === 'private') {
           result = await graph.runDelta(scope, { stats: counts });
         } else {
-          const record = await db.getChat(scope.chatId);
-          if (!record || record.state === 'gone') {
-            emit({ type: 'sync-complete', scopeId });
-            return;
-          }
+          const strategy = chatRecord?.syncStrategy;
           const known = await db.getScopeDropETags(scopeId);
-          const synced = await chatsApi.runChatSync(scope, record.syncStrategy, known, counts);
+          const synced = await chatsApi.runChatSync(scope, strategy, known, counts);
           result = synced.result;
           if (synced.strategy === 'listing') mode = 'listing';
-          if (synced.strategy !== (record.syncStrategy ?? 'delta')) {
+          if (synced.strategy !== (strategy ?? 'delta')) {
             await db.patchChat(scope.chatId, { syncStrategy: synced.strategy });
           }
         }
@@ -678,24 +709,36 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
         // upsert is present in IDB and indistinguishable from one we held.
         const arrivals = await collectArrivals(scope, result.upserts);
 
+        // A full pass is the complete server state: a drop this device held
+        // before the pass that the pass never named is gone. Only ids held
+        // BEFORE the pass are swept, so a drop a concurrent outbox drain
+        // wrote meanwhile (an edit, a retried send) survives.
+        const deletes = new Set(result.removals);
         if (result.fullResync) {
-          // Reconcile: the pass IS the complete server state for this scope.
-          await db.replaceScopeDrops(scopeId, result.upserts);
-        } else {
-          for (const record of result.upserts) await db.putDrop(scopeId, record);
-          for (const id of result.removals) {
-            await db.deleteDrop(scopeId, id);
-            await db.deleteThumb(scopeId, id).catch(() => {});
-            await db.deleteCachedBlob(scopeId, id).catch(() => {});
-          }
+          const named = new Set(result.upserts.map(record => record.meta.id));
+          for (const id of preIds) if (!named.has(id)) deletes.add(id);
         }
+
+        const tokenKey = graph.deltaTokenKey(scope);
+        const settingsPut: Array<[string, unknown]> = [];
+        const settingsDelete: string[] = [];
+        if (result.deltaLink) settingsPut.push([tokenKey, result.deltaLink]);
+        // A full pass that produced no token (no drops folder yet) retires
+        // any stale one, so the next pass doesn't trip over it again.
+        else if (result.fullResync) settingsDelete.push(tokenKey);
+        if (cTag) settingsPut.push([graph.folderCtagKey(scope), cTag]);
+
+        await db.commitDropChanges(scopeId, {
+          puts: result.upserts,
+          deletes: [...deletes],
+          settingsPut,
+          settingsDelete,
+        });
         firstCommitMs = performance.now() - t0;
-        removed = result.removals.length;
+        removed = deletes.size;
+        st.completedOnce = true;
 
-        await graph.markFeedClean(scope);
-        if (scope.kind === 'private' && deviceCTag) await graph.markDeviceRegistryClean(deviceCTag);
-
-        const passChanged = result.upserts.length > 0 || result.removals.length > 0 || result.fullResync;
+        const passChanged = result.upserts.length > 0 || deletes.size > 0 || result.fullResync;
         if (scope.kind === 'chat') {
           st.consecutiveGone = 0;
           const record = await db.getChat(scope.chatId);
@@ -716,6 +759,8 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
           await trackUnread(scope, arrivals);
         }
 
+        // Announcements name the sending device, so let its profile land first.
+        await devicesTask;
         try {
           await announceArrivals(scope, arrivals);
         } catch (err) {
@@ -741,6 +786,7 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
         emit({ type: 'sync-error', scopeId, error: err });
       }
 
+      const devicesPhase = await devicesTask;
       void recordPass({
         ...counts,
         scope: scope.kind,
@@ -750,8 +796,8 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
         startedAt,
         totalMs: performance.now() - t0,
         firstCommitMs,
-        devicesMs,
-        devices,
+        devicesMs: devicesPhase?.ms,
+        devices: devicesPhase?.count,
         removed,
         requests: requestCount() - requestsBefore,
       }).catch(err => console.debug('[Sync] Could not record pass stats:', err));
@@ -765,6 +811,35 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState): Promise<void> {
 /** Re-read a scope's feed from IDB after another tab synced (no network). */
 export function refreshFromCache(scopeId: ScopeId): void {
   emit({ type: 'feed-updated', scopeId });
+}
+
+/**
+ * Coming back to the app: sync only what moved. Queued sends (or a pending
+ * profile write) force a pass, as on a poll tick; otherwise the cTag probe
+ * decides, so returning to an idle app costs a GET or two, not a full pass.
+ */
+export async function syncIfDirty(scope: Scope): Promise<void> {
+  const scopeId = scopeIdOf(scope);
+  const outbox = await db.getOutbox();
+  const hasWork =
+    outbox.some(r => r.state !== 'failed' && (r.scopeId ?? PRIVATE_SCOPE_ID) === scopeId) ||
+    (scope.kind === 'private' && Boolean(await db.getSetting(PENDING_DEVICE_PROFILE_KEY)));
+  if (hasWork) return requestSync(scope, { force: true });
+  if (Date.now() < throttledUntil) return;
+  await pollScope(scopeId);
+}
+
+/**
+ * True until a scope finishes its first pass on this device: no delta token
+ * stored and no pass completed this session. The feed says "fetching" rather
+ * than "empty" meanwhile. A brand-new account (no drops folder) never gets a
+ * token, so its first completed pass is what ends this.
+ */
+export async function isFirstSyncPending(scopeId: ScopeId): Promise<boolean> {
+  if (stateFor(scopeId).completedOnce) return false;
+  const scope = await resolveScope(scopeId);
+  if (!scope) return false;
+  return !(await db.getSetting<string>(graph.deltaTokenKey(scope)));
 }
 
 const resettingScopes = new Set<ScopeId>();
@@ -808,9 +883,11 @@ async function pollScope(scopeId: ScopeId): Promise<void> {
     if (!record || (record.state ?? 'active') !== 'active') return;
   }
   try {
-    const dirty = await graph.isFeedDirty(scope);
-    const devicesDirty = scope.kind === 'private' ? await graph.isDeviceRegistryDirty() : false;
-    if (dirty || devicesDirty) await requestSync(scope, { force: true });
+    const [feed, devicesDirty] = await Promise.all([
+      graph.isFeedDirty(scope),
+      scope.kind === 'private' ? graph.isDeviceRegistryDirty() : Promise.resolve(false),
+    ]);
+    if (feed.dirty || devicesDirty) await requestSync(scope, { force: true, knownCTag: feed.cTag });
   } catch (err) {
     noteThrottle(err);
     if (scope.kind === 'chat' && graph.isAccessLostError(err)) {
@@ -827,9 +904,9 @@ async function pollScope(scopeId: ScopeId): Promise<void> {
 
 /**
  * Cheap poll tick. The active scope is dirty-checked every tick; background
- * scopes take turns, one per tick — so the ceiling is 3 cTag GETs per tick
- * (active + devices + one background) no matter how many chats exist.
- * Queued outbox work always forces a sync for its scope.
+ * scopes take turns, one per tick — so the ceiling is 5 cTag GETs per tick
+ * (two registry folders, active + devices, one background) no matter how
+ * many chats exist. Queued outbox work always forces a sync for its scope.
  */
 export async function pollAll(activeScopeId: ScopeId): Promise<void> {
   if (Date.now() < throttledUntil) return;
