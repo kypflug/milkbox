@@ -113,6 +113,11 @@ export async function renderFeed(
   let feed: DropRecord[] = [];
   /** The last pass failed — the first-sync copy says so while it retries. */
   let syncFailed = false;
+  /** How far the running pass has got fetching drops. */
+  let syncProgress: { received: number; total: number } | null = null;
+  /** The list markup on screen. A refresh that would rebuild the same list
+   *  (older drops landing below the visible window) leaves it alone. */
+  let renderedHtml = '';
   const mkey = (id: string) => `${scopeId}/${id}`;
 
   // Author identity for chat attribution. Resolved from IDB after the first
@@ -170,7 +175,9 @@ export async function renderFeed(
         emptyTitle = isChat ? `Fetching ${escapeHtml(scope.name)}` : 'Fetching your drops';
         emptyDek = syncFailed
           ? 'Couldn’t reach OneDrive yet — retrying.'
-          : 'First sync on this device — keep Milkbox open until it finishes.';
+          : syncProgress?.total
+            ? `${syncProgress.received} of ${syncProgress.total} — keep Milkbox open until it finishes.`
+            : 'First sync on this device — keep Milkbox open until it finishes.';
       }
       html = `
         <div class="feed-empty">
@@ -204,9 +211,12 @@ export async function renderFeed(
         html += renderDropCard(record, presentation);
       }
     }
-    listEl.innerHTML = html;
-    hydrateImages();
-    hydrateFavicons();
+    if (html !== renderedHtml) {
+      listEl.innerHTML = html;
+      renderedHtml = html;
+      hydrateImages();
+      hydrateFavicons();
+    }
     if (stick) scrollToBottom();
 
     if (isChat && document.visibilityState === 'visible') {
@@ -219,6 +229,42 @@ export async function renderFeed(
     const queued = pendingRefresh;
     pendingRefresh = null;
     if (queued) void refresh(queued);
+  }
+
+  /**
+   * Coalesced refresh for sync events. A first sync commits a batch every
+   * few hundred milliseconds and each refresh re-reads the feed from IDB,
+   * so one runs at a time, at most every REFRESH_MIN_MS, and requests that
+   * arrive meanwhile fold into a single trailing run.
+   */
+  const REFRESH_MIN_MS = 300;
+  let refreshWanted = false;
+  let refreshRunning = false;
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastRefreshAt = 0;
+  teardownFns.push(() => clearTimeout(refreshTimer));
+
+  function scheduleRefresh(): void {
+    refreshWanted = true;
+    if (refreshRunning || refreshTimer) return;
+    const wait = Math.max(0, lastRefreshAt + REFRESH_MIN_MS - performance.now());
+    refreshTimer = setTimeout(() => void runScheduledRefresh(), wait);
+  }
+
+  async function runScheduledRefresh(): Promise<void> {
+    refreshTimer = undefined;
+    if (!refreshWanted || !listEl.isConnected) return;
+    refreshWanted = false;
+    refreshRunning = true;
+    try {
+      await refresh();
+    } catch (err) {
+      console.debug('[Feed] Refresh failed:', err);
+    } finally {
+      refreshRunning = false;
+      lastRefreshAt = performance.now();
+      if (refreshWanted) scheduleRefresh();
+    }
   }
 
   /**
@@ -588,6 +634,8 @@ export async function renderFeed(
     const input = editor.querySelector<HTMLTextAreaElement>('.drop-edit-input')!;
     input.value = record.meta.text || '';
     textEl.replaceWith(editor);
+    // The list no longer matches its markup — the next refresh must rebuild.
+    renderedHtml = '';
     input.focus();
     input.setSelectionRange(input.value.length, input.value.length);
 
@@ -666,21 +714,28 @@ export async function renderFeed(
       case 'sync-start':
         composerApi?.setSyncState('syncing');
         break;
+      case 'sync-progress':
+        syncProgress = { received: event.received, total: event.total };
+        composerApi?.setSyncState('syncing', syncProgress);
+        if (feed.length === 0) scheduleRefresh();
+        break;
       case 'sync-complete':
         composerApi?.setSyncState('synced');
+        syncProgress = null;
         if (syncFailed) {
           syncFailed = false;
-          if (feed.length === 0) void refresh();
+          if (feed.length === 0) scheduleRefresh();
         }
         break;
       case 'sync-error':
         composerApi?.setSyncState('error');
+        syncProgress = null;
         syncFailed = true;
         // An empty first-sync screen says it is retrying.
-        if (feed.length === 0) void refresh();
+        if (feed.length === 0) scheduleRefresh();
         break;
       case 'feed-updated':
-        void refresh();
+        scheduleRefresh();
         break;
       case 'drop-conflict':
         showToast('A drop you changed was edited or removed by someone else', 'error');

@@ -5,7 +5,7 @@ import { clearAllData } from '../services/db';
 import { escapeAttr, escapeHtml } from '../utils/storage';
 import { showToast } from '../components/toast';
 import { iconClose } from '../components/icons';
-import { renameCurrentDevice, resetScope } from '../services/sync-coordinator';
+import { renameCurrentDevice, resetScope, shutdown } from '../services/sync-coordinator';
 import { getDiagnostics, type Diagnostics, type PassStats } from '../services/sync-stats';
 import {
   isNotifySupported,
@@ -289,6 +289,9 @@ export function mountSettingsFlyout(
 
   panel.querySelector<HTMLButtonElement>('[data-settings-action="sign-out"]')!
     .addEventListener('click', async () => {
+      // Stop syncing and refuse further writes first, so a batch still in
+      // flight can't land this account's drops after the wipe.
+      shutdown();
       try {
         await clearAllData();
       } catch (err) {

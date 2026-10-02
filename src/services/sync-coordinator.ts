@@ -46,6 +46,8 @@ export type CoordinatorEvent =
   | { type: 'sync-start'; scopeId: ScopeId }
   | { type: 'sync-complete'; scopeId: ScopeId }
   | { type: 'sync-error'; scopeId: ScopeId; error: unknown }
+  /** A pass is fetching drops: `received` of the `total` it set out to download. */
+  | { type: 'sync-progress'; scopeId: ScopeId; received: number; total: number }
   | { type: 'feed-updated'; scopeId: ScopeId }
   | { type: 'drop-progress'; scopeId: ScopeId; dropId: string; fraction: number }
   /** A queued chat edit lost its conditional write — the drop changed or was removed remotely. */
@@ -209,15 +211,22 @@ export async function enqueueCreate(scope: Scope, meta: DropMeta, blob?: Blob): 
     scopeId,
   });
   emit({ type: 'feed-updated', scopeId });
+  // Upload now, even if a long pass (a first sync) is mid-download; the
+  // forced pass then picks up anything else that changed.
+  void drainOutbox(scopeId);
   void requestSync(scope, { force: true });
 }
 
 /** Queue an edit to an existing text drop. */
 export async function enqueueEdit(scope: Scope, meta: DropMeta): Promise<void> {
   const scopeId = scopeIdOf(scope);
-  await db.putOutboxRecord({ id: meta.id, meta, op: 'edit', attempts: 0, state: 'queued', scopeId });
-  // Optimistically update the local record so the edit shows immediately
   const existing = await db.getDrop(scopeId, meta.id);
+  // Keep the server's version for a discard to restore. A second edit before
+  // the first lands inherits the first one's original.
+  const queued = (await db.getOutbox()).find(r => r.id === meta.id && r.op === 'edit');
+  const prevMeta = queued?.prevMeta ?? existing?.meta;
+  await db.putOutboxRecord({ id: meta.id, meta, op: 'edit', attempts: 0, state: 'queued', scopeId, prevMeta });
+  // Optimistically update the local record so the edit shows immediately
   if (existing) await db.putDrop(scopeId, { ...existing, meta });
   emit({ type: 'feed-updated', scopeId });
   void drainOutbox(scopeId);
@@ -255,36 +264,54 @@ export async function discardOutboxRecord(id: string): Promise<void> {
   const records = await db.getOutbox();
   const record = records.find(r => r.id === id);
   await db.deleteOutboxRecord(id);
-  emit({ type: 'feed-updated', scopeId: record?.scopeId ?? PRIVATE_SCOPE_ID });
+  const scopeId = record?.scopeId ?? PRIVATE_SCOPE_ID;
+  // A discarded edit never reached OneDrive: put the server's version back
+  // over the optimistic local copy. Its eTag still matches the server's, so
+  // no sync pass would ever correct it.
+  if (record?.op === 'edit' && record.prevMeta) {
+    const existing = await db.getDrop(scopeId, id);
+    if (existing) await db.putDrop(scopeId, { ...existing, meta: record.prevMeta });
+  }
+  emit({ type: 'feed-updated', scopeId });
 }
 
 const drainingScopes = new Set<ScopeId>();
+/** Asked to drain while a drain was running — go round once more. */
+const drainAgainScopes = new Set<ScopeId>();
 
 /**
  * Drain one scope's outbox serially. Each record gets MAX_ATTEMPTS tries with
  * exponential backoff; throttle responses (429/503) pause the whole drain
- * for the server-requested interval.
+ * for the server-requested interval. A send queued mid-drain is picked up by
+ * the same drain rather than waiting for the next pass.
  */
 export async function drainOutbox(scopeId: ScopeId): Promise<void> {
-  if (drainingScopes.has(scopeId)) return;
+  if (drainingScopes.has(scopeId)) {
+    drainAgainScopes.add(scopeId);
+    return;
+  }
   drainingScopes.add(scopeId);
   try {
-    const scope = await resolveScope(scopeId);
-    const records = (await db.getOutbox()).filter(r => (r.scopeId ?? PRIVATE_SCOPE_ID) === scopeId);
-    // Oldest first so the feed lands in order
-    records.sort((a, b) => (a.id < b.id ? -1 : 1));
+    do {
+      drainAgainScopes.delete(scopeId);
+      const scope = await resolveScope(scopeId);
+      const records = (await db.getOutbox()).filter(r => (r.scopeId ?? PRIVATE_SCOPE_ID) === scopeId);
+      // Oldest first so the feed lands in order
+      records.sort((a, b) => (a.id < b.id ? -1 : 1));
 
-    for (const record of records) {
-      if (record.state === 'failed') continue;
-      if (!scope) {
-        // The chat is no longer registered locally — terminal.
-        await db.putOutboxRecord({ ...record, state: 'failed' });
-        continue;
+      for (const record of records) {
+        if (record.state === 'failed') continue;
+        if (!scope) {
+          // The chat is no longer registered locally — terminal.
+          await db.putOutboxRecord({ ...record, state: 'failed' });
+          continue;
+        }
+        await processOutboxRecord(scope, record);
       }
-      await processOutboxRecord(scope, record);
-    }
+    } while (drainAgainScopes.has(scopeId));
   } finally {
     drainingScopes.delete(scopeId);
+    drainAgainScopes.delete(scopeId);
   }
 }
 
@@ -391,12 +418,24 @@ interface ScopeSyncState {
   lastDescriptorFetch: number;
   /** A pass finished this session — the feed's "fetching" copy can go. */
   completedOnce: boolean;
+  /** Aborts the running pass (a reset, or sign-out). */
+  controller: AbortController | null;
+  /** Quick retries spent since the last completed pass. */
+  retryCount: number;
+  retryTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 const scopeStates = new Map<ScopeId, ScopeSyncState>();
 const SYNC_FLOOR_MS = 5_000;
 const MEMBERS_REFRESH_MS = 5 * 60_000;
 const GONE_THRESHOLD = 3;
+/** After a transient failure, try again this soon; then the 45 s poll takes over. */
+const RETRY_DELAYS_MS = [2_000, 5_000, 15_000];
+/** Other tabs re-read the feed at most this often while a pass commits batches. */
+const BROADCAST_EVERY_MS = 2_000;
+
+/** Sign-out has begun: no new passes, and every write is refused. */
+let shuttingDown = false;
 
 /** Global throttle gate — Graph throttles per app+user across all drives,
  *  so one 429 pauses every scope's polling and syncing. */
@@ -425,6 +464,9 @@ function stateFor(scopeId: ScopeId): ScopeSyncState {
       lastMembersFetch: 0,
       lastDescriptorFetch: 0,
       completedOnce: false,
+      controller: null,
+      retryCount: 0,
+      retryTimer: undefined,
     };
     scopeStates.set(scopeId, st);
   }
@@ -486,30 +528,27 @@ async function runDevicesPhase(): Promise<{ ms: number; count?: number }> {
 }
 
 /**
- * Pick out the upserts this install has never held before.
+ * Pick out the drops this install had never held, sent by someone else.
  *
  * Novelty is presence in IDB, not id order. ULIDs are minted when a drop is
  * composed but only published when the author's outbox drains — and in chats
  * other members' clocks can skew — so id order never decides novelty.
  *
- * Must be called before the pass writes upserts to IDB.
+ * `heldBefore` is the scope's ids as the pass found them, taken before its
+ * first batch was written: once batches land, every drop they carry is in
+ * IDB and indistinguishable from one we held.
  */
-async function collectArrivals(scope: Scope, upserts: DropRecord[]): Promise<DropMeta[]> {
-  if (!upserts.length) return [];
-
-  let candidates: DropRecord[];
-  if (scope.kind === 'private') {
-    const deviceId = device.getDeviceId();
-    candidates = upserts.filter(record => record.meta.device.id !== deviceId);
-  } else {
-    const me = await ensureMe();
-    candidates = upserts.filter(record => record.meta.author?.id !== me?.id);
-  }
-  if (!candidates.length) return [];
-
-  const known = new Set(await db.getScopeDropIds(scopeIdOf(scope)));
-  return candidates
-    .filter(record => !known.has(record.meta.id))
+function pickArrivals(
+  scope: Scope,
+  records: DropRecord[],
+  heldBefore: ReadonlySet<string>,
+  selfId: string | undefined,
+): DropMeta[] {
+  return records
+    .filter(record => !heldBefore.has(record.meta.id))
+    .filter(record =>
+      scope.kind === 'private' ? record.meta.device.id !== selfId : record.meta.author?.id !== selfId,
+    )
     .map(record => record.meta)
     .sort((a, b) => (a.id < b.id ? -1 : 1));
 }
@@ -522,12 +561,16 @@ async function collectArrivals(scope: Scope, upserts: DropRecord[]): Promise<Dro
  * would be a wall of notifications. Priming has to happen even when that
  * pass found nothing, or the first drop the scope ever receives would be
  * mistaken for backlog.
+ *
+ * A pass that failed after committing some batches passes `mayPrime: false`:
+ * it announces into an already-primed scope, but never primes one — or an
+ * interrupted first sync would announce the rest of the history as new.
  */
-async function announceArrivals(scope: Scope, arrivals: DropMeta[]): Promise<void> {
+async function announceArrivals(scope: Scope, arrivals: DropMeta[], mayPrime: boolean): Promise<void> {
   const scopeId = scopeIdOf(scope);
   const primed = await db.getSetting<boolean>(notifyPrimedKey(scopeId));
   if (!primed) {
-    await db.putSetting(notifyPrimedKey(scopeId), true);
+    if (mayPrime) await db.putSetting(notifyPrimedKey(scopeId), true);
     return;
   }
   if (!arrivals.length || !notify.isNotifyEnabled()) return;
@@ -641,7 +684,7 @@ export function requestSync(scope: Scope, opts: { force?: boolean; knownCTag?: s
     if (opts.force) st.syncAgain = true;
     return st.syncPromise;
   }
-  if (resettingScopes.has(scopeId)) return Promise.resolve();
+  if (shuttingDown || resettingScopes.has(scopeId)) return Promise.resolve();
   const now = Date.now();
   if (!opts.force && now - st.lastSyncAt < SYNC_FLOOR_MS) return Promise.resolve();
   if (now < throttledUntil) return Promise.resolve();
@@ -649,13 +692,44 @@ export function requestSync(scope: Scope, opts: { force?: boolean; knownCTag?: s
   return st.syncPromise;
 }
 
+/** Network trouble rather than a verdict — worth another pass soon. */
+function isTransientSyncError(err: unknown): boolean {
+  // An expired download link or a storage hiccup: a new pass mints fresh links.
+  if (err instanceof graph.DownloadError) return true;
+  if (err instanceof graph.GraphHttpError) return err.status >= 500 && !graph.isThrottleError(err);
+  if (err instanceof DOMException) return err.name === 'TimeoutError';
+  return err instanceof TypeError; // fetch's network failure
+}
+
+/**
+ * A pass that failed on the network gets a few quick retries while the app
+ * is on screen — a first sync interrupted by a flaky connection resumes in
+ * seconds, not at the next 45 s poll. Each retry skips what already landed.
+ */
+function scheduleRetry(scope: Scope, st: ScopeSyncState, err: unknown): void {
+  if (shuttingDown || !isTransientSyncError(err)) return;
+  const delay = RETRY_DELAYS_MS[st.retryCount];
+  if (delay === undefined) return; // the poll takes it from here
+  st.retryCount++;
+  clearTimeout(st.retryTimer);
+  st.retryTimer = setTimeout(() => {
+    st.retryTimer = undefined;
+    if (document.visibilityState === 'visible') void requestSync(scope, { force: true });
+  }, delay);
+}
+
 async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string): Promise<void> {
   const scopeId = scopeIdOf(scope);
   st.syncing = true;
+  let aborted = false;
   try {
     do {
       st.syncAgain = false;
       st.lastSyncAt = Date.now();
+      clearTimeout(st.retryTimer);
+      st.retryTimer = undefined;
+      const controller = new AbortController();
+      st.controller = controller;
       emit({ type: 'sync-start', scopeId });
 
       // Diagnostics for this pass (Settings › Sync diagnostics).
@@ -670,6 +744,9 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
       let error: string | undefined;
 
       const devicesTask = scope.kind === 'private' ? runDevicesPhase() : undefined;
+      /** Drops that arrived in batches this pass committed — announced even if it fails later. */
+      const arrivals: DropMeta[] = [];
+      let received = 0;
 
       try {
         let chatRecord: ChatRecord | undefined;
@@ -688,15 +765,50 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         // first iteration; a repeat reads afresh.
         const cTag = knownCTag ?? (await graph.readFeedCTag(scope).catch(() => undefined));
         knownCTag = undefined;
-        const preIds = new Set(await db.getScopeDropIds(scopeId));
+
+        // What this device holds as the pass starts: the eTags let it skip
+        // bodies it already has, the ids decide novelty and what a full pass
+        // may sweep. Taken before any batch below is written.
+        const known = await db.getScopeDropETags(scopeId);
+        const heldBefore = new Set(known.keys());
+        const selfId = scope.kind === 'private' ? device.getDeviceId() : (await ensureMe())?.id;
+        // Decided up front, so a first sync that fails is still recorded as one.
+        if (chatRecord?.syncStrategy !== 'listing' && !(await db.getSetting(graph.deltaTokenKey(scope)))) {
+          mode = 'full';
+        }
+
+        let total = 0;
+        let lastBroadcast = 0;
+        const deltaOpts: graph.DeltaOptions = {
+          stats: counts,
+          known,
+          signal: controller.signal,
+          onEnumerated: toDownload => {
+            total = toDownload;
+            if (total) emit({ type: 'sync-progress', scopeId, received, total });
+          },
+          // Each batch is committed and shown as it arrives, newest first.
+          onBatch: async records => {
+            const batchArrivals = pickArrivals(scope, records, heldBefore, selfId);
+            await db.commitDropChanges(scopeId, { puts: records });
+            arrivals.push(...batchArrivals);
+            firstCommitMs ??= performance.now() - t0;
+            received += records.length;
+            emit({ type: 'sync-progress', scopeId, received, total });
+            emit({ type: 'feed-updated', scopeId });
+            if (Date.now() - lastBroadcast >= BROADCAST_EVERY_MS) {
+              lastBroadcast = Date.now();
+              postBroadcast({ type: 'sync-complete', scopeId });
+            }
+          },
+        };
 
         let result: graph.DeltaResult;
         if (scope.kind === 'private') {
-          result = await graph.runDelta(scope, { stats: counts });
+          result = await graph.runDelta(scope, deltaOpts);
         } else {
           const strategy = chatRecord?.syncStrategy;
-          const known = await db.getScopeDropETags(scopeId);
-          const synced = await chatsApi.runChatSync(scope, strategy, known, counts);
+          const synced = await chatsApi.runChatSync(scope, strategy, known, deltaOpts);
           result = synced.result;
           if (synced.strategy === 'listing') mode = 'listing';
           if (synced.strategy !== (strategy ?? 'delta')) {
@@ -705,18 +817,13 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         }
         if (result.fullResync) mode = 'full';
 
-        // Snapshot novelty before the writes below land — afterwards every
-        // upsert is present in IDB and indistinguishable from one we held.
-        const arrivals = await collectArrivals(scope, result.upserts);
-
         // A full pass is the complete server state: a drop this device held
-        // before the pass that the pass never named is gone. Only ids held
+        // before the pass that the pass never found is gone. Only ids held
         // BEFORE the pass are swept, so a drop a concurrent outbox drain
-        // wrote meanwhile (an edit, a retried send) survives.
+        // wrote meanwhile (a send, an edit) survives.
         const deletes = new Set(result.removals);
         if (result.fullResync) {
-          const named = new Set(result.upserts.map(record => record.meta.id));
-          for (const id of preIds) if (!named.has(id)) deletes.add(id);
+          for (const id of heldBefore) if (!result.seenIds.has(id)) deletes.add(id);
         }
 
         const tokenKey = graph.deltaTokenKey(scope);
@@ -728,17 +835,22 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         else if (result.fullResync) settingsDelete.push(tokenKey);
         if (cTag) settingsPut.push([graph.folderCtagKey(scope), cTag]);
 
+        // The last drops, the removals, the token and the cTag land together.
+        const finalArrivals = pickArrivals(scope, result.upserts, heldBefore, selfId);
         await db.commitDropChanges(scopeId, {
           puts: result.upserts,
           deletes: [...deletes],
           settingsPut,
           settingsDelete,
         });
-        firstCommitMs = performance.now() - t0;
+        arrivals.push(...finalArrivals);
+        firstCommitMs ??= performance.now() - t0;
+        received += result.upserts.length;
         removed = deletes.size;
         st.completedOnce = true;
+        st.retryCount = 0;
 
-        const passChanged = result.upserts.length > 0 || deletes.size > 0 || result.fullResync;
+        const passChanged = received > 0 || deletes.size > 0 || result.fullResync;
         if (scope.kind === 'chat') {
           st.consecutiveGone = 0;
           const record = await db.getChat(scope.chatId);
@@ -746,6 +858,8 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
             await db.patchChat(scope.chatId, { state: 'active' });
             emit({ type: 'chats-changed' });
           }
+          // The drops are in: show them before the roster and name refresh.
+          if (passChanged) emit({ type: 'feed-updated', scopeId });
           try {
             await refreshMembers(scope, st, passChanged);
           } catch (err) {
@@ -762,7 +876,7 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         // Announcements name the sending device, so let its profile land first.
         await devicesTask;
         try {
-          await announceArrivals(scope, arrivals);
+          await announceArrivals(scope, arrivals, true);
         } catch (err) {
           console.warn('[Sync] Announcing arrivals failed; drops are synced:', err);
         }
@@ -775,17 +889,37 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
       } catch (err) {
         outcome = 'error';
         error = errorLabel(err);
-        noteThrottle(err);
-        if (scope.kind === 'chat' && graph.isAccessLostError(err)) {
-          st.consecutiveGone++;
-          if (st.consecutiveGone >= GONE_THRESHOLD) await handleChatGone(scope.chatId);
-        } else if (scope.kind === 'chat' && err instanceof ConsentRequiredError) {
-          await handleChatConsentLost(scope.chatId);
+        aborted = controller.signal.aborted;
+        if (aborted) {
+          // A reset or sign-out stopped this pass on purpose — not a failure
+          // to report; whoever aborted it takes it from here.
+          console.debug('[Sync] Pass for %s aborted', scopeId);
+        } else {
+          noteThrottle(err);
+          if (scope.kind === 'chat' && graph.isAccessLostError(err)) {
+            st.consecutiveGone++;
+            if (st.consecutiveGone >= GONE_THRESHOLD) await handleChatGone(scope.chatId);
+          } else if (scope.kind === 'chat' && err instanceof ConsentRequiredError) {
+            await handleChatConsentLost(scope.chatId);
+          }
+          // Batches that did commit are real arrivals.
+          if (arrivals.length) {
+            try {
+              await trackUnread(scope, arrivals);
+              await devicesTask;
+              await announceArrivals(scope, arrivals, false);
+            } catch (announceErr) {
+              console.debug('[Sync] Announcing partial arrivals failed:', announceErr);
+            }
+          }
+          if (received > 0) postBroadcast({ type: 'sync-complete', scopeId });
+          console.warn('[Sync] Sync pass failed (%s):', scopeId, err);
+          emit({ type: 'sync-error', scopeId, error: err });
+          scheduleRetry(scope, st, err);
         }
-        console.warn('[Sync] Sync pass failed (%s):', scopeId, err);
-        emit({ type: 'sync-error', scopeId, error: err });
       }
 
+      st.controller = null;
       const devicesPhase = await devicesTask;
       void recordPass({
         ...counts,
@@ -801,10 +935,24 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         removed,
         requests: requestCount() - requestsBefore,
       }).catch(err => console.debug('[Sync] Could not record pass stats:', err));
-    } while (st.syncAgain);
+    } while (st.syncAgain && !aborted && !shuttingDown);
   } finally {
     st.syncing = false;
     st.syncPromise = null;
+    st.controller = null;
+  }
+}
+
+/**
+ * Sign-out: stop every pass and close local storage to writes before the
+ * wipe, so nothing downloaded afterwards can land under the next account.
+ */
+export function shutdown(): void {
+  shuttingDown = true;
+  db.closeWrites();
+  for (const st of scopeStates.values()) {
+    clearTimeout(st.retryTimer);
+    st.controller?.abort();
   }
 }
 
@@ -857,8 +1005,13 @@ export async function resetScope(scope: Scope): Promise<void> {
   const st = stateFor(scopeId);
   resettingScopes.add(scopeId);
   try {
-    // Let a running pass finish, or it would write back over the reset.
+    // Stop a running pass and let it wind down, or it would write back over
+    // the reset.
+    clearTimeout(st.retryTimer);
+    st.controller?.abort();
     while (st.syncPromise) await st.syncPromise.catch(() => {});
+    st.completedOnce = false;
+    st.retryCount = 0;
     await graph.forgetSyncState(scope);
     await db.deleteSetting(notifyPrimedKey(scopeId));
     await db.clearScopeDrops(scopeId);
@@ -909,7 +1062,7 @@ async function pollScope(scopeId: ScopeId): Promise<void> {
  * many chats exist. Queued outbox work always forces a sync for its scope.
  */
 export async function pollAll(activeScopeId: ScopeId): Promise<void> {
-  if (Date.now() < throttledUntil) return;
+  if (shuttingDown || Date.now() < throttledUntil) return;
   // Land any join/leave the account made here that OneDrive has not yet
   // heard about, then pick up chats created/joined/left on other devices.
   // Both self-gate: the drain is a no-op with an empty queue, the registry

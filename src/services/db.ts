@@ -32,6 +32,22 @@ const V3_SETTINGS_RENAMES: ReadonlyArray<[string, string]> = [
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
+/**
+ * Set at sign-out, before the wipe: from then on every write is refused
+ * except clearAllData itself, so a sync batch still in flight can't land
+ * the old account's drops after the store was cleared.
+ */
+let writesClosed = false;
+
+export function closeWrites(): void {
+  writesClosed = true;
+}
+
+/** Called right before a write transaction opens — nothing can slip in between. */
+function assertWritable(): void {
+  if (writesClosed) throw new Error('Storage is closed for sign-out');
+}
+
 function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
@@ -136,6 +152,7 @@ function tx<T>(
   return openDb().then(
     db =>
       new Promise<T>((resolve, reject) => {
+        if (mode === 'readwrite') assertWritable();
         const t = db.transaction(store, mode);
         const req = fn(t.objectStore(store));
         let result: T;
@@ -204,6 +221,7 @@ export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): P
   const chatId = scopeId.startsWith('chat:') ? scopeId.slice(5) : null;
   const stores = ['drops', 'thumbs', 'blobs', 'settings', ...(chatId ? ['chats'] : [])];
   return new Promise((resolve, reject) => {
+    assertWritable();
     const t = db.transaction(stores, 'readwrite');
     let written = false;
     const write = () => {
@@ -330,6 +348,7 @@ export function putDeviceProfile(profile: DeviceProfile): Promise<void> {
 export async function replaceAllDeviceProfiles(profiles: DeviceProfile[]): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
+    assertWritable();
     const t = db.transaction('devices', 'readwrite');
     const s = t.objectStore('devices');
     s.clear();
@@ -405,6 +424,7 @@ export async function getSettingsByPrefix<T>(prefix: string): Promise<Array<{ ke
 export async function updateSettings(puts: Array<[string, unknown]>, deletes: string[]): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
+    assertWritable();
     const t = db.transaction('settings', 'readwrite');
     const store = t.objectStore('settings');
     for (const key of deletes) store.delete(key);
@@ -423,6 +443,7 @@ export async function updateSettings(puts: Array<[string, unknown]>, deletes: st
 export async function patchSetting<T>(key: string, fn: (current: T | undefined) => T | undefined): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
+    assertWritable();
     const t = db.transaction('settings', 'readwrite');
     const store = t.objectStore('settings');
     const req = store.get(key) as IDBRequest<T | undefined>;
@@ -453,6 +474,7 @@ function scopeSettingsKeys(scopeId: ScopeId): string[] {
 export async function clearScopeData(scopeId: ScopeId): Promise<void> {
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
+    assertWritable();
     const t = db.transaction(['drops', 'thumbs', 'blobs', 'outbox', 'settings', 'chats'], 'readwrite');
     t.objectStore('drops').delete(scopeRange(scopeId));
     t.objectStore('thumbs').delete(mediaRange(scopeId));
@@ -479,6 +501,7 @@ export async function clearScopeData(scopeId: ScopeId): Promise<void> {
 export async function clearScopeDrops(scopeId: ScopeId): Promise<void> {
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
+    assertWritable();
     const t = db.transaction(['drops', 'thumbs', 'blobs'], 'readwrite');
     t.objectStore('drops').delete(scopeRange(scopeId));
     t.objectStore('thumbs').delete(mediaRange(scopeId));

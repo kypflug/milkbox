@@ -16,7 +16,8 @@ export interface ComposerApi {
   /** Add attachments (share target, drag-drop). */
   addFiles(files: File[]): void;
   focus(): void;
-  setSyncState(state: 'syncing' | 'synced' | 'error'): void;
+  /** `progress` labels a pass that is fetching drops: "Syncing — 120 of 312". */
+  setSyncState(state: 'syncing' | 'synced' | 'error', progress?: { received: number; total: number }): void;
   /** Grey out sending (a gone chat) — refresh/settings/chats stay usable. */
   setDisabled(disabled: boolean, placeholder?: string): void;
   /** Change the idle placeholder (a renamed chat) without touching disabled state. */
@@ -64,12 +65,16 @@ export function mountComposer(
 
   let pendingFiles: File[] = [];
 
-  function setSyncState(state: 'syncing' | 'synced' | 'error'): void {
+  function setSyncState(
+    state: 'syncing' | 'synced' | 'error',
+    progress?: { received: number; total: number },
+  ): void {
     refreshBtn.classList.toggle('syncing', state === 'syncing');
     refreshBtn.classList.toggle('sync-error', state === 'error');
     if (state === 'syncing') {
-      refreshBtn.title = 'Syncing';
-      refreshBtn.setAttribute('aria-label', 'Syncing');
+      const label = progress?.total ? `Syncing — ${progress.received} of ${progress.total}` : 'Syncing';
+      refreshBtn.title = label;
+      refreshBtn.setAttribute('aria-label', label);
       refreshBtn.setAttribute('aria-busy', 'true');
     } else if (state === 'error') {
       refreshBtn.title = 'Sync failed — refresh to retry';

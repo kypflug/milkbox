@@ -85,6 +85,12 @@ export interface OutboxRecord {
    * stamps 'private' and the coordinator treats absence as 'private'.
    */
   scopeId?: ScopeId;
+  /**
+   * Edits only: the drop as OneDrive held it before this edit, so discarding
+   * a failed edit can restore it over the optimistic local copy. Absent on
+   * records from older builds.
+   */
+  prevMeta?: DropMeta;
 }
 
 // ─── Shared chats ───

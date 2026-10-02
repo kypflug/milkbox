@@ -17,18 +17,19 @@ import {
   GRAPH_BASE,
   GraphHttpError,
   contentUrl,
+  downloadItemJson,
   graphFetch,
   isDeltaUnsupportedError,
   isGoneError,
   itemByPathUrl,
   runDelta,
-  storageFetch,
+  type DeltaOptions,
   type DeltaResult,
   type DriveRef,
 } from './graph';
 import { validateChatDescriptor, validateChatMember, validateDropMeta, validateJoinedPointer } from './validate-drop';
-import type { PassCounts } from './sync-stats';
 import { ulid } from '../utils/ulid';
+import { mapLimited } from '../utils/limit';
 import type {
   AuthorAttribution,
   ChatDescriptor,
@@ -85,14 +86,16 @@ async function listChildren(
   return items;
 }
 
-async function downloadJson(item: GraphChildItem, driveId: string | undefined, tier: 'base' | 'share'): Promise<unknown> {
+function downloadJson(
+  item: GraphChildItem,
+  driveId: string | undefined,
+  tier: 'base' | 'share',
+  opts?: Pick<DeltaOptions, 'signal' | 'stats'>,
+): Promise<unknown> {
   const fallback = driveId
     ? `${GRAPH_BASE}/drives/${driveId}/items/${item.id}/content`
     : `${GRAPH_BASE}/me/drive/items/${item.id}/content`;
-  const url = item['@microsoft.graph.downloadUrl'] || fallback;
-  const res = item['@microsoft.graph.downloadUrl'] ? await storageFetch(url) : await graphFetch(url, undefined, tier);
-  if (!res.ok) throw new GraphHttpError(res.status, url, 'JSON download failed');
-  return res.json();
+  return downloadItemJson(item, fallback, tier, opts);
 }
 
 async function putJson(ref: DriveRef, path: string, body: unknown, tier: 'base' | 'share'): Promise<void> {
@@ -307,17 +310,17 @@ export async function listMembers(chat: { driveId: string; itemId: string }): Pr
     if (isGoneError(err)) return [];
     throw err;
   }
-  const members: ChatMember[] = [];
-  for (const item of items) {
-    if (!item.file || !item.name?.endsWith('.json')) continue;
+  const files = items.filter(item => item.file && item.name?.endsWith('.json'));
+  const members = await mapLimited(files, 4, async item => {
     try {
-      const member = validateChatMember(await downloadJson(item, chat.driveId, 'share'));
-      if (member) members.push(member);
+      return validateChatMember(await downloadJson(item, chat.driveId, 'share'));
     } catch {
-      // One unreadable member file must not hide the roster
+      return null; // one unreadable member file must not hide the roster
     }
-  }
-  return members.sort((a, b) => a.joinedAt - b.joinedAt);
+  });
+  return members
+    .filter((member): member is ChatMember => member !== null)
+    .sort((a, b) => a.joinedAt - b.joinedAt);
 }
 
 // ─── permissions (host moderation) ───
@@ -399,18 +402,24 @@ export async function listJoinedPointers(skipChatIds?: ReadonlySet<string>): Pro
     if (isGoneError(err)) return { ids, pointers }; // folder never created — no joined chats
     throw err;
   }
+  const unknown: Array<{ item: GraphChildItem; chatId: string }> = [];
   for (const item of items) {
     if (!item.file || !item.name?.endsWith('.json')) continue;
     // Pointer files are named <chatId>.json — chats the caller already knows
     // need no download, keeping recurring hydration to the one listing GET.
     const chatId = item.name.slice(0, -5);
     ids.add(chatId);
-    if (skipChatIds?.has(chatId)) continue;
+    if (!skipChatIds?.has(chatId)) unknown.push({ item, chatId });
+  }
+  const resolved = await mapLimited(unknown, 4, async ({ item, chatId }) => {
     try {
       const pointer = validateJoinedPointer(await downloadJson(item, undefined, 'base'));
-      if (pointer && pointer.chatId === chatId) pointers.push(pointer);
-    } catch { /* skip unreadable pointer — it stays in ids, so it is not a removal */ }
-  }
+      return pointer && pointer.chatId === chatId ? pointer : null;
+    } catch {
+      return null; // unreadable pointer — it stays in ids, so it is not a removal
+    }
+  });
+  for (const pointer of resolved) if (pointer) pointers.push(pointer);
   return { ids, pointers };
 }
 
@@ -463,33 +472,42 @@ export async function listHostChats(me: AuthorAttribution, skipChatIds?: Readonl
     if (isGoneError(err)) return { ids, records }; // folder never created — no hosted chats
     throw err;
   }
+  const unknown: Array<GraphChildItem & { name: string }> = [];
   for (const item of items) {
     if (!item.folder || !item.name) continue;
     // Folders are named by chat id — chats the caller already knows need no
     // descriptor/drops reads, keeping recurring hydration to the listing GET.
     ids.add(item.name);
-    if (skipChatIds?.has(item.name)) continue;
+    if (!skipChatIds?.has(item.name)) unknown.push({ ...item, name: item.name });
+  }
+  const resolved = await mapLimited(unknown, 3, async (item): Promise<ChatRecord | null> => {
     try {
-      const descRes = await graphFetch(contentUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/chat.json`));
-      const descriptor = validateChatDescriptor(await descRes.json());
-      if (!descriptor || descriptor.id !== item.name) continue;
-      const dropsRes = await graphFetch(`${itemByPathUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/drops`)}?$select=id`);
-      const dropsItem = await dropsRes.json();
+      // The descriptor and the drops folder id are independent — ask for both at once.
+      const [descriptor, dropsItem] = await Promise.all([
+        graphFetch(contentUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/chat.json`))
+          .then(res => res.json())
+          .then(validateChatDescriptor),
+        graphFetch(`${itemByPathUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/drops`)}?$select=id`)
+          .then(res => res.json() as Promise<{ id?: string }>),
+      ]);
       const driveId = item.parentReference?.driveId;
-      if (!driveId || !dropsItem.id) continue;
-      records.push({
+      if (!descriptor || descriptor.id !== item.name || !driveId || !dropsItem.id) return null;
+      return {
         id: descriptor.id,
         name: descriptor.name,
         role: 'host',
         driveId,
         itemId: item.id,
-        dropsItemId: dropsItem.id as string,
+        dropsItemId: dropsItem.id,
         host: me,
         joinedAt: descriptor.createdAt,
         state: 'active',
-      });
-    } catch { /* skip a chat folder we can't read — it stays in ids, so it is not a removal */ }
-  }
+      };
+    } catch {
+      return null; // a chat folder we can't read — it stays in ids, so it is not a removal
+    }
+  });
+  for (const record of resolved) if (record) records.push(record);
   return { ids, records };
 }
 
@@ -503,17 +521,19 @@ export async function listHostChats(me: AuthorAttribution, skipChatIds?: Readonl
  */
 export async function listChatDrops(
   scope: ChatScope,
-  known: Map<string, string | undefined>,
-  stats?: PassCounts,
+  known: ReadonlyMap<string, string | undefined>,
+  opts: Pick<DeltaOptions, 'signal' | 'stats'> = {},
 ): Promise<DeltaResult> {
+  const { signal, stats } = opts;
   let url = `${GRAPH_BASE}/drives/${scope.driveId}/items/${scope.dropsItemId}/children?$select=id,name,file,eTag,@microsoft.graph.downloadUrl`;
   const upserts: DropRecord[] = [];
   const seen = new Set<string>();
 
   while (url) {
-    const res = await graphFetch(url, undefined, 'share');
+    const res = await graphFetch(url, { signal }, 'share');
     const data: { value: GraphChildItem[]; '@odata.nextLink'?: string } = await res.json();
     if (stats) stats.pages++;
+    const changed: Array<{ item: GraphChildItem; id: string }> = [];
     for (const item of data.value) {
       const name = item.name || '';
       if (!item.file || !name.endsWith('.json')) continue;
@@ -524,19 +544,20 @@ export async function listChatDrops(
         if (stats) stats.skipped++;
         continue;
       }
-      const parsed = await downloadJson(item, scope.driveId, 'share');
-      if (stats) {
-        stats.downloaded++;
-        if (!item['@microsoft.graph.downloadUrl']) stats.fallbacks++;
-      }
+      changed.push({ item, id });
+    }
+    const records = await mapLimited(changed, 6, async ({ item, id }) => {
+      const parsed = await downloadJson(item, scope.driveId, 'share', { signal, stats });
+      if (stats) stats.downloaded++;
       const meta = validateDropMeta(parsed, { expectedId: id, requireAuthor: true });
       if (!meta) {
-        console.debug('[Sync] Discarding malformed drop JSON: %s', name);
+        console.debug('[Sync] Discarding malformed drop JSON: %s', item.name);
         if (stats) stats.malformed++;
-        continue;
+        return null;
       }
-      upserts.push({ meta, eTag: item.eTag });
-    }
+      return { meta, eTag: item.eTag };
+    }, signal);
+    for (const record of records) if (record) upserts.push(record);
     url = data['@odata.nextLink'] || '';
   }
 
@@ -544,7 +565,7 @@ export async function listChatDrops(
   // NOT a fullResync: unchanged known drops are deliberately absent from
   // upserts (their bodies were never downloaded), so a scope-replacing
   // reconcile would wipe them. upserts + removals reconcile exactly.
-  return { upserts, removals, fullResync: false };
+  return { upserts, removals, fullResync: false, seenIds: seen };
 }
 
 /**
@@ -555,16 +576,16 @@ export async function listChatDrops(
 export async function runChatSync(
   scope: ChatScope,
   strategy: 'delta' | 'listing' | undefined,
-  known: Map<string, string | undefined>,
-  stats?: PassCounts,
+  known: ReadonlyMap<string, string | undefined>,
+  opts: DeltaOptions = {},
 ): Promise<{ result: DeltaResult; strategy: 'delta' | 'listing' }> {
   if (strategy !== 'listing') {
     try {
-      return { result: await runDelta(scope, { stats }), strategy: 'delta' };
+      return { result: await runDelta(scope, { ...opts, known }), strategy: 'delta' };
     } catch (err) {
       if (!isDeltaUnsupportedError(err)) throw err;
       console.debug('[Sync] Delta unsupported for chat %s — falling back to children listing', scope.chatId);
     }
   }
-  return { result: await listChatDrops(scope, known, stats), strategy: 'listing' };
+  return { result: await listChatDrops(scope, known, opts), strategy: 'listing' };
 }

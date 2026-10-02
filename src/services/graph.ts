@@ -15,7 +15,7 @@ import { getAccessToken, type TokenTier } from './auth';
 import { getSetting, putSetting, deleteSetting } from './db';
 import { validateDropMeta } from './validate-drop';
 import { counters, type PassCounts } from './sync-stats';
-import { mapLimited } from '../utils/limit';
+import { createLimiter, mapLimited } from '../utils/limit';
 import { scopeIdOf, type DeviceProfile, type DropMeta, type DropRecord, type Scope } from '../types';
 
 export const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
@@ -145,6 +145,91 @@ async function injectBodyFault(): Promise<void> {
   if (!import.meta.env.DEV) return;
   if (devFaults.bodyDelayMs > 0) await new Promise(r => setTimeout(r, devFaults.bodyDelayMs));
   if (Math.random() < devFaults.bodyFailRate) throw new TypeError('Injected network failure');
+}
+
+// ─── small JSON bodies ───
+
+/**
+ * A non-OK answer from OneDrive's content host to a pre-authenticated
+ * download. Kept apart from GraphHttpError on purpose: an expired download
+ * link (401/403/404) says nothing about access to a chat, so it must never
+ * count toward a chat being "gone" — the next pass simply mints fresh links.
+ * The link itself is never kept: it carries its own auth.
+ */
+export class DownloadError extends Error {
+  constructor(public status: number) {
+    super(`Download failed: ${status}`);
+  }
+}
+
+/** Every JSON body download, across all scopes, shares these slots. */
+const bodyLimiter = createLimiter(6);
+const BODY_RETRY_DELAYS_MS = [500, 2000];
+
+/** A dropped connection, a timeout or a server hiccup — worth a quick retry. */
+function isRetryableBodyError(err: unknown): boolean {
+  if (err instanceof DownloadError || err instanceof GraphHttpError) {
+    return err.status >= 500 && err.status !== 503;
+  }
+  if (err instanceof DOMException) return err.name === 'TimeoutError';
+  return err instanceof TypeError; // fetch's network failure
+}
+
+export interface JsonItem {
+  id: string;
+  '@microsoft.graph.downloadUrl'?: string;
+}
+
+/**
+ * Download one small JSON file (a drop, a device profile, a member file):
+ * through the item's pre-authenticated link when its listing carried one,
+ * else through Graph /content — a redirect plus a token, counted as a
+ * fallback in diagnostics. Transient failures retry twice; 429/503 surface
+ * as GraphHttpError so the coordinator's throttle gate applies.
+ */
+export function downloadItemJson(
+  item: JsonItem,
+  fallbackUrl: string,
+  tier: TokenTier,
+  opts: { signal?: AbortSignal; stats?: PassCounts } = {},
+): Promise<unknown> {
+  return bodyLimiter(async () => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fetchJsonBody(item, fallbackUrl, tier, opts);
+      } catch (err) {
+        const delay = BODY_RETRY_DELAYS_MS[attempt];
+        if (delay === undefined || opts.signal?.aborted || !isRetryableBodyError(err)) throw err;
+        if (opts.stats) opts.stats.retries++;
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }, opts.signal);
+}
+
+async function fetchJsonBody(
+  item: JsonItem,
+  fallbackUrl: string,
+  tier: TokenTier,
+  opts: { signal?: AbortSignal; stats?: PassCounts },
+): Promise<unknown> {
+  await injectBodyFault();
+  const link = item['@microsoft.graph.downloadUrl'];
+  if (!link) {
+    if (opts.stats) opts.stats.fallbacks++;
+    const res = await graphFetch(fallbackUrl, { signal: opts.signal }, tier);
+    return res.json();
+  }
+  const res = await storageFetch(link, { signal: jsonSignal(opts.signal) });
+  if (!res.ok) {
+    if (res.status === 429 || res.status === 503) {
+      counters.throttles++;
+      const retryAfter = parseInt(res.headers.get('Retry-After') ?? '', 10);
+      throw new GraphHttpError(res.status, 'content host', undefined, Number.isFinite(retryAfter) ? retryAfter : 30);
+    }
+    throw new DownloadError(res.status);
+  }
+  return res.json();
 }
 
 /**
@@ -322,18 +407,9 @@ export async function listDeviceProfiles(skipIfCTag?: string): Promise<DevicePro
     url = data['@odata.nextLink'] || '';
   }
 
-  const downloaded = await mapLimited(items, 4, async item => {
-    const downloadUrl =
-      item['@microsoft.graph.downloadUrl'] ||
-      `${GRAPH_BASE}/me/drive/items/${item.id}/content`;
-    const bodyRes = item['@microsoft.graph.downloadUrl']
-      ? await storageFetch(downloadUrl, { signal: jsonSignal() })
-      : await graphFetch(downloadUrl);
-    if (!bodyRes.ok) {
-      throw new GraphHttpError(bodyRes.status, downloadUrl, 'Device profile download failed');
-    }
-    return (await bodyRes.json()) as DeviceProfile;
-  });
+  const downloaded = await mapLimited(items, 4, async item =>
+    (await downloadItemJson(item, `${GRAPH_BASE}/me/drive/items/${item.id}/content`, 'base')) as DeviceProfile,
+  );
 
   const profiles = downloaded.filter(
     profile =>
@@ -501,11 +577,36 @@ export async function fetchThumbnail(scope: Scope, itemId: string): Promise<Blob
 
 // ─── delta sync ───
 
+export interface DeltaOptions {
+  stats?: PassCounts;
+  /**
+   * Drop id → eTag this device already holds. An upsert at the same eTag is
+   * not downloaded again — own sends, a resync after an expired token, and
+   * whatever an interrupted earlier attempt already committed.
+   */
+  known?: ReadonlyMap<string, string | undefined>;
+  /**
+   * Receives downloaded drops in newest-first batches while the pass runs,
+   * so the feed fills in as they arrive. Called one batch at a time; a batch
+   * that fails fails the pass. Drops not yet handed over when the pass
+   * completes come back in `upserts`, for the caller's final commit.
+   */
+  onBatch?: (records: DropRecord[]) => Promise<void>;
+  /** How many bodies the pass is about to download. */
+  onEnumerated?: (toDownload: number) => void;
+  signal?: AbortSignal;
+  /** Ignore the saved token — the restart after it expired. */
+  fromScratch?: boolean;
+}
+
 export interface DeltaResult {
+  /** Downloaded drops not already handed to `onBatch`. */
   upserts: DropRecord[];
   removals: string[];
-  /** True when the pass replaced the whole feed (caller should reconcile). */
+  /** True when the pass enumerated the whole feed (caller should reconcile). */
   fullResync: boolean;
+  /** Every drop id the pass found present: downloaded, or held at the same eTag. */
+  seenIds: Set<string>;
   /**
    * The token for the next pass. Returned, not saved: the caller commits it
    * in the same transaction as the drops it covers, so a token can never get
@@ -522,6 +623,17 @@ interface DeltaItem {
   eTag?: string;
   '@microsoft.graph.downloadUrl'?: string;
 }
+
+/** What the enumeration says should happen to one drop — its last word wins. */
+type DeltaOp =
+  | { kind: 'upsert'; itemId: string; eTag?: string; downloadUrl?: string }
+  | { kind: 'delete' };
+
+/** Bodies in flight per pass (the global body limiter also applies). */
+const DELTA_CONCURRENCY = 6;
+/** The first hand-over is small, so the screen fills quickly; later ones batch up. */
+const FIRST_BATCH = 10;
+const BATCH = 25;
 
 function deltaStartUrl(scope: Scope): string {
   return scope.kind === 'private'
@@ -546,32 +658,41 @@ export function isAccessLostError(err: unknown): boolean {
 }
 
 /**
- * Run a delta pass over a scope's drops folder. Returns the next delta token
- * only when every changed JSON body downloaded successfully, so a mid-pass
- * failure replays the page next time instead of losing changes.
+ * Run a delta pass over a scope's drops folder, in two phases:
+ *
+ * 1. Enumerate every page. Pages are small and few; walking them all first
+ *    means the whole change set is known before any body is fetched.
+ * 2. Download the bodies this device doesn't already hold, several at once
+ *    and newest first — drop ids are ULIDs, so the bottom of the feed (what
+ *    the user is looking at) fills in first — handing them to `onBatch` as
+ *    they arrive.
+ *
+ * The next delta token comes back only when every body downloaded, so a
+ * failure replays the changes next time instead of losing them. Batches
+ * already handed over stay committed, and the eTag skip means the retry
+ * fetches only what is still missing.
  *
  * A missing folder is an empty private feed, but for a chat it means access
  * was revoked or the chat deleted — that propagates to the caller.
  */
-export async function runDelta(
-  scope: Scope,
-  opts: { stats?: PassCounts; fromScratch?: boolean } = {},
-): Promise<DeltaResult> {
-  const stats = opts.stats;
+export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<DeltaResult> {
+  const { stats, known, signal } = opts;
   const tier = scopeTier(scope);
   const isChat = scope.kind === 'chat';
   const savedToken = opts.fromScratch ? undefined : await getSetting<string>(deltaTokenKey(scope));
-  let url = savedToken ?? deltaStartUrl(scope);
   const fullResync = !savedToken;
 
-  const upserts: DropRecord[] = [];
-  const removals: string[] = [];
-  let finalDeltaLink: string | undefined;
+  // ── 1. enumerate ──
+  // The same item can appear more than once across pages; the last
+  // occurrence is its current state.
+  const ops = new Map<string, DeltaOp>();
+  let url = savedToken ?? deltaStartUrl(scope);
+  let deltaLink: string | undefined;
 
   while (url) {
     let data: { value: DeltaItem[]; '@odata.nextLink'?: string; '@odata.deltaLink'?: string };
     try {
-      const res = await graphFetch(url, undefined, tier);
+      const res = await graphFetch(url, { signal }, tier);
       data = await res.json();
       if (stats) stats.pages++;
     } catch (err) {
@@ -584,57 +705,126 @@ export async function runDelta(
         }
         if (isChat) throw err; // revoked / deleted — the caller decides
         // Folder doesn't exist yet — empty feed, not an error
-        return { upserts: [], removals: [], fullResync };
+        return { upserts: [], removals: [], fullResync, seenIds: new Set() };
       }
       throw err;
     }
 
     for (const item of data.value) {
       const name = item.name || '';
+      if (!name.endsWith('.json')) continue;
+      const id = name.slice(0, -5);
       if (item.deleted) {
-        if (name.endsWith('.json')) {
-          removals.push(name.slice(0, -5));
-          if (stats) stats.enumerated++;
-        }
-        continue;
+        ops.set(id, { kind: 'delete' });
+      } else if (item.file) {
+        ops.set(id, {
+          kind: 'upsert',
+          itemId: item.id,
+          eTag: item.eTag,
+          downloadUrl: item['@microsoft.graph.downloadUrl'],
+        });
       }
-      if (!item.file || !name.endsWith('.json')) continue;
-      if (stats) stats.enumerated++;
-
-      // Prefer the pre-authenticated downloadUrl from the delta response —
-      // no extra token round-trip per item.
-      const fallbackUrl = scope.kind === 'private'
-        ? `${GRAPH_BASE}/me/drive/items/${item.id}/content`
-        : `${GRAPH_BASE}/drives/${scope.driveId}/items/${item.id}/content`;
-      const downloadUrl = item['@microsoft.graph.downloadUrl'] || fallbackUrl;
-      await injectBodyFault();
-      const bodyRes = item['@microsoft.graph.downloadUrl']
-        ? await storageFetch(downloadUrl, { signal: jsonSignal() })
-        : await graphFetch(downloadUrl, undefined, tier);
-      if (!bodyRes.ok) throw new GraphHttpError(bodyRes.status, downloadUrl, 'Drop JSON download failed');
-      if (stats) {
-        stats.downloaded++;
-        if (!item['@microsoft.graph.downloadUrl']) stats.fallbacks++;
-      }
-      const parsed: unknown = await bodyRes.json();
-      const meta = validateDropMeta(parsed, { expectedId: name.slice(0, -5), requireAuthor: isChat });
-      if (!meta) {
-        console.debug('[Sync] Discarding malformed drop JSON: %s', name);
-        if (stats) stats.malformed++;
-        continue;
-      }
-      upserts.push({ meta, eTag: item.eTag });
     }
 
     if (data['@odata.deltaLink']) {
-      finalDeltaLink = data['@odata.deltaLink'];
+      deltaLink = data['@odata.deltaLink'];
       url = '';
     } else {
       url = data['@odata.nextLink'] || '';
     }
   }
+  if (stats) stats.enumerated += ops.size;
 
-  return { upserts, removals, fullResync, deltaLink: finalDeltaLink };
+  const removals: string[] = [];
+  const seenIds = new Set<string>();
+  const pending: Array<{ id: string; itemId: string; eTag?: string; downloadUrl?: string }> = [];
+  for (const [id, op] of ops) {
+    if (op.kind === 'delete') {
+      removals.push(id);
+    } else if (op.eTag !== undefined && known?.get(id) === op.eTag) {
+      seenIds.add(id);
+      if (stats) stats.skipped++;
+    } else {
+      pending.push({ id, itemId: op.itemId, eTag: op.eTag, downloadUrl: op.downloadUrl });
+    }
+  }
+  pending.sort((a, b) => (a.id < b.id ? 1 : -1));
+  opts.onEnumerated?.(pending.length);
+
+  // ── 2. download, newest first ──
+  let ready: DropRecord[] = [];
+  let handedOver = 0;
+  let handing: Promise<void> = Promise.resolve();
+  const failure: { failed: boolean; error?: unknown; commitFailed: boolean } = { failed: false, commitFailed: false };
+  const fail = (error: unknown) => {
+    if (failure.failed) return;
+    failure.failed = true;
+    failure.error = error;
+  };
+
+  /**
+   * Hand finished drops to the caller, one batch at a time. After a batch
+   * fails to commit, nothing more is handed over; after a download fails,
+   * what did arrive still is.
+   */
+  const handOver = (final: boolean) => {
+    if (!opts.onBatch || ready.length === 0) return;
+    if (!final && ready.length < (handedOver === 0 ? FIRST_BATCH : BATCH)) return;
+    const batch = ready;
+    ready = [];
+    handedOver += batch.length;
+    const onBatch = opts.onBatch;
+    handing = handing
+      .then(() => (failure.commitFailed ? undefined : onBatch(batch)))
+      .catch(err => {
+        failure.commitFailed = true;
+        fail(err);
+      });
+  };
+
+  try {
+    await mapLimited(
+      pending,
+      DELTA_CONCURRENCY,
+      async op => {
+        // A batch that failed to commit fails the pass — stop fetching.
+        if (failure.commitFailed) throw failure.error;
+        const fallbackUrl = scope.kind === 'private'
+          ? `${GRAPH_BASE}/me/drive/items/${op.itemId}/content`
+          : `${GRAPH_BASE}/drives/${scope.driveId}/items/${op.itemId}/content`;
+        const parsed = await downloadItemJson(
+          { id: op.itemId, '@microsoft.graph.downloadUrl': op.downloadUrl },
+          fallbackUrl,
+          tier,
+          { signal, stats },
+        );
+        if (stats) stats.downloaded++;
+        const meta = validateDropMeta(parsed, { expectedId: op.id, requireAuthor: isChat });
+        if (!meta) {
+          console.debug('[Sync] Discarding malformed drop JSON: %s.json', op.id);
+          if (stats) stats.malformed++;
+          return;
+        }
+        seenIds.add(op.id);
+        ready.push({ meta, eTag: op.eTag });
+        handOver(false);
+      },
+      signal,
+    );
+  } catch (err) {
+    fail(err);
+  }
+
+  if (failure.failed) {
+    // Keep what did arrive: those drops are real server state, and the next
+    // attempt skips them by eTag instead of fetching them again.
+    handOver(true);
+    await handing;
+    throw failure.error;
+  }
+  await handing;
+  if (failure.failed) throw failure.error;
+  return { upserts: ready, removals, fullResync, seenIds, deltaLink };
 }
 
 export function clearDeltaToken(scope: Scope): Promise<void> {
