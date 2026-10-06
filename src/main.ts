@@ -215,18 +215,59 @@ async function attemptAutoRedirect(app: HTMLElement): Promise<void> {
   }
 }
 
+/** Another tab signed this account out: this page shows the sign-in screen and does nothing more. */
+let signedOutElsewhere = false;
+
+/** Stop this page and put the sign-in screen up — whatever it was in the middle of drawing. */
+function showSignedOutElsewhere(app: HTMLElement): void {
+  teardownScreenListeners();
+  chatUiTeardown?.();
+  chatUiTeardown = null;
+  renderSignIn(app, () => location.reload());
+}
+
 /** Transition to the main app: routing, share target, and resume handler. */
 async function enterApp(app: HTMLElement): Promise<void> {
   initBroadcast();
+  // Subscribed first, before any await: another tab signing out, or
+  // re-syncing from scratch, must not be missed while this one is still
+  // starting up. Either way this page's view of local storage is superseded
+  // and its writes are refused (see the store epoch in db.ts), so it must
+  // not carry on as it was.
+  onBroadcast(event => {
+    if (event.type === 'auth-changed' && !event.signedIn) {
+      // Not a reload: the other tab's logout may not have cleared the token
+      // cache yet, and a reload would boot straight back into this account.
+      signedOutElsewhere = true;
+      coordinator.shutdown();
+      // This tab's backup hooks (pagehide, going hidden) are still armed and
+      // the token cache is still in localStorage until that logout finishes:
+      // a backup from here would recreate the snapshot sign-out just deleted.
+      void clearMsalCacheBackup();
+      showSignedOutElsewhere(app);
+    } else if (event.type === 'store-reset') {
+      location.reload();
+    }
+  });
   postBroadcast({ type: 'auth-changed', signedIn: true });
-  // Before anything reads the store: data left by a different account goes.
-  const accountId = getAccountId();
-  if (accountId) await coordinator.claimStoreFor(accountId);
-  await route(app);
-  window.addEventListener('hashchange', () => void route(app));
-  // Anything a consent redirect / sign-in / iOS sheet interrupted.
-  await resumePendingAction();
-  await handleShareTarget();
+  try {
+    // Before anything reads the store: data left by a different account goes.
+    const accountId = getAccountId();
+    if (accountId) await coordinator.claimStoreFor(accountId);
+    await route(app);
+    window.addEventListener('hashchange', () => void route(app));
+    // Anything a consent redirect / sign-in / iOS sheet interrupted.
+    if (!signedOutElsewhere) await resumePendingAction();
+    if (!signedOutElsewhere) await handleShareTarget();
+  } catch (err) {
+    // Once another tab has signed out, storage refuses this page's writes.
+    // A start-up step failing on that is expected, not a failed boot.
+    if (!signedOutElsewhere) throw err;
+  }
+  if (signedOutElsewhere) {
+    showSignedOutElsewhere(app);
+    return;
+  }
   setupResumeHandler();
   setupBackgroundBackup();
   // Warm the author identity, land any registry write a previous session
@@ -234,27 +275,6 @@ async function enterApp(app: HTMLElement): Promise<void> {
   // account has elsewhere (hosted folders + roaming pointers).
   void coordinator.ensureMe();
   void coordinator.catchUpRegistry();
-
-  // Another tab signed out, or re-synced from scratch. Either way this
-  // page's view of local storage is superseded and its writes are refused
-  // (see the store epoch in db.ts), so it must not carry on as it was.
-  onBroadcast(event => {
-    if (event.type === 'auth-changed' && !event.signedIn) {
-      // Not a reload: the other tab's logout may not have cleared the token
-      // cache yet, and a reload would boot straight back into this account.
-      coordinator.shutdown();
-      // This tab's backup hooks (pagehide, going hidden) are still armed and
-      // the token cache is still in localStorage until that logout finishes:
-      // a backup from here would recreate the snapshot sign-out just deleted.
-      void clearMsalCacheBackup();
-      teardownScreenListeners();
-      chatUiTeardown?.();
-      chatUiTeardown = null;
-      renderSignIn(app, () => location.reload());
-    } else if (event.type === 'store-reset') {
-      location.reload();
-    }
-  });
 
   // A notification tap on an already-open window arrives as a worker
   // message — route to the scope it named.
@@ -279,6 +299,7 @@ let restoredActiveScope = false;
 let chatUiTeardown: (() => void) | null = null;
 
 async function route(app: HTMLElement): Promise<void> {
+  if (signedOutElsewhere) return;
   const rawHash = location.hash.slice(1);
 
   if (rawHash.startsWith('join=')) {
@@ -314,6 +335,12 @@ async function route(app: HTMLElement): Promise<void> {
 
   await coordinator.setActiveScopeId(scopeIdOf(scope));
   await renderFeed(app, { openSettings: hash === 'settings', scope });
+  // The sign-out arrived while the feed was being drawn: the feed may have
+  // been painted over the sign-in screen, so put that back.
+  if (signedOutElsewhere) {
+    showSignedOutElsewhere(app);
+    return;
+  }
   chatUiTeardown = mountChatUi(app, scopeIdOf(scope));
 }
 

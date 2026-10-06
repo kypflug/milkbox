@@ -103,29 +103,42 @@ export function ensureMe(): Promise<AuthorAttribution | null> {
 }
 
 const STORE_OWNER_KEY = 'milkbox:owner';
+/** The owner marker a sign-out wipe leaves behind: nobody's, and not to be adopted. */
+const SIGNED_OUT = 'signed-out';
+
+/**
+ * The sign-out wipe. It leaves a marker saying the store was emptied on
+ * purpose, so anything found in it later was written behind the wipe's back
+ * — a tab still on an older build can do that; the store epoch only stops
+ * current ones — and is cleared, not adopted, when the next account arrives.
+ */
+export function wipeForSignOut(): Promise<void> {
+  return db.clearAllData({ settings: [[STORE_OWNER_KEY, SIGNED_OUT]] });
+}
 
 /**
  * Local data belongs to one account. Called as the app is entered, before
- * anything reads the store: if what is stored was left by a different
- * account, it is wiped first.
+ * anything reads the store: if what is stored was not left by this account,
+ * it is wiped first. So whatever a failed wipe or an older build left
+ * behind, the next account never sees it, and queued sends from the last
+ * one are never uploaded to this one's OneDrive.
  *
- * Sign-out already wipes, and the store epoch keeps current builds from
- * writing afterwards — but neither can stop a tab still running an older
- * build, and a wipe can fail. This is the backstop that does not depend on
- * either: whatever was left behind, the next account never sees it (nor do
- * queued sends from the last one get uploaded to this one's OneDrive).
- * Signing back in to the same account keeps what is there; a full pass
- * reconciles it.
+ * - Marked as this account's: kept. (Signing back in to the same account
+ *   after a failed wipe keeps what is there; a full pass reconciles it.)
+ * - Marked as another account's, or as signed out: wiped.
+ * - No marker at all: an install from before the marker existed, whose
+ *   data is the signed-in account's — adopted as it is.
  */
 export async function claimStoreFor(accountId: string): Promise<void> {
   const owner = await db.getSetting<string>(STORE_OWNER_KEY);
   if (owner === accountId) return;
-  if (owner !== undefined) {
-    console.info('[Sync] Local data belongs to another account — clearing it');
-    await db.clearAllData({ adopt: true });
-    mePromise = null;
+  if (owner === undefined) {
+    await db.putSetting(STORE_OWNER_KEY, accountId);
+    return;
   }
-  await db.putSetting(STORE_OWNER_KEY, accountId);
+  console.info('[Sync] Local data is not this account’s — clearing it');
+  await db.clearAllData({ adopt: true, settings: [[STORE_OWNER_KEY, accountId]] });
+  mePromise = null;
 }
 
 // ─── scopes ───
@@ -602,6 +615,9 @@ async function runDevicesPhase(): Promise<{ ms: number; count?: number }> {
     if (synced.cTag) await graph.markDeviceRegistryClean(synced.cTag);
     return { ms: performance.now() - t0, count: synced.count };
   } catch (err) {
+    // Optional work, but a throttle is a throttle: it still raises the gate
+    // every other request path honours.
+    noteThrottle(err);
     console.warn('[Sync] Device profile sync failed; drops sync on:', err);
     return { ms: performance.now() - t0 };
   }

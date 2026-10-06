@@ -586,14 +586,20 @@ export async function resetScopeStore(scopeId: ScopeId, settingsKeys: string[]):
  *
  * `adopt` is for a page that carries on afterwards: the boot-time wipe when
  * a different account signs in over leftovers from the last one.
+ *
+ * `settings` are written into the emptied store in the same transaction —
+ * the marker saying who (or that nobody) owns what is stored from here on.
  */
-export async function clearAllData(opts: { adopt?: boolean } = {}): Promise<void> {
+export async function clearAllData(
+  opts: { adopt?: boolean; settings?: Array<[string, unknown]> } = {},
+): Promise<void> {
   const db = await openDb();
   const stores = ['drops', 'thumbs', 'blobs', 'outbox', 'devices', 'chats', 'settings'];
   return new Promise((resolve, reject) => {
     const t = db.transaction(stores, 'readwrite');
     for (const s of stores) t.objectStore(s).clear();
     renewEpoch(t, opts.adopt === true);
+    for (const [key, value] of opts.settings ?? []) t.objectStore('settings').put(value, key);
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);

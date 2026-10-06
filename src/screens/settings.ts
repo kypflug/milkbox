@@ -1,11 +1,10 @@
 import { getUserDisplayName, getUserEmail, signOut } from '../services/auth';
 import { getDeviceName } from '../services/device';
 import { getTheme, applyTheme } from '../theme';
-import { clearAllData } from '../services/db';
 import { escapeAttr, escapeHtml } from '../utils/storage';
 import { showToast } from '../components/toast';
 import { iconClose } from '../components/icons';
-import { renameCurrentDevice, resetScope, shutdown } from '../services/sync-coordinator';
+import { renameCurrentDevice, resetScope, shutdown, wipeForSignOut } from '../services/sync-coordinator';
 import { getDiagnostics, type Diagnostics, type PassStats } from '../services/sync-stats';
 import { postBroadcast } from '../services/broadcast';
 import {
@@ -303,7 +302,7 @@ export function mountSettingsFlyout(
       shutdown();
       postBroadcast({ type: 'auth-changed', signedIn: false });
       try {
-        await clearAllData();
+        await wipeForSignOut();
       } catch (err) {
         console.warn('Failed to clear local data during sign-out:', err);
       }
