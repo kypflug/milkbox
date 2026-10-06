@@ -577,18 +577,23 @@ export async function resetScopeStore(scopeId: ScopeId, settingsKeys: string[]):
 }
 
 /**
- * Wipe all local data (sign-out) and start a new epoch. This page does not
- * adopt it: from here on its own late writes — and those of every other tab
- * still open on the old account — are refused, so nothing of that account
- * can land after the wipe. The page is on its way out (or reloads).
+ * Wipe all local data and start a new epoch.
+ *
+ * At sign-out (the default) this page does not adopt the new epoch: from
+ * here on its own late writes — and those of every other tab still open on
+ * the old account — are refused, so nothing of that account can land after
+ * the wipe. The page is on its way out (or reloads).
+ *
+ * `adopt` is for a page that carries on afterwards: the boot-time wipe when
+ * a different account signs in over leftovers from the last one.
  */
-export async function clearAllData(): Promise<void> {
+export async function clearAllData(opts: { adopt?: boolean } = {}): Promise<void> {
   const db = await openDb();
   const stores = ['drops', 'thumbs', 'blobs', 'outbox', 'devices', 'chats', 'settings'];
   return new Promise((resolve, reject) => {
     const t = db.transaction(stores, 'readwrite');
     for (const s of stores) t.objectStore(s).clear();
-    renewEpoch(t, false);
+    renewEpoch(t, opts.adopt === true);
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);

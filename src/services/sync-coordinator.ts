@@ -102,6 +102,32 @@ export function ensureMe(): Promise<AuthorAttribution | null> {
   return mePromise;
 }
 
+const STORE_OWNER_KEY = 'milkbox:owner';
+
+/**
+ * Local data belongs to one account. Called as the app is entered, before
+ * anything reads the store: if what is stored was left by a different
+ * account, it is wiped first.
+ *
+ * Sign-out already wipes, and the store epoch keeps current builds from
+ * writing afterwards — but neither can stop a tab still running an older
+ * build, and a wipe can fail. This is the backstop that does not depend on
+ * either: whatever was left behind, the next account never sees it (nor do
+ * queued sends from the last one get uploaded to this one's OneDrive).
+ * Signing back in to the same account keeps what is there; a full pass
+ * reconciles it.
+ */
+export async function claimStoreFor(accountId: string): Promise<void> {
+  const owner = await db.getSetting<string>(STORE_OWNER_KEY);
+  if (owner === accountId) return;
+  if (owner !== undefined) {
+    console.info('[Sync] Local data belongs to another account — clearing it');
+    await db.clearAllData({ adopt: true });
+    mePromise = null;
+  }
+  await db.putSetting(STORE_OWNER_KEY, accountId);
+}
+
 // ─── scopes ───
 
 export function chatScopeOf(record: ChatRecord): ChatScope {
@@ -1113,6 +1139,11 @@ export async function resetScope(scope: Scope): Promise<void> {
     // for drops that are no longer here). Those tabs are told to reload.
     await db.resetScopeStore(scopeId, [...graph.syncStateKeys(scope), notifyPrimedKey(scopeId)]);
     postBroadcast({ type: 'store-reset' });
+    // The pass below enumerates everything whatever token it finds. The
+    // epoch stops current builds, but a tab still on an older build could
+    // write its own (now meaningless) token back before this pass reads it,
+    // and an incremental pass from there would skip nearly every drop.
+    st.forceFull = true;
   } finally {
     resettingScopes.delete(scopeId);
   }

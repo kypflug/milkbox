@@ -1,5 +1,5 @@
-import { initAuth, isSignedIn, tryRecoverAuth, refreshTokenOnResume, hasAccountHint, signInWithHint } from './services/auth';
-import { restoreMsalCacheIfNeeded, setupBackgroundBackup } from './services/msal-cache-backup';
+import { getAccountId, initAuth, isSignedIn, tryRecoverAuth, refreshTokenOnResume, hasAccountHint, signInWithHint } from './services/auth';
+import { clearMsalCacheBackup, restoreMsalCacheIfNeeded, setupBackgroundBackup } from './services/msal-cache-backup';
 import { initBroadcast, onBroadcast, postBroadcast } from './services/broadcast';
 import { drainShareInbox } from './services/share-inbox';
 import * as coordinator from './services/sync-coordinator';
@@ -219,6 +219,9 @@ async function attemptAutoRedirect(app: HTMLElement): Promise<void> {
 async function enterApp(app: HTMLElement): Promise<void> {
   initBroadcast();
   postBroadcast({ type: 'auth-changed', signedIn: true });
+  // Before anything reads the store: data left by a different account goes.
+  const accountId = getAccountId();
+  if (accountId) await coordinator.claimStoreFor(accountId);
   await route(app);
   window.addEventListener('hashchange', () => void route(app));
   // Anything a consent redirect / sign-in / iOS sheet interrupted.
@@ -240,6 +243,10 @@ async function enterApp(app: HTMLElement): Promise<void> {
       // Not a reload: the other tab's logout may not have cleared the token
       // cache yet, and a reload would boot straight back into this account.
       coordinator.shutdown();
+      // This tab's backup hooks (pagehide, going hidden) are still armed and
+      // the token cache is still in localStorage until that logout finishes:
+      // a backup from here would recreate the snapshot sign-out just deleted.
+      void clearMsalCacheBackup();
       teardownScreenListeners();
       chatUiTeardown?.();
       chatUiTeardown = null;

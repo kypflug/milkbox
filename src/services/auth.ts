@@ -355,6 +355,11 @@ export function isSignedIn(): boolean {
   return getAccount() !== null;
 }
 
+/** A stable id for the signed-in account — what local data is bound to. */
+export function getAccountId(): string | null {
+  return getAccount()?.homeAccountId ?? null;
+}
+
 export function getUserDisplayName(): string {
   const account = getAccount();
   return account?.name || account?.username || '';
