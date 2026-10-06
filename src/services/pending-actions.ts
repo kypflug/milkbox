@@ -10,7 +10,9 @@
 
 import { deleteSetting, getSetting, putSetting } from './db';
 
-const KEY = 'milkbox:pending-action';
+/** Exported for the one caller that has to carry the record across a store wipe. */
+export const PENDING_ACTION_KEY = 'milkbox:pending-action';
+const KEY = PENDING_ACTION_KEY;
 const STALE_MS = 15 * 60_000;
 
 export type PendingAction =

@@ -33,6 +33,7 @@ import * as notify from './notify';
 import { ConsentRequiredError } from './auth';
 import { postBroadcast } from './broadcast';
 import { errorLabel, newPassCounts, recordPass, requestCount, type PassStats } from './sync-stats';
+import { PENDING_ACTION_KEY, getPendingAction } from './pending-actions';
 import {
   deferRegistryOp,
   enqueueRegistryOp,
@@ -128,6 +129,10 @@ export function wipeForSignOut(): Promise<void> {
  * - Marked as another account's, or as signed out: wiped.
  * - No marker at all: an install from before the marker existed, whose
  *   data is the signed-in account's — adopted as it is.
+ *
+ * One thing survives the wipe of a signed-out store: an invite opened while
+ * signed out, which is parked there until sign-in and belongs to whoever
+ * signs in next. A join parked under another account goes with its data.
  */
 export async function claimStoreFor(accountId: string): Promise<void> {
   const owner = await db.getSetting<string>(STORE_OWNER_KEY);
@@ -137,7 +142,12 @@ export async function claimStoreFor(accountId: string): Promise<void> {
     return;
   }
   console.info('[Sync] Local data is not this account’s — clearing it');
-  await db.clearAllData({ adopt: true, settings: [[STORE_OWNER_KEY, accountId]] });
+  const keep: Array<[string, unknown]> = [[STORE_OWNER_KEY, accountId]];
+  if (owner === SIGNED_OUT) {
+    const pending = await getPendingAction();
+    if (pending?.type === 'join') keep.push([PENDING_ACTION_KEY, pending]);
+  }
+  await db.clearAllData({ adopt: true, settings: keep });
   mePromise = null;
 }
 
