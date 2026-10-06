@@ -319,6 +319,10 @@ export async function renderFeed(
     if (!file || !itemId || coordinator.isThrottled()) return undefined;
     try {
       return await thumbLimiter(async () => {
+        // Checked again now that this preview has a slot: it may have been
+        // queued before another one's 429 raised the gate. Reported as a
+        // miss, the caller sweeps again once the gate lifts.
+        if (coordinator.isThrottled()) return undefined;
         const fetched = await fetchThumbnail(scope, itemId);
         if (fetched) {
           await db.putThumb(scopeId, id, fetched).catch(() => {});

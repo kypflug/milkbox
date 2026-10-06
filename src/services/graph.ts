@@ -49,8 +49,27 @@ export const PAGE_TIMEOUT_MS = 60_000;
  */
 const THUMBNAIL_TIMEOUT_MS = 60_000;
 
-/** A signal that aborts after the JSON timeout (or `ms`), or when `outer` does. */
-export function jsonSignal(outer?: AbortSignal, ms = JSON_TIMEOUT_MS): AbortSignal {
+/**
+ * A time limit for one request, response body included.
+ *
+ * fetch() resolves as soon as the headers arrive, so the limit has to cover
+ * reading the body too — and a read cut short by it does not reliably say
+ * so: it can reject with a bare AbortError rather than the TimeoutError the
+ * signal was aborted with. `fail` settles that in one place.
+ */
+interface Deadline {
+  signal: AbortSignal;
+  /**
+   * Rethrow `err` — as a TimeoutError, counted for diagnostics, when this
+   * deadline is what ended the request. The retry logic treats a timeout as
+   * transient; an unexplained abort it would not.
+   */
+  fail(err: unknown): never;
+}
+
+/** A deadline of `ms` (the JSON timeout by default) that `outer` can also end early. */
+function deadline(outer?: AbortSignal | null, ms = JSON_TIMEOUT_MS): Deadline {
+  if (import.meta.env.DEV && devFaults.timeoutMs > 0) ms = devFaults.timeoutMs;
   let timeout: AbortSignal;
   if (typeof AbortSignal.timeout === 'function') {
     timeout = AbortSignal.timeout(ms);
@@ -59,20 +78,29 @@ export function jsonSignal(outer?: AbortSignal, ms = JSON_TIMEOUT_MS): AbortSign
     setTimeout(() => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')), ms);
     timeout = controller.signal;
   }
-  if (!outer) return timeout;
-  if (typeof AbortSignal.any === 'function') return AbortSignal.any([outer, timeout]);
-  const combined = new AbortController();
-  const forward = (signal: AbortSignal) => () => combined.abort(signal.reason);
-  if (outer.aborted) combined.abort(outer.reason);
-  outer.addEventListener('abort', forward(outer), { once: true });
-  timeout.addEventListener('abort', forward(timeout), { once: true });
-  return combined.signal;
-}
-
-/** Count timeouts for diagnostics on the way past; the error is rethrown unchanged. */
-function noteTimeout(err: unknown): never {
-  if (err instanceof DOMException && err.name === 'TimeoutError') counters.timeouts++;
-  throw err;
+  let signal = timeout;
+  if (outer) {
+    if (typeof AbortSignal.any === 'function') {
+      signal = AbortSignal.any([outer, timeout]);
+    } else {
+      const combined = new AbortController();
+      const forward = (from: AbortSignal) => () => combined.abort(from.reason);
+      if (outer.aborted) combined.abort(outer.reason);
+      outer.addEventListener('abort', forward(outer), { once: true });
+      timeout.addEventListener('abort', forward(timeout), { once: true });
+      signal = combined.signal;
+    }
+  }
+  return {
+    signal,
+    fail(err) {
+      if (timeout.aborted && !outer?.aborted) {
+        counters.timeouts++;
+        throw new DOMException('The operation timed out.', 'TimeoutError');
+      }
+      throw err;
+    },
+  };
 }
 
 /** Simple PUT limit — Graph requires upload sessions above 4 MB. */
@@ -111,15 +139,25 @@ export interface GraphInit extends RequestInit {
   timeoutMs?: number;
 }
 
+/** Statuses whose responses carry no body (and may not be rebuilt with one). */
+const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
+
 export async function graphFetch(url: string, init?: GraphInit, tier: TokenTier = 'base'): Promise<Response> {
   const headers = await authHeaders(tier);
   counters.graph++;
   const { noTimeout, timeoutMs, ...request } = init ?? {};
-  const res = await fetch(url, {
-    ...request,
-    signal: noTimeout ? request.signal : jsonSignal(request.signal ?? undefined, timeoutMs),
-    headers: { ...headers, ...(request.headers as Record<string, string> | undefined) },
-  }).catch(noteTimeout);
+  const limit: Deadline | null = noTimeout ? null : deadline(request.signal, timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...request,
+      signal: limit ? limit.signal : request.signal,
+      headers: { ...headers, ...(request.headers as Record<string, string> | undefined) },
+    });
+  } catch (err) {
+    if (limit) limit.fail(err);
+    throw err;
+  }
   if (!res.ok) {
     if (res.status === 429 || res.status === 503) counters.throttles++;
     const retryAfter = res.headers.get('Retry-After');
@@ -130,17 +168,43 @@ export async function graphFetch(url: string, init?: GraphInit, tier: TokenTier 
       retryAfter ? parseInt(retryAfter, 10) : undefined,
     );
   }
-  return res;
+  if (!limit) return res;
+  // Read the body here, under the same limit, and hand back a response that
+  // already holds it: callers go on to res.json() and the like, and a stall
+  // there would be outside anything that could time it, count it or retry it.
+  try {
+    const body = await res.arrayBuffer();
+    return new Response(NULL_BODY_STATUS.has(res.status) ? null : body, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: res.headers,
+    });
+  } catch (err) {
+    return limit.fail(err);
+  }
 }
 
 /**
  * Fetch from OneDrive's content host — a pre-authenticated download or
- * upload-session URL, so no token. Counted apart from Graph calls. Callers
- * fetching JSON pass `jsonSignal()`; upload chunks run untimed.
+ * upload-session URL, so no token. Counted apart from Graph calls. Untimed:
+ * upload chunks use it as is, and reads that want a limit go through
+ * storageRead.
  */
 export function storageFetch(url: string, init?: RequestInit): Promise<Response> {
   counters.storage++;
-  return fetch(url, init).catch(noteTimeout);
+  return fetch(url, init);
+}
+
+/**
+ * Fetch from the content host and consume the response with `read`, all of
+ * it under one deadline — the body as much as the headers.
+ */
+async function storageRead<T>(url: string, limit: Deadline, read: (res: Response) => Promise<T>): Promise<T> {
+  try {
+    return await read(await storageFetch(url, { signal: limit.signal }));
+  } catch (err) {
+    limit.fail(err);
+  }
 }
 
 // ─── DEV fault injection ───
@@ -150,7 +214,12 @@ export function storageFetch(url: string, init?: RequestInit): Promise<Response>
  * and retried passes on a desktop. Driven from window.__milkboxChatDev; the
  * hook below compiles to nothing in production builds.
  */
-const devFaults = { bodyFailRate: 0, bodyDelayMs: 0 };
+const devFaults = {
+  bodyFailRate: 0,
+  bodyDelayMs: 0,
+  /** Replaces every request time limit, so timeouts can be tested without waiting for them. */
+  timeoutMs: 0,
+};
 
 export function setDevFaults(faults: Partial<typeof devFaults>): void {
   Object.assign(devFaults, faults);
@@ -235,12 +304,14 @@ async function fetchJsonBody(
     const res = await graphFetch(fallbackUrl, { signal: opts.signal }, tier);
     return parseJsonBody(await res.text());
   }
-  const res = await storageFetch(link, { signal: jsonSignal(opts.signal) });
-  if (!res.ok) {
-    if (res.status === 429 || res.status === 503) throw contentThrottleError(res);
-    throw new DownloadError(res.status);
-  }
-  return parseJsonBody(await res.text());
+  const text = await storageRead(link, deadline(opts.signal), async res => {
+    if (!res.ok) {
+      if (res.status === 429 || res.status === 503) throw contentThrottleError(res);
+      throw new DownloadError(res.status);
+    }
+    return res.text();
+  });
+  return parseJsonBody(text);
 }
 
 /**
@@ -608,12 +679,13 @@ export async function fetchThumbnail(scope: Scope, itemId: string): Promise<Blob
     );
     const data = await res.json();
     if (!data.url) return null;
-    const imgRes = await storageFetch(data.url, { signal: jsonSignal(undefined, THUMBNAIL_TIMEOUT_MS) });
-    // Throttled is not "no thumbnail": reporting it as a miss would send the
-    // caller off to download the full image, the opposite of backing off.
-    if (imgRes.status === 429 || imgRes.status === 503) throw contentThrottleError(imgRes);
-    if (!imgRes.ok) return null;
-    return imgRes.blob();
+    return await storageRead(data.url, deadline(undefined, THUMBNAIL_TIMEOUT_MS), async imgRes => {
+      // Throttled is not "no thumbnail": reporting it as a miss would send
+      // the caller off to download the full image, the opposite of backing off.
+      if (imgRes.status === 429 || imgRes.status === 503) throw contentThrottleError(imgRes);
+      if (!imgRes.ok) return null;
+      return imgRes.blob();
+    });
   } catch (err) {
     if (isGoneError(err)) return null;
     throw err;
