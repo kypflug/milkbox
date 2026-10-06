@@ -257,7 +257,9 @@ export async function signOut(): Promise<boolean> {
   if (!account) return false;
 
   clearAccountHint();
-  clearMsalCacheBackup().catch(() => {});
+  // Awaited: the delete has to be committed before the redirect unloads the
+  // page, or the next boot would restore the snapshot it was meant to remove.
+  await clearMsalCacheBackup();
 
   await msal.logoutRedirect({
     account,

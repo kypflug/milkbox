@@ -32,20 +32,72 @@ const V3_SETTINGS_RENAMES: ReadonlyArray<[string, string]> = [
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
-/**
- * Set at sign-out, before the wipe: from then on every write is refused
- * except clearAllData itself, so a sync batch still in flight can't land
- * the old account's drops after the store was cleared.
- */
-let writesClosed = false;
+// ─── store epoch ───
 
-export function closeWrites(): void {
-  writesClosed = true;
+const EPOCH_KEY = 'milkbox:epoch';
+
+/**
+ * The store's epoch as this page first found it (null when none has been
+ * stored yet; undefined until the database is open).
+ *
+ * Sign-out and "Re-sync from scratch" start a new epoch. Every write then
+ * checks, inside its own transaction, that the store is still on the epoch
+ * its page knows, and is refused otherwise. So a pass that was mid-download
+ * — in this tab or any other — when the store was wiped cannot write the old
+ * state back afterwards, whether or not word of the wipe ever reached it.
+ */
+let pageEpoch: string | null | undefined;
+
+/** A write from a page whose view of local storage has been superseded. */
+export class StaleStoreError extends Error {
+  constructor() {
+    super('Local storage was reset by another action — this page is out of date');
+    this.name = 'StaleStoreError';
+  }
 }
 
-/** Called right before a write transaction opens — nothing can slip in between. */
-function assertWritable(): void {
-  if (writesClosed) throw new Error('Storage is closed for sign-out');
+/** Start a new epoch inside `t`. `adopt` keeps this page current with it. */
+function renewEpoch(t: IDBTransaction, adopt: boolean): void {
+  const previous = pageEpoch;
+  const next = crypto.randomUUID();
+  const put = t.objectStore('settings').put(next, EPOCH_KEY);
+  if (!adopt) return;
+  put.onsuccess = () => {
+    pageEpoch = next;
+  };
+  t.addEventListener('abort', () => {
+    pageEpoch = previous;
+  });
+}
+
+/**
+ * Run `body` in one readwrite transaction over `stores`, once the epoch
+ * check has passed in that same transaction. Resolves with the result of
+ * the request `body` returns, if any.
+ */
+function write<T = void>(
+  db: IDBDatabase,
+  stores: string[],
+  body: (t: IDBTransaction) => IDBRequest<T> | void,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = db.transaction([...new Set([...stores, 'settings'])], 'readwrite');
+    let result: T;
+    let stale = false;
+    const epoch = t.objectStore('settings').get(EPOCH_KEY);
+    epoch.onsuccess = () => {
+      if ((epoch.result ?? null) !== pageEpoch) {
+        stale = true;
+        t.abort();
+        return;
+      }
+      const req = body(t);
+      if (req) req.onsuccess = () => { result = req.result; };
+    };
+    t.oncomplete = () => resolve(result);
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(stale ? new StaleStoreError() : t.error);
+  });
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -128,13 +180,29 @@ function openDb(): Promise<IDBDatabase> {
         req.result.close();
         return;
       }
-      req.result.onversionchange = () => {
+      const db = req.result;
+      db.onversionchange = () => {
         // A newer build in another tab is upgrading — release the connection
         // and drop the memoized promise so our next access reopens cleanly.
-        req.result.close();
+        db.close();
         dbPromise = null;
       };
-      resolve(req.result);
+      // Learn the store's epoch once, before anything can write. A reopen
+      // keeps the one this page already knows — reopening must not make a
+      // stale page current.
+      if (pageEpoch !== undefined) {
+        resolve(db);
+        return;
+      }
+      const epoch = db.transaction('settings', 'readonly').objectStore('settings').get(EPOCH_KEY);
+      epoch.onsuccess = () => {
+        pageEpoch = (epoch.result as string | undefined) ?? null;
+        resolve(db);
+      };
+      epoch.onerror = () => {
+        dbPromise = null;
+        reject(epoch.error);
+      };
     };
     req.onerror = () => {
       dbPromise = null;
@@ -149,10 +217,12 @@ function tx<T>(
   mode: IDBTransactionMode,
   fn: (store: IDBObjectStore) => IDBRequest<T> | void,
 ): Promise<T> {
+  if (mode === 'readwrite') {
+    return openDb().then(db => write<T>(db, [store], t => fn(t.objectStore(store))));
+  }
   return openDb().then(
     db =>
       new Promise<T>((resolve, reject) => {
-        if (mode === 'readwrite') assertWritable();
         const t = db.transaction(store, mode);
         const req = fn(t.objectStore(store));
         let result: T;
@@ -231,12 +301,10 @@ export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): P
   const db = await openDb();
   const chatId = scopeId.startsWith('chat:') ? scopeId.slice(5) : null;
   const stores = ['drops', 'thumbs', 'blobs', 'settings', ...(chatId ? ['chats'] : [])];
-  return new Promise((resolve, reject) => {
-    assertWritable();
-    const t = db.transaction(stores, 'readwrite');
-    let written = false;
-    const added = new Set<string>();
-    const write = () => {
+  let written = false;
+  const added = new Set<string>();
+  await write(db, stores, t => {
+    const apply = () => {
       const drops = t.objectStore('drops');
       for (const r of commit.puts ?? []) {
         const held = drops.getKey([scopeId, r.meta.id]);
@@ -258,15 +326,13 @@ export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): P
     if (chatId) {
       const req = t.objectStore('chats').get(chatId);
       req.onsuccess = () => {
-        if (req.result) write();
+        if (req.result) apply();
       };
     } else {
-      write();
+      apply();
     }
-    t.oncomplete = () => resolve({ written, added });
-    t.onerror = () => reject(t.error);
-    t.onabort = () => reject(t.error);
   });
+  return { written, added };
 }
 
 // ─── thumbs (scoped keys) ───
@@ -365,15 +431,10 @@ export function putDeviceProfile(profile: DeviceProfile): Promise<void> {
 
 export async function replaceAllDeviceProfiles(profiles: DeviceProfile[]): Promise<void> {
   const db = await openDb();
-  return new Promise((resolve, reject) => {
-    assertWritable();
-    const t = db.transaction('devices', 'readwrite');
+  await write(db, ['devices'], t => {
     const s = t.objectStore('devices');
     s.clear();
     for (const profile of profiles) s.put(profile);
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-    t.onabort = () => reject(t.error);
   });
 }
 
@@ -441,15 +502,10 @@ export async function getSettingsByPrefix<T>(prefix: string): Promise<Array<{ ke
  */
 export async function updateSettings(puts: Array<[string, unknown]>, deletes: string[]): Promise<void> {
   const db = await openDb();
-  return new Promise((resolve, reject) => {
-    assertWritable();
-    const t = db.transaction('settings', 'readwrite');
+  await write(db, ['settings'], t => {
     const store = t.objectStore('settings');
     for (const key of deletes) store.delete(key);
     for (const [key, value] of puts) store.put(value, key);
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-    t.onabort = () => reject(t.error);
   });
 }
 
@@ -460,9 +516,7 @@ export async function updateSettings(puts: Array<[string, unknown]>, deletes: st
  */
 export async function patchSetting<T>(key: string, fn: (current: T | undefined) => T | undefined): Promise<void> {
   const db = await openDb();
-  return new Promise((resolve, reject) => {
-    assertWritable();
-    const t = db.transaction('settings', 'readwrite');
+  await write(db, ['settings'], t => {
     const store = t.objectStore('settings');
     const req = store.get(key) as IDBRequest<T | undefined>;
     req.onsuccess = () => {
@@ -470,9 +524,6 @@ export async function patchSetting<T>(key: string, fn: (current: T | undefined) 
       if (next === undefined) store.delete(key);
       else store.put(next, key);
     };
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-    t.onabort = () => reject(t.error);
   });
 }
 
@@ -491,9 +542,7 @@ function scopeSettingsKeys(scopeId: ScopeId): string[] {
 /** Remove everything a scope owns locally (leave chat / chat gone / delete). */
 export async function clearScopeData(scopeId: ScopeId): Promise<void> {
   const db = await openDb();
-  await new Promise<void>((resolve, reject) => {
-    assertWritable();
-    const t = db.transaction(['drops', 'thumbs', 'blobs', 'outbox', 'settings', 'chats'], 'readwrite');
+  await write(db, ['drops', 'thumbs', 'blobs', 'outbox', 'settings', 'chats'], t => {
     t.objectStore('drops').delete(scopeRange(scopeId));
     t.objectStore('thumbs').delete(mediaRange(scopeId));
     t.objectStore('blobs').delete(mediaRange(scopeId));
@@ -506,37 +555,40 @@ export async function clearScopeData(scopeId: ScopeId): Promise<void> {
         if ((record.scopeId ?? 'private') === scopeId) outboxStore.delete(record.id);
       }
     };
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-    t.onabort = () => reject(t.error);
   });
 }
 
 /**
- * Remove a scope's synced drops and cached media, keeping its outbox,
- * settings and chat record — the local half of a re-sync from scratch.
+ * The local half of a re-sync from scratch: remove a scope's synced drops
+ * and cached media plus the given settings (its sync markers), keeping its
+ * outbox and chat record — and start a new epoch, which this page adopts.
+ * Any other tab mid-sync is thereby cut off: its next commit is refused, so
+ * it cannot put back a delta token that no longer matches what is stored.
  */
-export async function clearScopeDrops(scopeId: ScopeId): Promise<void> {
+export async function resetScopeStore(scopeId: ScopeId, settingsKeys: string[]): Promise<void> {
   const db = await openDb();
-  await new Promise<void>((resolve, reject) => {
-    assertWritable();
-    const t = db.transaction(['drops', 'thumbs', 'blobs'], 'readwrite');
+  await write(db, ['drops', 'thumbs', 'blobs', 'settings'], t => {
     t.objectStore('drops').delete(scopeRange(scopeId));
     t.objectStore('thumbs').delete(mediaRange(scopeId));
     t.objectStore('blobs').delete(mediaRange(scopeId));
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-    t.onabort = () => reject(t.error);
+    for (const key of settingsKeys) t.objectStore('settings').delete(key);
+    renewEpoch(t, true);
   });
 }
 
-/** Wipe all local data (sign-out). */
+/**
+ * Wipe all local data (sign-out) and start a new epoch. This page does not
+ * adopt it: from here on its own late writes — and those of every other tab
+ * still open on the old account — are refused, so nothing of that account
+ * can land after the wipe. The page is on its way out (or reloads).
+ */
 export async function clearAllData(): Promise<void> {
   const db = await openDb();
   const stores = ['drops', 'thumbs', 'blobs', 'outbox', 'devices', 'chats', 'settings'];
   return new Promise((resolve, reject) => {
     const t = db.transaction(stores, 'readwrite');
     for (const s of stores) t.objectStore(s).clear();
+    renewEpoch(t, false);
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);

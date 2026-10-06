@@ -86,6 +86,8 @@ function openBackupDB(): Promise<IDBDatabase> {
 let lastSnapshot = '';
 let backupRunning: Promise<void> | null = null;
 let backupAgain = false;
+/** Sign-out has begun: this page writes no more snapshots (see clearMsalCacheBackup). */
+let backupsDisabled = false;
 
 /**
  * Snapshot all MSAL-related localStorage entries to IndexedDB.
@@ -95,6 +97,7 @@ let backupAgain = false;
  * afterwards, so the last change always lands without stacking writes.
  */
 export function backupMsalCache(): Promise<void> {
+  if (backupsDisabled) return Promise.resolve();
   if (backupRunning) {
     backupAgain = true;
     return backupRunning;
@@ -104,7 +107,7 @@ export function backupMsalCache(): Promise<void> {
       do {
         backupAgain = false;
         await writeSnapshot();
-      } while (backupAgain);
+      } while (backupAgain && !backupsDisabled);
     } finally {
       backupRunning = null;
     }
@@ -207,17 +210,27 @@ export async function restoreMsalCacheIfNeeded(): Promise<boolean> {
 }
 
 /**
- * Clear the IndexedDB backup (call on explicit sign-out).
+ * Clear the IndexedDB backup (call on explicit sign-out). Never rejects.
+ *
+ * Ordered so nothing can put the snapshot back: first no new backups from
+ * this page (the pagehide hook would otherwise snapshot the cache on the way
+ * out), then let one already writing finish, then delete. A snapshot that
+ * survived sign-out would be restored on the next boot and sign the user
+ * straight back in.
  */
 export async function clearMsalCacheBackup(): Promise<void> {
+  backupsDisabled = true;
+  // Bounded, so a write that never settles can't hold sign-out up.
+  await Promise.race([backupRunning?.catch(() => {}), new Promise(r => setTimeout(r, 2000))]);
   lastSnapshot = '';
   try {
     const db = await openBackupDB();
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       tx.objectStore(STORE_NAME).delete(SNAPSHOT_KEY);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   } catch {
     // Best-effort cleanup

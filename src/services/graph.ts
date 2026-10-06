@@ -814,12 +814,13 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
   // order, so the feed grows upward from the newest with no gaps to fill in
   // later. A body that is merely slower than its neighbours delays the
   // hand-over behind it, never the downloads. One that stays missing past
-  // HAND_OVER_PATIENCE_MS stops being waited for: what has arrived is handed
-  // over around it, and the straggler slots in when it lands.
+  // HAND_OVER_PATIENCE_MS stops being waited for: a timer hands over what
+  // has arrived around it, and the straggler slots in when it lands.
   const slots = new Array<DropRecord | null | undefined>(pending.length);
   let cursor = 0; // first slot that still has something to hand over, or to wait for
   let handedOver = 0;
   let lastHandOverAt = performance.now();
+  let patienceTimer: ReturnType<typeof setTimeout> | undefined;
   let handing: Promise<void> = Promise.resolve();
   const failure: { failed: boolean; error?: unknown; commitFailed: boolean } = { failed: false, commitFailed: false };
   const fail = (error: unknown) => {
@@ -852,6 +853,8 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
     while (cursor < slots.length && slots[cursor] === null) cursor++;
     handedOver += batch.length;
     lastHandOverAt = performance.now();
+    clearTimeout(patienceTimer);
+    patienceTimer = undefined;
     const onBatch = opts.onBatch;
     handing = handing
       .then(() => (failure.commitFailed ? undefined : onBatch(batch)))
@@ -860,6 +863,20 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
         fail(err);
       });
     return true;
+  };
+
+  /**
+   * Patience runs on a clock, not on the next download finishing: if the
+   * only bodies still in flight are stuck, nothing else would come along to
+   * release the drops that have already arrived.
+   */
+  const armPatience = () => {
+    if (!opts.onBatch || patienceTimer !== undefined) return;
+    const wait = Math.max(0, lastHandOverAt + HAND_OVER_PATIENCE_MS - performance.now());
+    patienceTimer = setTimeout(() => {
+      patienceTimer = undefined;
+      handOver('everything');
+    }, wait);
   };
 
   try {
@@ -890,14 +907,20 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
         }
         // In order while that keeps moving; around a straggler (or a slow
         // connection that hasn't filled a batch) once patience runs out.
-        if (!handOver('in-order') && performance.now() - lastHandOverAt > HAND_OVER_PATIENCE_MS) {
-          handOver('everything');
-        }
+        // Armed even after an in-order hand-over: drops that finished behind
+        // a body still downloading are waiting on the clock too.
+        handOver('in-order');
+        armPatience();
       },
       signal,
     );
   } catch (err) {
     fail(err);
+  } finally {
+    // The pass is settling its own hand-overs from here: a timer firing
+    // later would hand the final drops over a second time.
+    clearTimeout(patienceTimer);
+    patienceTimer = undefined;
   }
 
   if (failure.failed) {
@@ -918,14 +941,13 @@ export function clearDeltaToken(scope: Scope): Promise<void> {
 }
 
 /**
- * Drop the delta token and change markers for a scope, so its next pass
- * enumerates everything as a fresh install would. For the private feed that
- * includes the device registry's marker, so device profiles re-list too.
+ * The settings that hold a scope's sync position: its delta token and change
+ * markers. Deleting them makes its next pass enumerate everything, as a
+ * fresh install would. For the private feed that includes the device
+ * registry's marker, so device profiles re-list too.
  */
-export async function forgetSyncState(scope: Scope): Promise<void> {
-  await deleteSetting(deltaTokenKey(scope));
-  await deleteSetting(folderCtagKey(scope));
-  if (scope.kind === 'private') await deleteSetting(DEVICES_CTAG_KEY);
+export function syncStateKeys(scope: Scope): string[] {
+  return [deltaTokenKey(scope), folderCtagKey(scope), ...(scope.kind === 'private' ? [DEVICES_CTAG_KEY] : [])];
 }
 
 // ─── fast-path dirty check ───

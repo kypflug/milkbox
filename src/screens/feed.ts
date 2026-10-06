@@ -295,12 +295,12 @@ export async function renderFeed(
   teardownFns.push(() => previewsAbort.abort());
 
   /** One retry sweep for every preview that missed, not one per image. */
-  function scheduleThumbRetry(): void {
+  function scheduleThumbRetry(delayMs = 4000): void {
     if (thumbRetryTimer) return;
     thumbRetryTimer = setTimeout(() => {
       thumbRetryTimer = undefined;
       if (listEl.isConnected) hydrateImages();
-    }, 4000);
+    }, delayMs);
   }
 
   function loadPreview(id: string): Promise<Blob | undefined> {
@@ -354,7 +354,12 @@ export async function renderFeed(
         || (await db.getCachedBlob(scopeId, id).catch(() => undefined));
       if (!blob) {
         blob = await loadPreview(id);
-        if (!blob && !thumbRetried.has(id)) {
+        if (!blob && coordinator.isThrottled()) {
+          // Throttled — this miss, or the gate that kept the request from
+          // being made at all. That isn't the image's one retry: sweep
+          // again once the gate lifts.
+          scheduleThumbRetry(coordinator.throttledForMs() + 1000);
+        } else if (!blob && !thumbRetried.has(id)) {
           thumbRetried.add(id);
           scheduleThumbRetry();
         }

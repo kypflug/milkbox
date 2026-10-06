@@ -468,7 +468,7 @@ const RETRY_DELAYS_MS = [2_000, 5_000, 15_000];
 /** Other tabs re-read the feed at most this often while a pass commits batches. */
 const BROADCAST_EVERY_MS = 2_000;
 
-/** Sign-out has begun: no new passes, and every write is refused. */
+/** Sign-out has begun: no new passes. */
 let shuttingDown = false;
 
 /** Global throttle gate — Graph throttles per app+user across all drives,
@@ -484,6 +484,11 @@ export function noteThrottle(err: unknown): void {
 
 export function isThrottled(): boolean {
   return Date.now() < throttledUntil;
+}
+
+/** How long until the throttle gate lifts (0 when it is down). */
+export function throttledForMs(): number {
+  return Math.max(0, throttledUntil - Date.now());
 }
 
 /**
@@ -1032,12 +1037,12 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
 }
 
 /**
- * Sign-out: stop every pass and close local storage to writes before the
- * wipe, so nothing downloaded afterwards can land under the next account.
+ * Sign-out, here or in another tab: stop every pass and start no more. What
+ * keeps a late write out of the wiped store is the store's epoch (see
+ * db.clearAllData), not this — this just stops the page working for nothing.
  */
 export function shutdown(): void {
   shuttingDown = true;
-  db.closeWrites();
   for (const st of scopeStates.values()) {
     clearTimeout(st.retryTimer);
     st.controller?.abort();
@@ -1103,9 +1108,11 @@ export async function resetScope(scope: Scope): Promise<void> {
     while (st.syncPromise) await st.syncPromise.catch(() => {});
     st.completedOnce = false;
     st.retryCount = 0;
-    await graph.forgetSyncState(scope);
-    await db.deleteSetting(notifyPrimedKey(scopeId));
-    await db.clearScopeDrops(scopeId);
+    // One transaction, and a new store epoch with it: a pass still running
+    // in another tab can no longer commit (it would put back a delta token
+    // for drops that are no longer here). Those tabs are told to reload.
+    await db.resetScopeStore(scopeId, [...graph.syncStateKeys(scope), notifyPrimedKey(scopeId)]);
+    postBroadcast({ type: 'store-reset' });
   } finally {
     resettingScopes.delete(scopeId);
   }

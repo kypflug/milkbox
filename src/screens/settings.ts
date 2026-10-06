@@ -7,6 +7,7 @@ import { showToast } from '../components/toast';
 import { iconClose } from '../components/icons';
 import { renameCurrentDevice, resetScope, shutdown } from '../services/sync-coordinator';
 import { getDiagnostics, type Diagnostics, type PassStats } from '../services/sync-stats';
+import { postBroadcast } from '../services/broadcast';
 import {
   isNotifySupported,
   isNotifyEnabled,
@@ -296,17 +297,19 @@ export function mountSettingsFlyout(
 
   panel.querySelector<HTMLButtonElement>('[data-settings-action="sign-out"]')!
     .addEventListener('click', async () => {
-      // Stop syncing and refuse further writes first, so a batch still in
-      // flight can't land this account's drops after the wipe.
+      // Stop syncing here and tell the other tabs to. The wipe then starts a
+      // new store epoch, so a batch still in flight — in any tab — can't
+      // land this account's drops afterwards.
       shutdown();
+      postBroadcast({ type: 'auth-changed', signedIn: false });
       try {
         await clearAllData();
       } catch (err) {
         console.warn('Failed to clear local data during sign-out:', err);
       }
-      // shutdown() is one-way: sync is off and storage refuses writes. If
-      // the redirect doesn't happen (MSAL threw, or found no account), a
-      // reload is the way back to a working app rather than an inert one.
+      // This page is now shut down and on a superseded epoch. If the
+      // redirect doesn't happen (MSAL threw, or found no account), a reload
+      // is the way back to a working app rather than an inert one.
       let leaving = false;
       try {
         leaving = await signOut();

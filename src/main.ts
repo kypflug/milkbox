@@ -232,6 +232,23 @@ async function enterApp(app: HTMLElement): Promise<void> {
   void coordinator.ensureMe();
   void coordinator.catchUpRegistry();
 
+  // Another tab signed out, or re-synced from scratch. Either way this
+  // page's view of local storage is superseded and its writes are refused
+  // (see the store epoch in db.ts), so it must not carry on as it was.
+  onBroadcast(event => {
+    if (event.type === 'auth-changed' && !event.signedIn) {
+      // Not a reload: the other tab's logout may not have cleared the token
+      // cache yet, and a reload would boot straight back into this account.
+      coordinator.shutdown();
+      teardownScreenListeners();
+      chatUiTeardown?.();
+      chatUiTeardown = null;
+      renderSignIn(app, () => location.reload());
+    } else if (event.type === 'store-reset') {
+      location.reload();
+    }
+  });
+
   // A notification tap on an already-open window arrives as a worker
   // message — route to the scope it named.
   navigator.serviceWorker?.addEventListener('message', e => {

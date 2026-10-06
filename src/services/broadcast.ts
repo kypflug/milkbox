@@ -7,7 +7,10 @@
  * Events:
  * - `sync-complete`: Drops were synced; other tabs should refresh from cache
  * - `drop-mutated`: A single drop was created/updated/deleted
- * - `auth-changed`: Auth state changed (sign-in/sign-out)
+ * - `auth-changed`: Auth state changed (sign-in/sign-out). On a sign-out the
+ *   other tabs stop syncing and show the sign-in screen.
+ * - `store-reset`: Local storage was reset in another tab ("Re-sync from
+ *   scratch"); this tab's view of it is out of date, so it reloads
  * - `chats-changed`: The chat registry changed (create/join/leave/gone);
  *   carries `removedChatId` when a chat left the registry, so a tab showing
  *   that chat can leave it
@@ -22,6 +25,7 @@ export type BroadcastEvent =
   | { type: 'sync-complete'; scopeId?: ScopeId }
   | { type: 'drop-mutated'; dropId: string; action: 'upsert' | 'delete'; scopeId?: ScopeId }
   | { type: 'auth-changed'; signedIn: boolean }
+  | { type: 'store-reset' }
   | { type: 'chats-changed'; removedChatId?: string };
 
 type BroadcastHandler = (event: BroadcastEvent) => void;
