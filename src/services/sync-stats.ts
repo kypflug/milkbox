@@ -109,7 +109,10 @@ export async function recordPass(stats: PassStats): Promise<void> {
   );
   await patchSetting<SyncStatsLog>(STATS_KEY, current => ({
     passes: [...(current?.passes ?? []), stats].slice(-MAX_PASSES),
-    lastFull: stats.mode === 'full' && stats.outcome === 'ok' ? stats : current?.lastFull,
+    // The private feed's only: the panel pairs it with the private drop
+    // count, and a small chat joined later shouldn't replace the figure.
+    lastFull:
+      stats.scope === 'private' && stats.mode === 'full' && stats.outcome === 'ok' ? stats : current?.lastFull,
   }));
 }
 

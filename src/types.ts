@@ -91,6 +91,12 @@ export interface OutboxRecord {
    * records from older builds.
    */
   prevMeta?: DropMeta;
+  /**
+   * Edits only: the eTag `prevMeta` was held at. A discard restores
+   * `prevMeta` only while the local row is still at this eTag — if a sync
+   * pass has since brought a newer version, that one stays.
+   */
+  prevETag?: string;
 }
 
 // ─── Shared chats ───

@@ -63,7 +63,8 @@ function diagnosticsRows(d: Diagnostics): Array<[string, string]> {
     [
       'Since launch',
       `${d.sinceLaunch.graph} Graph · ${d.sinceLaunch.storage} content requests · ` +
-        `${d.sinceLaunch.throttles} throttled · ${d.sinceLaunch.backups} sign-in backups`,
+        `${d.sinceLaunch.throttles} throttled · ${d.sinceLaunch.timeouts} timed out · ` +
+        `${d.sinceLaunch.backups} sign-in backups`,
     ],
   ];
 }
@@ -303,7 +304,16 @@ export function mountSettingsFlyout(
       } catch (err) {
         console.warn('Failed to clear local data during sign-out:', err);
       }
-      await signOut();
+      // shutdown() is one-way: sync is off and storage refuses writes. If
+      // the redirect doesn't happen (MSAL threw, or found no account), a
+      // reload is the way back to a working app rather than an inert one.
+      let leaving = false;
+      try {
+        leaving = await signOut();
+      } catch (err) {
+        console.warn('Sign-out did not start:', err);
+      }
+      if (!leaving) location.reload();
     });
 
   copyReportButton.addEventListener('click', async () => {

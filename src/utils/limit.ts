@@ -8,8 +8,9 @@
 
 /**
  * A shared gate: at most `max` tasks run at once across every caller, the
- * rest wait in arrival order. A task whose signal aborted while it waited is
- * rejected without running.
+ * rest wait in arrival order. A task whose signal aborts while it waits
+ * leaves the queue and is rejected at once, without running — so work queued
+ * for a screen that has gone never holds up the screen that replaced it.
  */
 export function createLimiter(max: number): <T>(task: () => Promise<T>, signal?: AbortSignal) => Promise<T> {
   let active = 0;
@@ -23,12 +24,18 @@ export function createLimiter(max: number): <T>(task: () => Promise<T>, signal?:
 
   return <T>(task: () => Promise<T>, signal?: AbortSignal) =>
     new Promise<T>((resolve, reject) => {
-      queue.push(() => {
-        if (signal?.aborted) {
-          reject(signal.reason);
-          next();
-          return;
-        }
+      if (signal?.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      const onAbort = () => {
+        const waiting = queue.indexOf(start);
+        if (waiting === -1) return; // already running — its own signal handling applies
+        queue.splice(waiting, 1);
+        reject(signal?.reason);
+      };
+      const start = () => {
+        signal?.removeEventListener('abort', onAbort);
         active++;
         task()
           .then(resolve, reject)
@@ -36,7 +43,9 @@ export function createLimiter(max: number): <T>(task: () => Promise<T>, signal?:
             active--;
             next();
           });
-      });
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      queue.push(start);
       next();
     });
 }

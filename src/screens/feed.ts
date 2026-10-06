@@ -152,7 +152,6 @@ export async function renderFeed(
       pendingRefresh = { ...(pendingRefresh ?? {}), ...opts };
       return;
     }
-    const stick = opts.stick ?? nearBottom();
     const [loadedFeed, profiles, me] = await Promise.all([
       coordinator.loadFeed(scopeId),
       isChat ? Promise.resolve([] as DeviceProfile[]) : coordinator.loadDeviceProfiles(),
@@ -211,13 +210,24 @@ export async function renderFeed(
         html += renderDropCard(record, presentation);
       }
     }
-    if (html !== renderedHtml) {
+    // An editor opened while the feed was loading: don't rebuild under it.
+    if (listEl.querySelector('.drop-edit')) {
+      pendingRefresh = { ...(pendingRefresh ?? {}), ...opts };
+      return;
+    }
+    // Read now, not before the awaits above — the user may have started
+    // scrolling up in the meantime.
+    const stick = opts.stick ?? nearBottom();
+    const rebuilt = html !== renderedHtml;
+    if (rebuilt) {
       listEl.innerHTML = html;
       renderedHtml = html;
       hydrateImages();
       hydrateFavicons();
     }
-    if (stick) scrollToBottom();
+    // A list left untouched stays where the user has it, unless the caller
+    // asked for the bottom (a send, the first paint).
+    if (rebuilt ? stick : opts.stick === true) scrollToBottom();
 
     if (isChat && document.visibilityState === 'visible') {
       const lastId = feed.length ? feed[feed.length - 1].meta.id : undefined;
@@ -274,9 +284,15 @@ export async function renderFeed(
    * than leaving the card blank forever.
    */
   const FULL_IMAGE_PREVIEW_LIMIT = 10 * 1024 * 1024;
+  /** A full image standing in for a preview gets this long, then gives its slot back. */
+  const FULL_IMAGE_PREVIEW_TIMEOUT_MS = 120_000;
   const thumbRetried = new Set<string>();
   let thumbRetryTimer: ReturnType<typeof setTimeout> | undefined;
   teardownFns.push(() => clearTimeout(thumbRetryTimer));
+  // Previews still waiting for a slot are dropped when this screen goes, so
+  // the next scope's previews don't queue behind this one's.
+  const previewsAbort = new AbortController();
+  teardownFns.push(() => previewsAbort.abort());
 
   /** One retry sweep for every preview that missed, not one per image. */
   function scheduleThumbRetry(): void {
@@ -311,10 +327,10 @@ export async function renderFeed(
         // No thumbnail (not generated yet, or unsupported format) — the
         // image itself is small enough to be its own preview.
         if (file.size > FULL_IMAGE_PREVIEW_LIMIT) return undefined;
-        const blob = await downloadDropFile(scope, itemId);
+        const blob = await downloadDropFile(scope, itemId, { timeoutMs: FULL_IMAGE_PREVIEW_TIMEOUT_MS });
         await db.putCachedBlob(scopeId, id, blob).catch(() => {});
         return blob;
-      });
+      }, previewsAbort.signal);
     } catch (err) {
       // Offline or transient; a throttle also pauses sync and polling.
       coordinator.noteThrottle(err);
@@ -323,7 +339,10 @@ export async function renderFeed(
   }
 
   function hydrateImages(): void {
-    listEl.querySelectorAll<HTMLImageElement>('img[data-thumb-id]').forEach(async img => {
+    // Newest first: the list is pinned to the bottom, so the last cards are
+    // the ones on screen, and previews queue for a few slots in this order.
+    const pending = [...listEl.querySelectorAll<HTMLImageElement>('img[data-thumb-id]:not(.loaded)')].reverse();
+    pending.forEach(async img => {
       const id = img.dataset.thumbId!;
       const cached = thumbUrls.get(mkey(id));
       if (cached) {
@@ -689,7 +708,15 @@ export async function renderFeed(
   const applyRename = async () => {
     if (scope.kind !== 'chat') return;
     const record = await db.getChat(scope.chatId);
-    if (!record || record.name === scope.name) return;
+    if (!record) return;
+    // Access ended, was paused or came back since this screen was drawn:
+    // draw it again, so the banner, the composer and the empty-feed copy all
+    // follow (an empty chat would otherwise keep saying it is retrying).
+    if ((record.state ?? 'active') !== chatState && listEl.isConnected) {
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+      return;
+    }
+    if (record.name === scope.name) return;
     scope.name = record.name;
     const wordmark = app.querySelector<HTMLElement>('.feed-wordmark');
     if (wordmark) wordmark.textContent = record.name;
@@ -722,9 +749,15 @@ export async function renderFeed(
       case 'sync-complete':
         composerApi?.setSyncState('synced');
         syncProgress = null;
-        if (syncFailed) {
-          syncFailed = false;
-          if (feed.length === 0) scheduleRefresh();
+        syncFailed = false;
+        // An empty feed may have been saying "fetching": a pass that found
+        // nothing emits no feed-updated, so re-read the copy here.
+        if (feed.length === 0) scheduleRefresh();
+        // Previews that missed (offline, throttled, thumbnail not generated
+        // yet) get another try once a pass has got through.
+        if (listEl.querySelector('img[data-thumb-id]:not(.loaded)')) {
+          thumbRetried.clear();
+          hydrateImages();
         }
         break;
       case 'sync-error':

@@ -36,6 +36,13 @@ export const folderCtagKey = (scope: Scope) => `milkbox:ctag:${scopeIdOf(scope)}
  */
 const JSON_TIMEOUT_MS = 20_000;
 /**
+ * Delta and listing pages carry hundreds of items each, and the limit covers
+ * the whole response, body included. They run one at a time and are already
+ * abortable, so a budget a slow cellular link can meet costs nothing — a
+ * page that keeps timing out would restart the enumeration every time.
+ */
+export const PAGE_TIMEOUT_MS = 60_000;
+/**
  * Thumbnail bytes are a file transfer too, but a bounded one (a preview
  * image), and a hung one would hold one of the few preview slots until a
  * relaunch — so they get a limit of their own, generous for a slow link.
@@ -100,15 +107,17 @@ async function authHeaders(tier: TokenTier): Promise<Record<string, string>> {
 export interface GraphInit extends RequestInit {
   /** Moves file bytes — skip the JSON timeout. */
   noTimeout?: boolean;
+  /** A limit other than the JSON one (a paged listing, a preview image). */
+  timeoutMs?: number;
 }
 
 export async function graphFetch(url: string, init?: GraphInit, tier: TokenTier = 'base'): Promise<Response> {
   const headers = await authHeaders(tier);
   counters.graph++;
-  const { noTimeout, ...request } = init ?? {};
+  const { noTimeout, timeoutMs, ...request } = init ?? {};
   const res = await fetch(url, {
     ...request,
-    signal: noTimeout ? request.signal : jsonSignal(request.signal ?? undefined),
+    signal: noTimeout ? request.signal : jsonSignal(request.signal ?? undefined, timeoutMs),
     headers: { ...headers, ...(request.headers as Record<string, string> | undefined) },
   }).catch(noteTimeout);
   if (!res.ok) {
@@ -224,14 +233,29 @@ async function fetchJsonBody(
   if (!link) {
     if (opts.stats) opts.stats.fallbacks++;
     const res = await graphFetch(fallbackUrl, { signal: opts.signal }, tier);
-    return res.json();
+    return parseJsonBody(await res.text());
   }
   const res = await storageFetch(link, { signal: jsonSignal(opts.signal) });
   if (!res.ok) {
     if (res.status === 429 || res.status === 503) throw contentThrottleError(res);
     throw new DownloadError(res.status);
   }
-  return res.json();
+  return parseJsonBody(await res.text());
+}
+
+/**
+ * A body that arrived whole but isn't JSON (an empty or truncated file) is
+ * that one file's problem: it comes back undefined, which every caller's
+ * validation discards. Thrown instead, it would fail the whole pass — and
+ * every pass after it, since each would meet the same file again. A body
+ * that failed to arrive still throws, from the read above.
+ */
+function parseJsonBody(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -409,7 +433,7 @@ export async function listDeviceProfiles(skipIfCTag?: string): Promise<DevicePro
   while (url) {
     let data: { value: GraphFileItem[]; '@odata.nextLink'?: string };
     try {
-      const res = await graphFetch(url);
+      const res = await graphFetch(url, { timeoutMs: PAGE_TIMEOUT_MS });
       data = await res.json();
     } catch (err) {
       if (isGoneError(err)) return { profiles: [], cTag };
@@ -558,9 +582,15 @@ function fileItemUrl(scope: Scope, itemId: string): string {
     : `${GRAPH_BASE}/drives/${scope.driveId}/items/${itemId}`;
 }
 
-/** Download a drop's file bytes. */
-export async function downloadDropFile(scope: Scope, itemId: string): Promise<Blob> {
-  const res = await graphFetch(`${fileItemUrl(scope, itemId)}/content`, { noTimeout: true }, scopeTier(scope));
+/**
+ * Download a drop's file bytes. Untimed by default — a user waiting on a big
+ * file should get it however long it takes. A caller fetching one as a
+ * preview passes a limit, so a transfer left hanging can't hold a preview
+ * slot for the rest of the session.
+ */
+export async function downloadDropFile(scope: Scope, itemId: string, opts: { timeoutMs?: number } = {}): Promise<Blob> {
+  const init: GraphInit = opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : { noTimeout: true };
+  const res = await graphFetch(`${fileItemUrl(scope, itemId)}/content`, init, scopeTier(scope));
   return res.blob();
 }
 
@@ -712,7 +742,7 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
   while (url) {
     let data: { value: DeltaItem[]; '@odata.nextLink'?: string; '@odata.deltaLink'?: string };
     try {
-      const res = await graphFetch(url, { signal }, tier);
+      const res = await graphFetch(url, { signal, timeoutMs: PAGE_TIMEOUT_MS }, tier);
       data = await res.json();
       if (stats) stats.pages++;
     } catch (err) {
@@ -724,7 +754,11 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
           return runDelta(scope, { ...opts, fromScratch: true });
         }
         if (isChat) throw err; // revoked / deleted — the caller decides
-        // Folder doesn't exist yet — empty feed, not an error
+        // Only the opening request can say the folder doesn't exist yet (an
+        // empty feed, not an error). "Gone" on a later page is a broken
+        // enumeration: reported as an empty feed it would sweep every drop
+        // this device holds, so it fails the pass instead.
+        if (url !== deltaStartUrl(scope)) throw err;
         return { upserts: [], removals: [], fullResync, seenIds: new Set() };
       }
       throw err;

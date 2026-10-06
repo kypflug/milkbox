@@ -207,6 +207,17 @@ export interface DropCommit {
   settingsDelete?: string[];
 }
 
+export interface DropCommitResult {
+  /** False when the write was refused: the chat is no longer on this device. */
+  written: boolean;
+  /**
+   * Ids among `puts` that this device did not hold until this commit. Decided
+   * inside the transaction, so two tabs syncing the same scope can't both
+   * count the same drop as new.
+   */
+  added: Set<string>;
+}
+
 /**
  * Apply a sync pass's changes to one scope in a single transaction, so the
  * delta token and cTag can never be stored without the drops they describe
@@ -214,9 +225,9 @@ export interface DropCommit {
  *
  * Puts land before deletes. For a chat scope the write is skipped entirely
  * when the chat record is gone — a pass that outlived a leave or delete must
- * not write drops back under the cleared scope. Resolves false then.
+ * not write drops back under the cleared scope.
  */
-export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): Promise<boolean> {
+export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): Promise<DropCommitResult> {
   const db = await openDb();
   const chatId = scopeId.startsWith('chat:') ? scopeId.slice(5) : null;
   const stores = ['drops', 'thumbs', 'blobs', 'settings', ...(chatId ? ['chats'] : [])];
@@ -224,9 +235,16 @@ export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): P
     assertWritable();
     const t = db.transaction(stores, 'readwrite');
     let written = false;
+    const added = new Set<string>();
     const write = () => {
       const drops = t.objectStore('drops');
-      for (const r of commit.puts ?? []) drops.put({ ...r, scopeId } satisfies StoredDropRecord);
+      for (const r of commit.puts ?? []) {
+        const held = drops.getKey([scopeId, r.meta.id]);
+        held.onsuccess = () => {
+          if (held.result === undefined) added.add(r.meta.id);
+        };
+        drops.put({ ...r, scopeId } satisfies StoredDropRecord);
+      }
       for (const id of commit.deletes ?? []) {
         drops.delete([scopeId, id]);
         t.objectStore('thumbs').delete(mediaKey(scopeId, id));
@@ -245,7 +263,7 @@ export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): P
     } else {
       write();
     }
-    t.oncomplete = () => resolve(written);
+    t.oncomplete = () => resolve({ written, added });
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);
   });

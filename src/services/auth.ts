@@ -247,12 +247,14 @@ export async function signIn(opts: { preConsentShare?: boolean } = {}): Promise<
 }
 
 /**
- * Sign the user out via redirect.
+ * Sign the user out via redirect. Resolves true once the redirect is under
+ * way (the page is navigating away), false when there was no account to
+ * sign out — the caller decides what to do with a page that is staying.
  */
-export async function signOut(): Promise<void> {
+export async function signOut(): Promise<boolean> {
   const msal = getMsal();
   const account = getAccount();
-  if (!account) return;
+  if (!account) return false;
 
   clearAccountHint();
   clearMsalCacheBackup().catch(() => {});
@@ -262,6 +264,7 @@ export async function signOut(): Promise<void> {
     postLogoutRedirectUri: REDIRECT_URI,
   });
   // Page navigates away
+  return true;
 }
 
 export async function getAccessToken(tier: TokenTier = 'base'): Promise<string> {

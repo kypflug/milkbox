@@ -16,6 +16,7 @@
 import {
   GRAPH_BASE,
   GraphHttpError,
+  PAGE_TIMEOUT_MS,
   contentUrl,
   downloadItemJson,
   graphFetch,
@@ -78,7 +79,7 @@ async function listChildren(
   let url = `${itemByPathUrl(ref, path)}:/children?$select=${select}`;
   const items: GraphChildItem[] = [];
   while (url) {
-    const res = await graphFetch(url, undefined, tier);
+    const res = await graphFetch(url, { timeoutMs: PAGE_TIMEOUT_MS }, tier);
     const data: { value: GraphChildItem[]; '@odata.nextLink'?: string } = await res.json();
     items.push(...data.value);
     url = data['@odata.nextLink'] || '';
@@ -530,7 +531,7 @@ export async function listChatDrops(
   const seen = new Set<string>();
 
   while (url) {
-    const res = await graphFetch(url, { signal }, 'share');
+    const res = await graphFetch(url, { signal, timeoutMs: PAGE_TIMEOUT_MS }, 'share');
     const data: { value: GraphChildItem[]; '@odata.nextLink'?: string } = await res.json();
     if (stats) stats.pages++;
     const changed: Array<{ item: GraphChildItem; id: string }> = [];

@@ -221,11 +221,22 @@ export async function enqueueCreate(scope: Scope, meta: DropMeta, blob?: Blob): 
 export async function enqueueEdit(scope: Scope, meta: DropMeta): Promise<void> {
   const scopeId = scopeIdOf(scope);
   const existing = await db.getDrop(scopeId, meta.id);
-  // Keep the server's version for a discard to restore. A second edit before
-  // the first lands inherits the first one's original.
+  // Keep the server's version, and the eTag it was held at, for a discard to
+  // restore. A second edit before the first lands inherits the first one's
+  // original exactly — including none at all, if an older build queued it.
   const queued = (await db.getOutbox()).find(r => r.id === meta.id && r.op === 'edit');
-  const prevMeta = queued?.prevMeta ?? existing?.meta;
-  await db.putOutboxRecord({ id: meta.id, meta, op: 'edit', attempts: 0, state: 'queued', scopeId, prevMeta });
+  const prevMeta = queued ? queued.prevMeta : existing?.meta;
+  const prevETag = queued ? queued.prevETag : existing?.eTag;
+  await db.putOutboxRecord({
+    id: meta.id,
+    meta,
+    op: 'edit',
+    attempts: 0,
+    state: 'queued',
+    scopeId,
+    prevMeta,
+    prevETag,
+  });
   // Optimistically update the local record so the edit shows immediately
   if (existing) await db.putDrop(scopeId, { ...existing, meta });
   emit({ type: 'feed-updated', scopeId });
@@ -270,7 +281,12 @@ export async function discardOutboxRecord(id: string): Promise<void> {
   // no sync pass would ever correct it.
   const existing = record?.op === 'edit' ? await db.getDrop(scopeId, id) : undefined;
   if (existing && record?.prevMeta) {
-    await db.putDrop(scopeId, { ...existing, meta: record.prevMeta });
+    // Only while the row is still the version the edit was made on. If a
+    // pass has since brought a newer one (another device edited the drop
+    // while this edit sat failed), that is the server's truth: leave it.
+    if (existing.eTag === record.prevETag) {
+      await db.putDrop(scopeId, { ...existing, meta: record.prevMeta });
+    }
   } else if (existing) {
     // An edit queued by an older build kept no original to restore. Forget
     // the row's eTag, so it stops matching the server's, and make the next
@@ -436,6 +452,8 @@ interface ScopeSyncState {
   controller: AbortController | null;
   /** The next pass ignores its delta token and enumerates the whole scope. */
   forceFull: boolean;
+  /** The last pass ended in an error — coming back to the app tries again. */
+  lastPassFailed: boolean;
   /** Quick retries spent since the last completed pass. */
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -468,6 +486,19 @@ export function isThrottled(): boolean {
   return Date.now() < throttledUntil;
 }
 
+/**
+ * Forget a scope's sync state and stop any pass still running for it: a chat
+ * leaving this device must not have an old pass commit into it afterwards —
+ * least of all into the same chat re-joined a moment later.
+ */
+function dropScopeState(scopeId: ScopeId): void {
+  const st = scopeStates.get(scopeId);
+  if (!st) return;
+  clearTimeout(st.retryTimer);
+  st.controller?.abort();
+  scopeStates.delete(scopeId);
+}
+
 function stateFor(scopeId: ScopeId): ScopeSyncState {
   let st = scopeStates.get(scopeId);
   if (!st) {
@@ -482,6 +513,7 @@ function stateFor(scopeId: ScopeId): ScopeSyncState {
       completedOnce: false,
       controller: null,
       forceFull: false,
+      lastPassFailed: false,
       retryCount: 0,
       retryTimer: undefined,
     };
@@ -551,18 +583,19 @@ async function runDevicesPhase(): Promise<{ ms: number; count?: number }> {
  * composed but only published when the author's outbox drains — and in chats
  * other members' clocks can skew — so id order never decides novelty.
  *
- * `heldBefore` is the scope's ids as the pass found them, taken before its
- * first batch was written: once batches land, every drop they carry is in
- * IDB and indistinguishable from one we held.
+ * `added` is what the commit itself found absent (db.commitDropChanges):
+ * decided in the write transaction, so batches of one pass can't hide each
+ * other's drops, and a second tab syncing the same scope can't count a drop
+ * the first tab already wrote.
  */
 function pickArrivals(
   scope: Scope,
   records: DropRecord[],
-  heldBefore: ReadonlySet<string>,
+  added: ReadonlySet<string>,
   selfId: string | undefined,
 ): DropMeta[] {
   return records
-    .filter(record => !heldBefore.has(record.meta.id))
+    .filter(record => added.has(record.meta.id))
     .filter(record =>
       scope.kind === 'private' ? record.meta.device.id !== selfId : record.meta.author?.id !== selfId,
     )
@@ -807,8 +840,8 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         knownCTag = undefined;
 
         // What this device holds as the pass starts: the eTags let it skip
-        // bodies it already has, the ids decide novelty and what a full pass
-        // may sweep. Taken before any batch below is written.
+        // bodies it already has, the ids are what a full pass may sweep.
+        // Taken before any batch below is written.
         const known = await db.getScopeDropETags(scopeId);
         const heldBefore = new Set(known.keys());
         const selfId = scope.kind === 'private' ? device.getDeviceId() : (await ensureMe())?.id;
@@ -833,10 +866,9 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           },
           // Each batch is committed and shown as it arrives, newest first.
           onBatch: async records => {
-            const batchArrivals = pickArrivals(scope, records, heldBefore, selfId);
-            const written = await db.commitDropChanges(scopeId, { puts: records });
+            const { written, added } = await db.commitDropChanges(scopeId, { puts: records });
             if (!written) stopForRemovedScope(controller);
-            arrivals.push(...batchArrivals);
+            arrivals.push(...pickArrivals(scope, records, added, selfId));
             firstCommitMs ??= performance.now() - t0;
             received += records.length;
             emit({ type: 'sync-progress', scopeId, received, total });
@@ -881,22 +913,24 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         if (cTag) settingsPut.push([graph.folderCtagKey(scope), cTag]);
 
         // The last drops, the removals, the token and the cTag land together.
-        const finalArrivals = pickArrivals(scope, result.upserts, heldBefore, selfId);
-        const written = await db.commitDropChanges(scopeId, {
+        const { written, added } = await db.commitDropChanges(scopeId, {
           puts: result.upserts,
           deletes: [...deletes],
           settingsPut,
           settingsDelete,
         });
         if (!written) stopForRemovedScope(controller);
-        arrivals.push(...finalArrivals);
+        arrivals.push(...pickArrivals(scope, result.upserts, added, selfId));
         // "First drops" only when this commit carried some: an empty account,
         // or a pass that skipped every body, shows no such moment.
         if (result.upserts.length) firstCommitMs ??= performance.now() - t0;
         received += result.upserts.length;
-        removed = deletes.size;
+        // Only what this device actually held: the tombstone for a drop it
+        // deleted itself (already gone locally) is not a removal.
+        removed = [...deletes].filter(id => heldBefore.has(id)).length;
         st.completedOnce = true;
         st.retryCount = 0;
+        st.lastPassFailed = false;
 
         const passChanged = received > 0 || deletes.size > 0 || result.fullResync;
         if (scope.kind === 'chat') {
@@ -944,6 +978,7 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           // to report; whoever aborted it takes it from here.
           console.debug('[Sync] Pass for %s aborted', scopeId);
         } else {
+          st.lastPassFailed = true;
           noteThrottle(err);
           if (scope.kind === 'chat' && graph.isAccessLostError(err)) {
             st.consecutiveGone++;
@@ -968,6 +1003,10 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         }
       }
 
+      // An abort that landed after the pass's last abortable step (its final
+      // commit, the roster refresh) still ends the loop: whoever aborted is
+      // waiting for this pass to get out of the way, not for another one.
+      aborted ||= controller.signal.aborted;
       st.controller = null;
       const devicesPhase = await devicesTask;
       void recordPass({
@@ -1021,7 +1060,10 @@ export async function syncIfDirty(scope: Scope): Promise<void> {
   const hasWork =
     outbox.some(r => r.state !== 'failed' && (r.scopeId ?? PRIVATE_SCOPE_ID) === scopeId) ||
     (scope.kind === 'private' && Boolean(await db.getSetting(PENDING_DEVICE_PROFILE_KEY)));
-  if (hasWork) return requestSync(scope, { force: true });
+  // A pass that failed (the app was opened offline, say) is tried again even
+  // if nothing changed remotely — otherwise "Sync failed" would sit there
+  // until the next remote change or a manual refresh.
+  if (hasWork || stateFor(scopeId).lastPassFailed) return requestSync(scope, { force: true });
   if (Date.now() < throttledUntil) return;
   await pollScope(scopeId);
 }
@@ -1356,8 +1398,8 @@ export async function leaveChat(chatId: string): Promise<void> {
 
 /** Drop a chat from this install and tell every listener, this tab's and the others'. */
 async function forgetChat(record: ChatRecord): Promise<void> {
+  dropScopeState(`chat:${record.id}`);
   await db.clearScopeData(`chat:${record.id}`);
-  scopeStates.delete(`chat:${record.id}`);
   emit({ type: 'chats-changed' });
   postBroadcast({ type: 'chats-changed', removedChatId: record.id });
 }
@@ -1367,8 +1409,8 @@ export async function deleteChatHosted(chatId: string): Promise<void> {
   const record = await db.getChat(chatId);
   if (!record || record.role !== 'host') return;
   await chatsApi.deleteChatFolder(chatId);
+  dropScopeState(`chat:${chatId}`);
   await db.clearScopeData(`chat:${chatId}`);
-  scopeStates.delete(`chat:${chatId}`);
   emit({ type: 'chats-changed' });
   postBroadcast({ type: 'chats-changed' });
 }
@@ -1588,8 +1630,8 @@ async function reconcileChatRegistry(me: AuthorAttribution): Promise<void> {
     // Gone on every other device too: the host deleted it, or we left it.
     const current = await db.getChat(record.id);
     if (!current) continue; // already left/removed while we listed
+    dropScopeState(`chat:${record.id}`);
     await db.clearScopeData(`chat:${record.id}`);
-    scopeStates.delete(`chat:${record.id}`);
     removed.push(current);
     changed = true;
   }
