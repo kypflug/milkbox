@@ -709,6 +709,17 @@ export function requestSync(scope: Scope, opts: { force?: boolean; knownCTag?: s
   return st.syncPromise;
 }
 
+/**
+ * A commit was refused because the chat left this device while its pass was
+ * downloading (see db.commitDropChanges). Nothing was written, so nothing
+ * may be counted, shown or announced: abort the pass, which ends it quietly.
+ */
+function stopForRemovedScope(controller: AbortController): never {
+  const reason = new DOMException('The chat was removed during its sync pass.', 'AbortError');
+  controller.abort(reason);
+  throw reason;
+}
+
 /** Network trouble rather than a verdict — worth another pass soon. */
 function isTransientSyncError(err: unknown): boolean {
   // An expired download link or a storage hiccup: a new pass mints fresh links.
@@ -784,7 +795,15 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         // The cTag this pass will commit, read BEFORE the delta (see
         // graph.readFeedCTag). A poll tick's value is only good for the
         // first iteration; a repeat reads afresh.
-        const cTag = knownCTag ?? (await graph.readFeedCTag(scope).catch(() => undefined));
+        // Only a private feed with no drops folder yet (a new account) is
+        // "no cTag". Anything else — a throttle above all, whose Retry-After
+        // must stop this pass before it enumerates — fails the pass.
+        const cTag =
+          knownCTag ??
+          (await graph.readFeedCTag(scope).catch(err => {
+            if (scope.kind === 'private' && graph.isGoneError(err)) return undefined;
+            throw err;
+          }));
         knownCTag = undefined;
 
         // What this device holds as the pass starts: the eTags let it skip
@@ -815,7 +834,8 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           // Each batch is committed and shown as it arrives, newest first.
           onBatch: async records => {
             const batchArrivals = pickArrivals(scope, records, heldBefore, selfId);
-            await db.commitDropChanges(scopeId, { puts: records });
+            const written = await db.commitDropChanges(scopeId, { puts: records });
+            if (!written) stopForRemovedScope(controller);
             arrivals.push(...batchArrivals);
             firstCommitMs ??= performance.now() - t0;
             received += records.length;
@@ -862,12 +882,13 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
 
         // The last drops, the removals, the token and the cTag land together.
         const finalArrivals = pickArrivals(scope, result.upserts, heldBefore, selfId);
-        await db.commitDropChanges(scopeId, {
+        const written = await db.commitDropChanges(scopeId, {
           puts: result.upserts,
           deletes: [...deletes],
           settingsPut,
           settingsDelete,
         });
+        if (!written) stopForRemovedScope(controller);
         arrivals.push(...finalArrivals);
         // "First drops" only when this commit carried some: an empty account,
         // or a pass that skipped every body, shows no such moment.

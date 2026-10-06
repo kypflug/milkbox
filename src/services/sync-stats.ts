@@ -88,8 +88,8 @@ export function requestCount(): number {
 export function errorLabel(err: unknown): string {
   const status = (err as { status?: unknown } | null)?.status;
   if (typeof status === 'number') return `HTTP ${status}`;
-  if (err instanceof DOMException) return err.name;
-  if (err instanceof Error) return err.constructor.name || 'Error';
+  // `name`, not the constructor's: a production build minifies class names.
+  if (err instanceof Error || err instanceof DOMException) return err.name || 'Error';
   return 'Unknown';
 }
 

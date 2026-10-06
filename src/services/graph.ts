@@ -228,14 +228,20 @@ async function fetchJsonBody(
   }
   const res = await storageFetch(link, { signal: jsonSignal(opts.signal) });
   if (!res.ok) {
-    if (res.status === 429 || res.status === 503) {
-      counters.throttles++;
-      const retryAfter = parseInt(res.headers.get('Retry-After') ?? '', 10);
-      throw new GraphHttpError(res.status, 'content host', undefined, Number.isFinite(retryAfter) ? retryAfter : 30);
-    }
+    if (res.status === 429 || res.status === 503) throw contentThrottleError(res);
     throw new DownloadError(res.status);
   }
   return res.json();
+}
+
+/**
+ * A 429/503 from the content host, as the error the coordinator's throttle
+ * gate understands. Retry-After is honoured when the host exposes it.
+ */
+function contentThrottleError(res: Response): GraphHttpError {
+  counters.throttles++;
+  const retryAfter = parseInt(res.headers.get('Retry-After') ?? '', 10);
+  return new GraphHttpError(res.status, 'content host', undefined, Number.isFinite(retryAfter) ? retryAfter : 30);
 }
 
 /**
@@ -573,6 +579,9 @@ export async function fetchThumbnail(scope: Scope, itemId: string): Promise<Blob
     const data = await res.json();
     if (!data.url) return null;
     const imgRes = await storageFetch(data.url, { signal: jsonSignal(undefined, THUMBNAIL_TIMEOUT_MS) });
+    // Throttled is not "no thumbnail": reporting it as a miss would send the
+    // caller off to download the full image, the opposite of backing off.
+    if (imgRes.status === 429 || imgRes.status === 503) throw contentThrottleError(imgRes);
     if (!imgRes.ok) return null;
     return imgRes.blob();
   } catch (err) {
@@ -643,6 +652,8 @@ const DELTA_CONCURRENCY = 6;
 /** The first hand-over is small, so the screen fills quickly; later ones batch up. */
 const FIRST_BATCH = 10;
 const BATCH = 25;
+/** How long finished drops wait for an in-order batch before going out as they are. */
+const HAND_OVER_PATIENCE_MS = 1_000;
 
 function deltaStartUrl(scope: Scope): string {
   return scope.kind === 'private'
@@ -673,8 +684,8 @@ export function isAccessLostError(err: unknown): boolean {
  *    means the whole change set is known before any body is fetched.
  * 2. Download the bodies this device doesn't already hold, several at once
  *    and newest first — drop ids are ULIDs, so the bottom of the feed (what
- *    the user is looking at) fills in first — handing them to `onBatch` as
- *    they arrive.
+ *    the user is looking at) fills in first — handing them to `onBatch` in
+ *    that same order as they complete.
  *
  * The next delta token comes back only when every body downloaded, so a
  * failure replays the changes next time instead of losing them. Batches
@@ -761,8 +772,20 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
   opts.onEnumerated?.(pending.length);
 
   // ── 2. download, newest first ──
-  let ready: DropRecord[] = [];
+  // One slot per `pending` place: undefined while its body is downloading,
+  // the record once it has arrived, null once there is nothing (left) to
+  // hand over — a body that failed validation, or a record already handed.
+  //
+  // Downloads finish in any order, but drops are handed over in `pending`
+  // order, so the feed grows upward from the newest with no gaps to fill in
+  // later. A body that is merely slower than its neighbours delays the
+  // hand-over behind it, never the downloads. One that stays missing past
+  // HAND_OVER_PATIENCE_MS stops being waited for: what has arrived is handed
+  // over around it, and the straggler slots in when it lands.
+  const slots = new Array<DropRecord | null | undefined>(pending.length);
+  let cursor = 0; // first slot that still has something to hand over, or to wait for
   let handedOver = 0;
+  let lastHandOverAt = performance.now();
   let handing: Promise<void> = Promise.resolve();
   const failure: { failed: boolean; error?: unknown; commitFailed: boolean } = { failed: false, commitFailed: false };
   const fail = (error: unknown) => {
@@ -772,16 +795,29 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
   };
 
   /**
-   * Hand finished drops to the caller, one batch at a time. After a batch
-   * fails to commit, nothing more is handed over; after a download fails,
-   * what did arrive still is.
+   * Hand finished drops to the caller, one batch at a time. 'in-order'
+   * takes the run up to the first body still downloading, once it is a
+   * batch's worth; 'everything' takes whatever has arrived. After a batch
+   * fails to commit, nothing more is handed over.
    */
-  const handOver = (final: boolean) => {
-    if (!opts.onBatch || ready.length === 0) return;
-    if (!final && ready.length < (handedOver === 0 ? FIRST_BATCH : BATCH)) return;
-    const batch = ready;
-    ready = [];
+  const handOver = (mode: 'in-order' | 'everything'): boolean => {
+    if (!opts.onBatch) return false;
+    const take: number[] = [];
+    for (let i = cursor; i < slots.length; i++) {
+      const slot = slots[i];
+      if (slot === undefined) {
+        if (mode === 'in-order') break;
+      } else if (slot) {
+        take.push(i);
+      }
+    }
+    if (take.length === 0) return false;
+    if (mode === 'in-order' && take.length < (handedOver === 0 ? FIRST_BATCH : BATCH)) return false;
+    const batch = take.map(i => slots[i] as DropRecord);
+    for (const i of take) slots[i] = null;
+    while (cursor < slots.length && slots[cursor] === null) cursor++;
     handedOver += batch.length;
+    lastHandOverAt = performance.now();
     const onBatch = opts.onBatch;
     handing = handing
       .then(() => (failure.commitFailed ? undefined : onBatch(batch)))
@@ -789,13 +825,14 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
         failure.commitFailed = true;
         fail(err);
       });
+    return true;
   };
 
   try {
     await mapLimited(
       pending,
       DELTA_CONCURRENCY,
-      async op => {
+      async (op, index) => {
         // A batch that failed to commit fails the pass — stop fetching.
         if (failure.commitFailed) throw failure.error;
         const fallbackUrl = scope.kind === 'private'
@@ -809,14 +846,19 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
         );
         if (stats) stats.downloaded++;
         const meta = validateDropMeta(parsed, { expectedId: op.id, requireAuthor: isChat });
-        if (!meta) {
+        if (meta) {
+          seenIds.add(op.id);
+          slots[index] = { meta, eTag: op.eTag };
+        } else {
           console.debug('[Sync] Discarding malformed drop JSON: %s.json', op.id);
           if (stats) stats.malformed++;
-          return;
+          slots[index] = null;
         }
-        seenIds.add(op.id);
-        ready.push({ meta, eTag: op.eTag });
-        handOver(false);
+        // In order while that keeps moving; around a straggler (or a slow
+        // connection that hasn't filled a batch) once patience runs out.
+        if (!handOver('in-order') && performance.now() - lastHandOverAt > HAND_OVER_PATIENCE_MS) {
+          handOver('everything');
+        }
       },
       signal,
     );
@@ -827,13 +869,14 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
   if (failure.failed) {
     // Keep what did arrive: those drops are real server state, and the next
     // attempt skips them by eTag instead of fetching them again.
-    handOver(true);
+    handOver('everything');
     await handing;
     throw failure.error;
   }
   await handing;
   if (failure.failed) throw failure.error;
-  return { upserts: ready, removals, fullResync, seenIds, deltaLink };
+  const upserts = slots.filter((record): record is DropRecord => Boolean(record));
+  return { upserts, removals, fullResync, seenIds, deltaLink };
 }
 
 export function clearDeltaToken(scope: Scope): Promise<void> {
