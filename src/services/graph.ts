@@ -56,13 +56,20 @@ const THUMBNAIL_TIMEOUT_MS = 60_000;
  * reading the body too — and a read cut short by it does not reliably say
  * so: it can reject with a bare AbortError rather than the TimeoutError the
  * signal was aborted with. `fail` settles that in one place.
+ *
+ * The limit starts when the request is sent. Getting an access token first
+ * (MSAL, in graphFetch) is outside it.
  */
 interface Deadline {
   signal: AbortSignal;
   /**
-   * Rethrow `err` — as a TimeoutError, counted for diagnostics, when this
-   * deadline is what ended the request. The retry logic treats a timeout as
-   * transient; an unexplained abort it would not.
+   * Rethrow `err`, classified by what actually happened:
+   * - this deadline ended the request: a TimeoutError, counted for diagnostics;
+   * - an AbortError nobody asked for (some engines report a connection lost
+   *   mid-body that way): a network error, like any other dropped connection;
+   * - anything else, a deliberate abort included: unchanged.
+   * The retry logic treats timeouts and network errors as transient; an
+   * unexplained abort it would not.
    */
   fail(err: unknown): never;
 }
@@ -97,6 +104,9 @@ function deadline(outer?: AbortSignal | null, ms = JSON_TIMEOUT_MS): Deadline {
       if (timeout.aborted && !outer?.aborted) {
         counters.timeouts++;
         throw new DOMException('The operation timed out.', 'TimeoutError');
+      }
+      if (err instanceof DOMException && err.name === 'AbortError' && !outer?.aborted) {
+        throw new TypeError('Network error while reading the response');
       }
       throw err;
     },
@@ -142,46 +152,60 @@ export interface GraphInit extends RequestInit {
 /** Statuses whose responses carry no body (and may not be rebuilt with one). */
 const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
 
-export async function graphFetch(url: string, init?: GraphInit, tier: TokenTier = 'base'): Promise<Response> {
+/**
+ * One authenticated Graph request. `read` consumes the response inside the
+ * request's deadline (when it has one), so the limit covers the body and a
+ * stall there is counted and classified like any other timeout.
+ */
+async function graphRequest<T>(
+  url: string,
+  init: GraphInit | undefined,
+  tier: TokenTier,
+  read: (res: Response, limited: boolean) => Promise<T>,
+): Promise<T> {
   const headers = await authHeaders(tier);
   counters.graph++;
   const { noTimeout, timeoutMs, ...request } = init ?? {};
   const limit: Deadline | null = noTimeout ? null : deadline(request.signal, timeoutMs);
-  let res: Response;
   try {
-    res = await fetch(url, {
+    const res = await fetch(url, {
       ...request,
       signal: limit ? limit.signal : request.signal,
       headers: { ...headers, ...(request.headers as Record<string, string> | undefined) },
     });
+    if (!res.ok) {
+      if (res.status === 429 || res.status === 503) counters.throttles++;
+      const retryAfter = res.headers.get('Retry-After');
+      throw new GraphHttpError(
+        res.status,
+        url,
+        undefined,
+        retryAfter ? parseInt(retryAfter, 10) : undefined,
+      );
+    }
+    return await read(res, limit !== null);
   } catch (err) {
-    if (limit) limit.fail(err);
+    // An HTTP error is an answer, not a failed request: never reclassified.
+    if (limit && !(err instanceof GraphHttpError)) return limit.fail(err);
     throw err;
   }
-  if (!res.ok) {
-    if (res.status === 429 || res.status === 503) counters.throttles++;
-    const retryAfter = res.headers.get('Retry-After');
-    throw new GraphHttpError(
-      res.status,
-      url,
-      undefined,
-      retryAfter ? parseInt(retryAfter, 10) : undefined,
-    );
-  }
-  if (!limit) return res;
-  // Read the body here, under the same limit, and hand back a response that
-  // already holds it: callers go on to res.json() and the like, and a stall
-  // there would be outside anything that could time it, count it or retry it.
-  try {
+}
+
+export function graphFetch(url: string, init?: GraphInit, tier: TokenTier = 'base'): Promise<Response> {
+  return graphRequest(url, init, tier, async (res, limited) => {
+    if (!limited) return res;
+    // Read the body here, under the limit, and hand back a response that
+    // already holds it: callers go on to res.json() and the like, and a
+    // stall there would be outside anything that could time it or retry it.
+    // (For the small JSON these requests carry. A file goes through
+    // downloadDropFile, which reads its bytes straight into a Blob.)
     const body = await res.arrayBuffer();
     return new Response(NULL_BODY_STATUS.has(res.status) ? null : body, {
       status: res.status,
       statusText: res.statusText,
       headers: res.headers,
     });
-  } catch (err) {
-    return limit.fail(err);
-  }
+  });
 }
 
 /**
@@ -659,10 +683,11 @@ function fileItemUrl(scope: Scope, itemId: string): string {
  * preview passes a limit, so a transfer left hanging can't hold a preview
  * slot for the rest of the session.
  */
-export async function downloadDropFile(scope: Scope, itemId: string, opts: { timeoutMs?: number } = {}): Promise<Blob> {
+export function downloadDropFile(scope: Scope, itemId: string, opts: { timeoutMs?: number } = {}): Promise<Blob> {
   const init: GraphInit = opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : { noTimeout: true };
-  const res = await graphFetch(`${fileItemUrl(scope, itemId)}/content`, init, scopeTier(scope));
-  return res.blob();
+  // Straight into a Blob, inside the limit when there is one — not through
+  // graphFetch's buffering, which would hold a large image in memory twice.
+  return graphRequest(`${fileItemUrl(scope, itemId)}/content`, init, scopeTier(scope), res => res.blob());
 }
 
 /**
