@@ -119,6 +119,7 @@
   transition: border-color var(--ease), color var(--ease);
 }
 .settings-button-danger:hover { color: var(--danger); border-color: var(--danger); }
+.settings-button:disabled { opacity: 0.5; cursor: default; }
 
 .settings-actions {
   display: flex;

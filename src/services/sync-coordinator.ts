@@ -268,9 +268,23 @@ export async function discardOutboxRecord(id: string): Promise<void> {
   // A discarded edit never reached OneDrive: put the server's version back
   // over the optimistic local copy. Its eTag still matches the server's, so
   // no sync pass would ever correct it.
-  if (record?.op === 'edit' && record.prevMeta) {
-    const existing = await db.getDrop(scopeId, id);
-    if (existing) await db.putDrop(scopeId, { ...existing, meta: record.prevMeta });
+  const existing = record?.op === 'edit' ? await db.getDrop(scopeId, id) : undefined;
+  if (existing && record?.prevMeta) {
+    await db.putDrop(scopeId, { ...existing, meta: record.prevMeta });
+  } else if (existing) {
+    // An edit queued by an older build kept no original to restore. Forget
+    // the row's eTag, so it stops matching the server's, and make the next
+    // pass enumerate everything: that pass downloads the real version (or
+    // sweeps the drop if it is gone). The token is cleared as well so the
+    // full pass still happens if the app closes first; the flag covers a
+    // pass already running, whose commit would put a token back.
+    await db.putDrop(scopeId, { ...existing, eTag: undefined });
+    const scope = await resolveScope(scopeId);
+    if (scope) {
+      stateFor(scopeId).forceFull = true;
+      await graph.clearDeltaToken(scope);
+      void requestSync(scope, { force: true });
+    }
   }
   emit({ type: 'feed-updated', scopeId });
 }
@@ -420,6 +434,8 @@ interface ScopeSyncState {
   completedOnce: boolean;
   /** Aborts the running pass (a reset, or sign-out). */
   controller: AbortController | null;
+  /** The next pass ignores its delta token and enumerates the whole scope. */
+  forceFull: boolean;
   /** Quick retries spent since the last completed pass. */
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -465,6 +481,7 @@ function stateFor(scopeId: ScopeId): ScopeSyncState {
       lastDescriptorFetch: 0,
       completedOnce: false,
       controller: null,
+      forceFull: false,
       retryCount: 0,
       retryTimer: undefined,
     };
@@ -747,6 +764,10 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
       /** Drops that arrived in batches this pass committed — announced even if it fails later. */
       const arrivals: DropMeta[] = [];
       let received = 0;
+      // Someone asked for a full enumeration (see discardOutboxRecord).
+      // Taken before the snapshot below; handed back if this pass fails.
+      const fromScratch = st.forceFull;
+      st.forceFull = false;
 
       try {
         let chatRecord: ChatRecord | undefined;
@@ -773,7 +794,10 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         const heldBefore = new Set(known.keys());
         const selfId = scope.kind === 'private' ? device.getDeviceId() : (await ensureMe())?.id;
         // Decided up front, so a first sync that fails is still recorded as one.
-        if (chatRecord?.syncStrategy !== 'listing' && !(await db.getSetting(graph.deltaTokenKey(scope)))) {
+        if (
+          chatRecord?.syncStrategy !== 'listing' &&
+          (fromScratch || !(await db.getSetting(graph.deltaTokenKey(scope))))
+        ) {
           mode = 'full';
         }
 
@@ -782,6 +806,7 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         const deltaOpts: graph.DeltaOptions = {
           stats: counts,
           known,
+          fromScratch,
           signal: controller.signal,
           onEnumerated: toDownload => {
             total = toDownload;
@@ -844,7 +869,9 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           settingsDelete,
         });
         arrivals.push(...finalArrivals);
-        firstCommitMs ??= performance.now() - t0;
+        // "First drops" only when this commit carried some: an empty account,
+        // or a pass that skipped every body, shows no such moment.
+        if (result.upserts.length) firstCommitMs ??= performance.now() - t0;
         received += result.upserts.length;
         removed = deletes.size;
         st.completedOnce = true;
@@ -890,6 +917,7 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         outcome = 'error';
         error = errorLabel(err);
         aborted = controller.signal.aborted;
+        if (fromScratch) st.forceFull = true;
         if (aborted) {
           // A reset or sign-out stopped this pass on purpose — not a failure
           // to report; whoever aborted it takes it from here.

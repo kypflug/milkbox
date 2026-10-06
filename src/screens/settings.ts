@@ -163,7 +163,7 @@ export function mountSettingsFlyout(
           <h3 class="settings-label">Sync diagnostics</h3>
           <dl class="settings-stats" data-sync-stats></dl>
           <div class="settings-actions">
-            <button class="settings-button" data-settings-action="copy-report">Copy report</button>
+            <button class="settings-button" data-settings-action="copy-report" disabled>Copy report</button>
             <button class="settings-button" data-settings-action="resync">Re-sync from scratch</button>
           </div>
         </section>
@@ -175,6 +175,7 @@ export function mountSettingsFlyout(
   const closeButton = panel.querySelector<HTMLButtonElement>('.settings-close')!;
   const deviceInput = panel.querySelector<HTMLInputElement>('.settings-input')!;
   const statsEl = panel.querySelector<HTMLElement>('[data-sync-stats]')!;
+  const copyReportButton = panel.querySelector<HTMLButtonElement>('[data-settings-action="copy-report"]')!;
   const resizeObserver = new ResizeObserver(() => {
     if (!panel.hidden) positionPanel();
   });
@@ -184,12 +185,17 @@ export function mountSettingsFlyout(
   let report = '';
 
   async function paintDiagnostics(): Promise<void> {
+    // Nothing to copy until this opening's snapshot is ready — never an
+    // empty report, or the one from the last time the panel was open.
+    report = '';
+    copyReportButton.disabled = true;
     try {
       const diagnostics = await getDiagnostics();
       statsEl.innerHTML = diagnosticsRows(diagnostics)
         .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`)
         .join('');
       report = diagnosticsReport(diagnostics);
+      copyReportButton.disabled = false;
     } catch (err) {
       console.debug('[Settings] Diagnostics unavailable:', err);
       statsEl.innerHTML = '<div><dd>Diagnostics are unavailable right now.</dd></div>';
@@ -300,15 +306,15 @@ export function mountSettingsFlyout(
       await signOut();
     });
 
-  panel.querySelector<HTMLButtonElement>('[data-settings-action="copy-report"]')!
-    .addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(report);
-        showToast('Sync report copied');
-      } catch {
-        showToast('Copy failed', 'error');
-      }
-    });
+  copyReportButton.addEventListener('click', async () => {
+    if (!report) return;
+    try {
+      await navigator.clipboard.writeText(report);
+      showToast('Sync report copied');
+    } catch {
+      showToast('Copy failed', 'error');
+    }
+  });
 
   panel.querySelector<HTMLButtonElement>('[data-settings-action="resync"]')!
     .addEventListener('click', () => {

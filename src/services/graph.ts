@@ -35,15 +35,21 @@ export const folderCtagKey = (scope: Scope) => `milkbox:ctag:${scopeIdOf(scope)}
  * run longer on a slow connection.
  */
 const JSON_TIMEOUT_MS = 20_000;
+/**
+ * Thumbnail bytes are a file transfer too, but a bounded one (a preview
+ * image), and a hung one would hold one of the few preview slots until a
+ * relaunch — so they get a limit of their own, generous for a slow link.
+ */
+const THUMBNAIL_TIMEOUT_MS = 60_000;
 
-/** A signal that aborts after the JSON timeout, or when `outer` does. */
-export function jsonSignal(outer?: AbortSignal): AbortSignal {
+/** A signal that aborts after the JSON timeout (or `ms`), or when `outer` does. */
+export function jsonSignal(outer?: AbortSignal, ms = JSON_TIMEOUT_MS): AbortSignal {
   let timeout: AbortSignal;
   if (typeof AbortSignal.timeout === 'function') {
-    timeout = AbortSignal.timeout(JSON_TIMEOUT_MS);
+    timeout = AbortSignal.timeout(ms);
   } else {
     const controller = new AbortController();
-    setTimeout(() => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')), JSON_TIMEOUT_MS);
+    setTimeout(() => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')), ms);
     timeout = controller.signal;
   }
   if (!outer) return timeout;
@@ -566,7 +572,7 @@ export async function fetchThumbnail(scope: Scope, itemId: string): Promise<Blob
     );
     const data = await res.json();
     if (!data.url) return null;
-    const imgRes = await storageFetch(data.url, { signal: jsonSignal() });
+    const imgRes = await storageFetch(data.url, { signal: jsonSignal(undefined, THUMBNAIL_TIMEOUT_MS) });
     if (!imgRes.ok) return null;
     return imgRes.blob();
   } catch (err) {
@@ -595,7 +601,10 @@ export interface DeltaOptions {
   /** How many bodies the pass is about to download. */
   onEnumerated?: (toDownload: number) => void;
   signal?: AbortSignal;
-  /** Ignore the saved token — the restart after it expired. */
+  /**
+   * Ignore the saved token and enumerate everything: the restart after it
+   * expired, or a caller that needs every drop checked against the server.
+   */
   fromScratch?: boolean;
 }
 
