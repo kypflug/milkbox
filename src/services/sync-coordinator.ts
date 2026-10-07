@@ -198,6 +198,10 @@ export function setActiveScopeId(scopeId: ScopeId): Promise<void> {
  * The rendered feed for one scope: synced drops from IDB with pending outbox
  * records overlaid (an outbox create shows as 'sending'/'failed'; an outbox
  * delete hides the drop before the server confirms). Sorted by ULID.
+ *
+ * A delete hides its drop whatever state its row is in: the row is retried
+ * until it lands, and is taken away again if it never can (see
+ * processOutboxRecord, withdrawDelete).
  */
 export async function loadFeed(scopeId: ScopeId): Promise<DropRecord[]> {
   const [drops, outbox] = await Promise.all([db.getScopeDrops(scopeId), db.getOutbox()]);
@@ -249,6 +253,20 @@ export async function renameCurrentDevice(name: string): Promise<void> {
 
 const MAX_ATTEMPTS = 3;
 const BACKOFF_BASE_MS = 1000;
+/** Only a delete keeps going long enough to reach this (see processOutboxRecord). */
+const BACKOFF_CAP_MS = 5 * 60_000;
+
+/**
+ * Whether a record is the drain's to take now. A failed create or edit
+ * waits for its card's Retry. A delete is never failed for good: one found
+ * marked so — by a build from before deletes were retried, or a tab still
+ * running one — is as due as any other, and one that is backing off is due
+ * when its wait is over.
+ */
+function isDue(record: OutboxRecord, now = Date.now()): boolean {
+  if (record.op !== 'delete') return record.state !== 'failed';
+  return (record.nextAt ?? 0) <= now;
+}
 
 /**
  * Storage refused to queue something for a chat (see db.writeForScope): the
@@ -433,6 +451,9 @@ class SendWithdrawnError extends Error {}
  * exponential backoff; throttle responses (429/503) pause the whole drain
  * for the server-requested interval. A send queued mid-drain is picked up by
  * the same drain rather than waiting for the next pass.
+ *
+ * A delete that used up those tries is not failed. It stays queued, and each
+ * later drain that finds its backoff over gives it one more.
  */
 export async function drainOutbox(scopeId: ScopeId): Promise<void> {
   if (drainingScopes.has(scopeId)) {
@@ -446,12 +467,20 @@ export async function drainOutbox(scopeId: ScopeId): Promise<void> {
       const scope = await resolveScope(scopeId);
       // The chat left this device, and its queued sends went with it.
       if (!scope) continue;
+      const gone = scope.kind === 'chat' && (await db.getChat(scope.chatId))?.state === 'gone';
       const records = (await db.getOutbox()).filter(r => (r.scopeId ?? PRIVATE_SCOPE_ID) === scopeId);
       // Oldest first so the feed lands in order
       records.sort((a, b) => (a.id < b.id ? -1 : 1));
 
       for (const record of records) {
-        if (record.state === 'failed') continue;
+        if (record.op === 'delete' && gone) {
+          await withdrawDelete(scope, record);
+          continue;
+        }
+        if (!isDue(record)) continue;
+        // A delete on a later try is not worth a request the server has asked
+        // not to get; and its 429 would only push the gate out further.
+        if (record.op === 'delete' && record.attempts >= MAX_ATTEMPTS && isThrottled()) continue;
         await processOutboxRecord(scope, record);
       }
     } while (drainAgainScopes.has(scopeId));
@@ -459,6 +488,56 @@ export async function drainOutbox(scopeId: ScopeId): Promise<void> {
     drainingScopes.delete(scopeId);
     drainAgainScopes.delete(scopeId);
   }
+}
+
+/**
+ * Try every waiting delete now. A delete's backoff is mostly made of
+ * failures that said only that the connection was down, and left to run it
+ * would hold the delete back for minutes after the network returns — the
+ * drop still showing on every other device meanwhile. The poll needs none
+ * of this, it takes a delete as it falls due; this is for the moments when
+ * the reason it failed has most likely gone: the app starting, coming back
+ * to the foreground or back online, a paused chat reconnected.
+ *
+ * Not while the throttle gate is up: that wait is the server's. Never
+ * rejects.
+ */
+export async function retryDeferredDeletes(): Promise<void> {
+  if (shuttingDown || isThrottled()) return;
+  try {
+    const now = Date.now();
+    const scopes = new Map<ScopeId, Scope | null>();
+    for (const r of await db.getOutbox()) {
+      if (r.op !== 'delete') continue;
+      const scopeId = r.scopeId ?? PRIVATE_SCOPE_ID;
+      if (!scopes.has(scopeId)) scopes.set(scopeId, await resolveScope(scopeId));
+      const scope = scopes.get(scopeId);
+      if (!scope) continue;
+      // Only a row that is waiting is rewritten. One that is due may be
+      // mid-send in some tab's drain, which keeps its own copy of the row.
+      if ((r.nextAt ?? 0) > now) await db.updateOutboxRecord(scopeRefOf(scope), { ...r, nextAt: undefined });
+    }
+    for (const [scopeId, scope] of scopes) {
+      if (scope) void drainOutbox(scopeId).catch(err => console.debug('[Outbox] Drain of %s failed:', scopeId, err));
+    }
+  } catch (err) {
+    console.debug('[Outbox] Could not bring waiting deletes forward:', err);
+  }
+}
+
+/**
+ * Take back a delete that can never be delivered: its chat is gone, and a
+ * gone chat is never synced again. The drop it was hiding shows once more in
+ * what was last synced — which is the truth of it, since the delete did not
+ * happen. Left in place, the row would hide the drop for good with nothing
+ * left to act on it.
+ */
+async function withdrawDelete(scope: Scope, record: OutboxRecord): Promise<void> {
+  if (!(await db.removeOutboxRecord(scopeRefOf(scope), record))) return;
+  const scopeId = scopeIdOf(scope);
+  console.warn('[Outbox] delete %s can no longer be delivered — the drop is kept', record.id);
+  emit({ type: 'feed-updated', scopeId });
+  postBroadcast({ type: 'drop-mutated', dropId: record.id, action: 'upsert', scopeId });
 }
 
 /**
@@ -472,6 +551,17 @@ export async function drainOutbox(scopeId: ScopeId): Promise<void> {
  * and the row now there is neither overwritten nor removed. A request or
  * file upload already under way is left to finish; see performOp for what
  * happens after one.
+ *
+ * A create or an edit that runs out of tries is marked failed, and its card
+ * offers Retry and Discard. A delete has no card — the feed hides its drop —
+ * so failing it would leave the drop hidden here, still in OneDrive and on
+ * every other device, with nothing to retry it and nothing to say so. It
+ * goes back to queued instead, with the time it may next be tried: the
+ * backoff keeps doubling up to a cap, or is the server's Retry-After. Trying
+ * again is always safe, since deleting what is already gone succeeds (see
+ * graph.deleteDropJson). What ends a delete is landing, its drop being
+ * deleted again or its chat removed (either replaces or removes the row),
+ * or its chat being gone (see withdrawDelete).
  */
 async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<void> {
   const scopeId = scopeIdOf(scope);
@@ -482,8 +572,11 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
     emit({ type: 'feed-updated', scopeId });
     await removeUnsentUpload(scope, record);
   };
-  let attempts = record.attempts;
-  while (attempts < MAX_ATTEMPTS) {
+  // The count is whatever the row holds. A delete's loop below has no bound
+  // but this number reaching MAX_ATTEMPTS, so it has to be one.
+  let attempts = Number.isSafeInteger(record.attempts) && record.attempts >= 0 ? record.attempts : 0;
+  // A delete past its quick tries gets one per drain (see drainOutbox).
+  while (attempts < MAX_ATTEMPTS || record.op === 'delete') {
     try {
       // Mutate the in-memory record before persisting: performOp's
       // onSessionCreated later persists { ...record }, so a stale copy here
@@ -525,12 +618,19 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       const retryAfter =
         throttled && err instanceof graph.GraphHttpError && err.retryAfterSeconds
           ? err.retryAfterSeconds * 1000
-          : BACKOFF_BASE_MS * 2 ** (attempts - 1);
+          : Math.min(BACKOFF_BASE_MS * 2 ** (attempts - 1), BACKOFF_CAP_MS);
       if (throttled) noteThrottle(err);
       console.warn('[Outbox] %s %s failed (attempt %d):', record.op, record.id, attempts, err);
       if (attempts >= MAX_ATTEMPTS) {
         record.attempts = attempts;
-        record.state = 'failed';
+        if (record.op === 'delete') {
+          // Not waited out here: the drain, and the sync pass behind it,
+          // move on, and a later drain comes back to it.
+          record.state = 'queued';
+          record.nextAt = Date.now() + retryAfter;
+        } else {
+          record.state = 'failed';
+        }
         if (!(await db.updateOutboxRecord(ref, { ...record }))) return await stop();
         emit({ type: 'feed-updated', scopeId });
         return;
@@ -958,13 +1058,14 @@ async function handleChatGone(scope: ChatScope): Promise<void> {
   const record = await db.getChat(scope.chatId);
   if (!record || record.state === 'gone') return;
   if (!(await db.patchChat(scope.chatId, { state: 'gone' }, { generation: scope.generation }))) return;
-  // Queued sends for a gone chat can never deliver — make them terminal.
+  // Queued sends for a gone chat can never deliver — make them terminal. A
+  // create or an edit ends as a failed card; a delete has none to end on.
   const ref = scopeRefOf(scope);
   const outbox = await db.getOutbox();
   for (const r of outbox) {
-    if (r.scopeId === ref.scopeId && r.state !== 'failed') {
-      await db.updateOutboxRecord(ref, { ...r, state: 'failed' });
-    }
+    if (r.scopeId !== ref.scopeId) continue;
+    if (r.op === 'delete') await withdrawDelete(scope, r);
+    else if (r.state !== 'failed') await db.updateOutboxRecord(ref, { ...r, state: 'failed' });
   }
   emit({ type: 'chats-changed' });
   postBroadcast({ type: 'chats-changed' });
@@ -1114,6 +1215,10 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           // for: either way it is not this pass's chat any more.
           if (!chatRecord || chatRecord.state === 'gone' || chatRecord.generation !== scope.generation) {
             superseded = Boolean(chatRecord) && chatRecord?.generation !== scope.generation;
+            // No pass for a gone chat, but its outbox is still looked at: a
+            // delete left there (by an older build, or queued since) is
+            // withdrawn by the drain, and stops counting as work to poll for.
+            if (chatRecord?.state === 'gone') await drainOutbox(scopeId);
             emit({ type: 'sync-complete', scopeId });
             return;
           }
@@ -1457,7 +1562,7 @@ export async function syncIfDirty(scope: Scope): Promise<void> {
   const scopeId = scopeIdOf(scope);
   const outbox = await db.getOutbox();
   const hasWork =
-    outbox.some(r => r.state !== 'failed' && (r.scopeId ?? PRIVATE_SCOPE_ID) === scopeId) ||
+    outbox.some(r => isDue(r) && (r.scopeId ?? PRIVATE_SCOPE_ID) === scopeId) ||
     (scope.kind === 'private' && Boolean(await db.getSetting(PENDING_DEVICE_PROFILE_KEY)));
   // A pass that failed (the app was opened offline, say) is tried again even
   // if nothing changed remotely — otherwise "Sync failed" would sit there
@@ -1623,7 +1728,9 @@ async function pollScope(scopeId: ScopeId): Promise<void> {
  * Cheap poll tick. The active scope is dirty-checked every tick; background
  * scopes take turns, one per tick — so the ceiling is 5 cTag GETs per tick
  * (two registry folders, active + devices, one background) no matter how
- * many chats exist. Queued outbox work always forces a sync for its scope.
+ * many chats exist. Queued outbox work always forces a sync for its scope —
+ * a delete that is backing off only once its wait is over, so a scope is not
+ * synced every tick on account of one that keeps failing.
  */
 export async function pollAll(activeScopeId: ScopeId): Promise<void> {
   if (shuttingDown || Date.now() < throttledUntil) return;
@@ -1636,7 +1743,7 @@ export async function pollAll(activeScopeId: ScopeId): Promise<void> {
     const outbox = await db.getOutbox();
     const pendingProfile = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
     const scopesWithWork = new Set<ScopeId>(
-      outbox.filter(r => r.state !== 'failed').map(r => r.scopeId ?? PRIVATE_SCOPE_ID),
+      outbox.filter(r => isDue(r)).map(r => r.scopeId ?? PRIVATE_SCOPE_ID),
     );
     if (pendingProfile) scopesWithWork.add(PRIVATE_SCOPE_ID);
     for (const scopeId of scopesWithWork) {
@@ -1762,6 +1869,9 @@ export async function reactivateChat(chatId: string): Promise<void> {
   st.consecutiveGone = 0;
   emit({ type: 'chats-changed' });
   void requestSync(chatScopeOf({ ...record, state: 'active' }), { force: true });
+  // A delete made while the chat was paused has been backing off against
+  // the missing grant: that pass's drain would leave it to wait that out.
+  void retryDeferredDeletes();
 }
 
 export class JoinError extends Error {
