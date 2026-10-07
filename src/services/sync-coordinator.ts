@@ -106,15 +106,25 @@ export function ensureMe(): Promise<AuthorAttribution | null> {
 const STORE_OWNER_KEY = 'milkbox:owner';
 /** The owner marker a sign-out wipe leaves behind: nobody's, and not to be adopted. */
 const SIGNED_OUT = 'signed-out';
+/** How long sign-out waits for the wipe before going on without it. */
+const WIPE_LIMIT_MS = 10_000;
 
 /**
  * The sign-out wipe. It leaves a marker saying the store was emptied on
  * purpose, so anything found in it later was written behind the wipe's back
- * — a tab still on an older build can do that; the store epoch only stops
- * current ones — and is cleared, not adopted, when the next account arrives.
+ * and is cleared, not adopted, when the next account arrives. Nothing should
+ * get that far: the store epoch refuses such writes from this build's pages,
+ * and the database version shuts older builds out. The marker is the check
+ * that depends on neither.
+ *
+ * Bounded: IndexedDB can stop answering (on iOS above all), and a wipe that
+ * never settled would keep sign-out from ever reaching its redirect. A wipe
+ * given up on rejects. Unless it was already committing (then it lands after
+ * all), the store is left as it was, still marked as its account's — which
+ * claimStoreFor keeps for that account and clears for any other.
  */
 export function wipeForSignOut(): Promise<void> {
-  return db.clearAllData({ settings: [[STORE_OWNER_KEY, SIGNED_OUT]] });
+  return db.clearAllData({ settings: [[STORE_OWNER_KEY, SIGNED_OUT]], timeoutMs: WIPE_LIMIT_MS });
 }
 
 /**
@@ -608,11 +618,16 @@ function stateFor(scopeId: ScopeId): ScopeSyncState {
   return st;
 }
 
-async function syncDeviceProfiles(): Promise<{ cTag?: string; count: number }> {
+/** Throw if `signal` has been aborted — for stretches that make no request to notice it for them. */
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new DOMException('Sync pass aborted', 'AbortError');
+}
+
+async function syncDeviceProfiles(signal: AbortSignal): Promise<{ cTag?: string; count: number }> {
   const local = await ensureCurrentDeviceProfile();
   const pending = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
   if (pending) {
-    await graph.putDeviceProfile(pending);
+    await graph.putDeviceProfile(pending, signal);
     const latest = await db.getSetting<DeviceProfile>(PENDING_DEVICE_PROFILE_KEY);
     if (latest?.updatedAt === pending.updatedAt) {
       await db.deleteSetting(PENDING_DEVICE_PROFILE_KEY);
@@ -621,7 +636,8 @@ async function syncDeviceProfiles(): Promise<{ cTag?: string; count: number }> {
 
   const before = await db.getAllDeviceProfiles();
   // Unchanged since the last listing: one cTag GET, no downloads.
-  const snapshot = await graph.listDeviceProfiles(await graph.getKnownDeviceRegistryCTag());
+  const snapshot = await graph.listDeviceProfiles(await graph.getKnownDeviceRegistryCTag(), signal);
+  throwIfAborted(signal);
   if (!snapshot.profiles) return { cTag: snapshot.cTag, count: before.length };
   const remote = snapshot.profiles;
   const remoteLocal = remote.find(profile => profile.id === local.id);
@@ -649,14 +665,20 @@ async function syncDeviceProfiles(): Promise<{ cTag?: string; count: number }> {
  * ahead of them: they only label drops, so neither the feed nor a send should
  * wait on them. Never rejects. The registry cTag was read before the listing,
  * so marking it clean here can't hide a change that landed meanwhile.
+ *
+ * `signal` is its pass's: a sign-out or a reset that stops the pass stops
+ * this too, requests and all, rather than leaving it to run on alone.
  */
-async function runDevicesPhase(): Promise<{ ms: number; count?: number }> {
+async function runDevicesPhase(signal: AbortSignal): Promise<{ ms: number; count?: number }> {
   const t0 = performance.now();
   try {
-    const synced = await syncDeviceProfiles();
+    const synced = await syncDeviceProfiles(signal);
+    throwIfAborted(signal);
     if (synced.cTag) await graph.markDeviceRegistryClean(synced.cTag);
     return { ms: performance.now() - t0, count: synced.count };
   } catch (err) {
+    // Stopped along with its pass: nothing failed.
+    if (signal.aborted) return { ms: performance.now() - t0 };
     // Optional work, but a throttle is a throttle: it still raises the gate
     // every other request path honours.
     noteThrottle(err);
@@ -895,7 +917,7 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
       /** Stopped on purpose (a reset, a removed chat, sign-out), not failed. */
       let stopped = false;
 
-      const devicesTask = scope.kind === 'private' ? runDevicesPhase() : undefined;
+      const devicesTask = scope.kind === 'private' ? runDevicesPhase(controller.signal) : undefined;
       /** Drops that arrived in batches this pass committed — announced even if it fails later. */
       const arrivals: DropMeta[] = [];
       let received = 0;
@@ -917,7 +939,7 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         await drainOutbox(scopeId);
         // The drain takes no signal and can sit in a retry backoff: a reset
         // or a removed chat may have stopped this pass meanwhile.
-        if (controller.signal.aborted) throw new DOMException('Sync pass aborted', 'AbortError');
+        throwIfAborted(controller.signal);
 
         // The cTag this pass will commit, read BEFORE the delta (see
         // graph.readFeedCTag). A poll tick's value is only good for the
@@ -1098,12 +1120,15 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         }
       }
 
+      // The device phase can outlast the drops (always, when they failed
+      // early): the controller stays in place until it is done, so a
+      // sign-out or a reset arriving now still stops it.
+      const devicesPhase = await devicesTask;
       // An abort that landed after the pass's last abortable step (its final
       // commit, the roster refresh) still ends the loop: whoever aborted is
       // waiting for this pass to get out of the way, not for another one.
       aborted ||= controller.signal.aborted;
       st.controller = null;
-      const devicesPhase = await devicesTask;
       // A pass stopped on purpose did not fail: it must not show in Settings
       // as the latest failed sync. (One that failed by itself and was then
       // aborted while it wound down is still a failure, and is recorded.)
@@ -1208,9 +1233,8 @@ export async function resetScope(scope: Scope): Promise<void> {
     await db.resetScopeStore(scopeId, [...graph.syncStateKeys(scope), notifyPrimedKey(scopeId)]);
     postBroadcast({ type: 'store-reset' });
     // The pass below enumerates everything whatever token it finds. The
-    // epoch stops current builds, but a tab still on an older build could
-    // write its own (now meaningless) token back before this pass reads it,
-    // and an incremental pass from there would skip nearly every drop.
+    // epoch keeps other tabs from writing theirs back, but a re-sync that
+    // trusted a stray token would skip nearly every drop — so it trusts none.
     st.forceFull = true;
   } finally {
     resettingScopes.delete(scopeId);

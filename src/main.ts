@@ -51,7 +51,11 @@ boot(app).catch(err => {
 
   if (err instanceof Error) {
     const errMsg = err.message.toLowerCase();
-    if (errMsg.includes('localstorage') || errMsg.includes('quota') || errMsg.includes('storage')) {
+    if (errMsg.includes('upgrade is blocked')) {
+      // A window on the previous version still has the store open (db.ts).
+      errorMessage = 'Milkbox is open in another window';
+      errorDetails = 'This version needs to update its local storage first. Close other Milkbox windows, then reload.';
+    } else if (errMsg.includes('localstorage') || errMsg.includes('quota') || errMsg.includes('storage')) {
       errorMessage = 'Storage access blocked';
       errorDetails = 'Milkbox needs storage access to work. Please disable Private Browsing or use a different browser.';
     } else if (errMsg.includes('network') || errMsg.includes('fetch') || errMsg.includes('timeout')) {
@@ -79,6 +83,11 @@ boot(app).catch(err => {
 async function boot(app: HTMLElement): Promise<void> {
   applyTheme();
   trackWindowControlsSide();
+  // Before the first await: a broadcast is not replayed, so a sign-out in
+  // another tab while this one restores its token cache or starts MSAL
+  // would be missed — and this page would enter the app as the account that
+  // was just signed out.
+  watchForSignOutElsewhere(app);
 
   // Restore MSAL cache from IndexedDB if iOS wiped localStorage
   const cacheRestored = await restoreMsalCacheIfNeeded();
@@ -103,11 +112,19 @@ async function boot(app: HTMLElement): Promise<void> {
     ? decodeURIComponent(location.hash.slice(6))
     : null;
   const invitedToken = rawInvited && isValidShareToken(rawInvited) ? rawInvited : null;
-  const signedIn = Boolean(redirectResponse?.account) || isSignedIn();
+  // Signed out in another tab while this one was starting: whatever account
+  // MSAL has just loaded is on its way out, so this page is not signed in.
+  const signedIn = !signedOutElsewhere && (Boolean(redirectResponse?.account) || isSignedIn());
   if (invitedToken && !signedIn) {
     invitedSignIn = true;
     await setPendingAction({ type: 'join', token: invitedToken, createdAt: Date.now(), parkedSignedOut: true });
     history.replaceState(null, '', '/');
+  }
+  if (signedOutElsewhere) {
+    // Its screen is up already; drawn again now that this is known to be an
+    // invite or not.
+    showSignedOutElsewhere(app);
+    return;
   }
 
   if (signedIn) {
@@ -119,6 +136,9 @@ async function boot(app: HTMLElement): Promise<void> {
     console.debug('[Boot] Account evidence exists (cacheRestored=%s, hint=%s) — attempting recovery',
       cacheRestored, hasAccountHint());
     const recovered = await tryRecoverAuth();
+    // The evidence was the account another tab has just signed out: neither
+    // enter the app as it nor send the user to sign in to it again.
+    if (signedOutElsewhere) return;
     if (recovered && isSignedIn()) {
       console.info('[Boot] Auth recovered without user interaction');
       clearAutoRedirectMark();
@@ -226,47 +246,74 @@ function showSignedOutElsewhere(app: HTMLElement): void {
   // Sheets hang off <body>: left open they would keep showing the signed-out
   // account's chat members or invite link over the sign-in screen.
   closeAllModals();
-  renderSignIn(app, () => location.reload());
+  renderSignIn(app, () => location.reload(), { invited: invitedSignIn });
+}
+
+/**
+ * Listen for a sign-out in another tab, from the first moment of boot to the
+ * end of the page. Once that tab's wipe lands, a page that had already
+ * opened the store is on a superseded epoch and its writes are refused (see
+ * db.ts); one that has not opened it yet would simply start on whatever the
+ * store then holds. Neither is something to lean on — the wipe is bounded
+ * and can be given up on — so either way this page must not carry on as it
+ * was, nor start up as if nothing had happened.
+ */
+function watchForSignOutElsewhere(app: HTMLElement): void {
+  initBroadcast();
+  onBroadcast(event => {
+    if (event.type !== 'auth-changed' || event.signedIn) return;
+    // Not a reload: the other tab's logout may not have cleared the token
+    // cache yet, and a reload would boot straight back into this account.
+    signedOutElsewhere = true;
+    coordinator.shutdown();
+    // This tab's backup hooks (pagehide, going hidden) may be armed and the
+    // token cache is still in localStorage until that logout finishes: a
+    // backup from here would recreate the snapshot sign-out just deleted.
+    void clearMsalCacheBackup();
+    showSignedOutElsewhere(app);
+  });
 }
 
 /** Transition to the main app: routing, share target, and resume handler. */
 async function enterApp(app: HTMLElement): Promise<void> {
-  initBroadcast();
-  // Subscribed first, before any await: another tab signing out, or
-  // re-syncing from scratch, must not be missed while this one is still
-  // starting up. Either way this page's view of local storage is superseded
-  // and its writes are refused (see the store epoch in db.ts), so it must
-  // not carry on as it was.
+  // Told of a sign-out since it loaded, this page is shut down for good (see
+  // watchForSignOutElsewhere) and must not claim the store. If it has been
+  // signed in again in place — the iOS sign-in sheet returns to the same
+  // page — it starts over.
+  if (signedOutElsewhere) {
+    location.reload();
+    return;
+  }
+  // Subscribed before any await here: another tab re-syncing from scratch
+  // must not be missed while this one is still starting up. This page's view
+  // of local storage is then superseded and its writes are refused (see the
+  // store epoch in db.ts).
   onBroadcast(event => {
-    if (event.type === 'auth-changed' && !event.signedIn) {
-      // Not a reload: the other tab's logout may not have cleared the token
-      // cache yet, and a reload would boot straight back into this account.
-      signedOutElsewhere = true;
-      coordinator.shutdown();
-      // This tab's backup hooks (pagehide, going hidden) are still armed and
-      // the token cache is still in localStorage until that logout finishes:
-      // a backup from here would recreate the snapshot sign-out just deleted.
-      void clearMsalCacheBackup();
-      showSignedOutElsewhere(app);
-    } else if (event.type === 'store-reset') {
-      // This page has to reload before it can write again — but not over
-      // something the user hasn't sent yet. Then it is their call.
-      if (hasUnsentDraft()) {
-        showToast('Milkbox was re-synced in another window. Reload this one when you’re ready.', 'info', {
-          label: 'Reload',
-          onClick: () => location.reload(),
-          duration: 10 * 60_000,
-        });
-      } else {
-        location.reload();
-      }
+    if (event.type !== 'store-reset') return;
+    // This page has to reload before it can write again — but not over
+    // something the user hasn't sent yet. Then it is their call.
+    if (hasUnsentDraft()) {
+      showToast('Milkbox was re-synced in another window. Reload this one when you’re ready.', 'info', {
+        label: 'Reload',
+        onClick: () => location.reload(),
+        duration: 10 * 60_000,
+      });
+    } else {
+      location.reload();
     }
   });
   postBroadcast({ type: 'auth-changed', signedIn: true });
   try {
     // Before anything reads the store: data left by a different account goes.
     const accountId = getAccountId();
-    if (accountId) await coordinator.claimStoreFor(accountId);
+    if (accountId) {
+      await coordinator.claimStoreFor(accountId);
+      // The sign-out landed while the claim was under way. If its wipe ran
+      // first, the claim has just replaced the "signed out" marker with this
+      // account's: put the wipe back, so that whatever is written behind it
+      // is still cleared, not adopted, when an account next signs in.
+      if (signedOutElsewhere) await coordinator.wipeForSignOut();
+    }
     await route(app);
     window.addEventListener('hashchange', () => void route(app));
     // Anything a consent redirect / sign-in / iOS sheet interrupted.

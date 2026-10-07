@@ -478,11 +478,12 @@ export async function deleteDropFiles(scope: Scope, id: string): Promise<void> {
 
 // ─── device profiles ───
 
-export async function putDeviceProfile(profile: DeviceProfile): Promise<void> {
+export async function putDeviceProfile(profile: DeviceProfile, signal?: AbortSignal): Promise<void> {
   await graphFetch(contentUrl(APPROOT, deviceJsonPath(profile.id)), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(profile, null, 2),
+    signal,
   });
 }
 
@@ -509,11 +510,12 @@ export function getKnownDeviceRegistryCTag(): Promise<string | undefined> {
  * List every device profile. Pass the cTag recorded after the last listing
  * as `skipIfCTag` and an unchanged registry costs one tiny GET instead of a
  * listing plus a download per profile — and every reinstall adds a profile.
+ * `signal` stops it between requests and ends the one in flight.
  */
-export async function listDeviceProfiles(skipIfCTag?: string): Promise<DeviceProfileSnapshot> {
+export async function listDeviceProfiles(skipIfCTag?: string, signal?: AbortSignal): Promise<DeviceProfileSnapshot> {
   let cTag: string | undefined;
   try {
-    const folderRes = await graphFetch(`${itemByPathUrl(APPROOT, DEVICES_FOLDER)}?$select=cTag`);
+    const folderRes = await graphFetch(`${itemByPathUrl(APPROOT, DEVICES_FOLDER)}?$select=cTag`, { signal });
     const folder = await folderRes.json();
     cTag = folder.cTag as string | undefined;
   } catch (err) {
@@ -528,7 +530,7 @@ export async function listDeviceProfiles(skipIfCTag?: string): Promise<DevicePro
   while (url) {
     let data: { value: GraphFileItem[]; '@odata.nextLink'?: string };
     try {
-      const res = await graphFetch(url, { timeoutMs: PAGE_TIMEOUT_MS });
+      const res = await graphFetch(url, { timeoutMs: PAGE_TIMEOUT_MS, signal });
       data = await res.json();
     } catch (err) {
       if (isGoneError(err)) return { profiles: [], cTag };
@@ -538,8 +540,14 @@ export async function listDeviceProfiles(skipIfCTag?: string): Promise<DevicePro
     url = data['@odata.nextLink'] || '';
   }
 
-  const downloaded = await mapLimited(items, 4, async item =>
-    (await downloadItemJson(item, `${GRAPH_BASE}/me/drive/items/${item.id}/content`, 'base')) as DeviceProfile,
+  const downloaded = await mapLimited(
+    items,
+    4,
+    async item =>
+      (await downloadItemJson(item, `${GRAPH_BASE}/me/drive/items/${item.id}/content`, 'base', {
+        signal,
+      })) as DeviceProfile,
+    signal,
   );
 
   const profiles = downloaded.filter(

@@ -306,9 +306,10 @@ export function mountSettingsFlyout(
       } catch (err) {
         console.warn('Failed to clear local data during sign-out:', err);
       }
-      // This page is now shut down and on a superseded epoch. If the
-      // redirect doesn't happen (MSAL threw, or found no account), a reload
-      // is the way back to a working app rather than an inert one.
+      // This page is now shut down and, if the wipe landed, on a superseded
+      // epoch. If the redirect doesn't happen (MSAL threw, or found no
+      // account), a reload is the way back to a working app rather than an
+      // inert one.
       let leaving = false;
       try {
         leaving = await signOut();

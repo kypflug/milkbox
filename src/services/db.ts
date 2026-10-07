@@ -16,7 +16,17 @@
 import type { ChatRecord, DeviceProfile, DropRecord, OutboxRecord, ScopeId } from '../types';
 
 const DB_NAME = 'milkbox-db';
-const DB_VERSION = 3;
+/**
+ * v4 changes no store. It is there to cut off pages still running a build
+ * from before the store epoch (below), which would write behind a sign-out
+ * or a re-sync: opening v4 closes their connections, and a build that asks
+ * for v3 can never open the database again.
+ *
+ * That cuts both ways. A device that has opened v4 cannot run an older build:
+ * rolling a deployment back past this version leaves it unable to open its
+ * store until a build that knows v4 is deployed again.
+ */
+const DB_VERSION = 4;
 
 /** Sorts after every ULID character — the top of a scope's key range. */
 const RANGE_CEIL = '￿';
@@ -648,24 +658,60 @@ const ALL_STORES = ['drops', 'thumbs', 'blobs', 'outbox', 'devices', 'chats', 's
 
 /**
  * Wipe all local data (sign-out) and start a new epoch. This page does not
- * adopt it: from here on its own late writes — and those of every other tab
- * still open on the old account — are refused, so nothing of that account
- * can land after the wipe. The page is on its way out (or reloads).
+ * adopt it: once the wipe commits its own late writes — and those of every
+ * other tab that had already opened the store — are refused, so nothing they
+ * were still holding of that account can land after the wipe. The page is on
+ * its way out (or reloads).
  *
  * `settings` are written into the emptied store in the same transaction:
  * the marker saying the store was emptied on purpose.
+ *
+ * With `timeoutMs` the wipe is given up on at that limit and rejects. Its
+ * transaction is aborted where it still can be, and one not yet opened never
+ * is: the store keeps its contents and its epoch, and nothing is refused. A
+ * transaction already committing cannot be aborted and lands after all — but
+ * it holds every store until it does, so it lands over exactly what it
+ * started on, never over anything written since.
  */
-export async function clearAllData(opts: { settings?: Array<[string, unknown]> } = {}): Promise<void> {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const t = db.transaction(ALL_STORES, 'readwrite');
-    for (const s of ALL_STORES) t.objectStore(s).clear();
-    renewEpoch(t, false);
-    for (const [key, value] of opts.settings ?? []) t.objectStore('settings').put(value, key);
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-    t.onabort = () => reject(t.error);
+export async function clearAllData(
+  opts: { settings?: Array<[string, unknown]>; timeoutMs?: number } = {},
+): Promise<void> {
+  let t: IDBTransaction | null = null;
+  let gaveUp = false;
+  const wipe = (async () => {
+    const db = await openDb();
+    if (gaveUp) return;
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(ALL_STORES, 'readwrite');
+      t = tx;
+      for (const s of ALL_STORES) tx.objectStore(s).clear();
+      renewEpoch(tx, false);
+      for (const [key, value] of opts.settings ?? []) tx.objectStore('settings').put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  })();
+  if (!opts.timeoutMs) return wipe;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      gaveUp = true;
+      try {
+        t?.abort();
+      } catch {
+        // already committing, or done
+      }
+      reject(new Error('Clearing local data timed out'));
+    }, opts.timeoutMs);
   });
+  wipe.catch(() => {}); // the abort above settles it after the race is over
+  try {
+    await Promise.race([wipe, limit]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
