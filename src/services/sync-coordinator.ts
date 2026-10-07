@@ -411,8 +411,9 @@ export async function discardOutboxRecord(id: string): Promise<void> {
         .catch(() => {})
         .then(() => requestSync(scope, { force: true }));
     }
-  } else {
-    await discard();
+  } else if ((await discard()) !== 'gone') {
+    // A file send can fail on its JSON with the file already uploaded.
+    void removeUnsentUpload(scope, record);
   }
   emit({ type: 'feed-updated', scopeId });
 }
@@ -477,7 +478,10 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
   const ref = scopeRefOf(scope);
   // The row is no longer this record's — withdrawn or queued over, perhaps
   // from another tab, so this one's feed may still show the card as sending.
-  const stop = () => emit({ type: 'feed-updated', scopeId });
+  const stop = async () => {
+    emit({ type: 'feed-updated', scopeId });
+    await removeUnsentUpload(scope, record);
+  };
   let attempts = record.attempts;
   while (attempts < MAX_ATTEMPTS) {
     try {
@@ -486,7 +490,7 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       // would revert the row's attempts/state mid-flight.
       record.attempts = attempts;
       record.state = 'sending';
-      if (!(await db.updateOutboxRecord(ref, { ...record }))) return stop();
+      if (!(await db.updateOutboxRecord(ref, { ...record }))) return await stop();
       await performOp(scope, record);
       // Sent — and the row goes only if it is still this send's. A request
       // can outlast its record: an edit that stalls, then lands after the
@@ -503,7 +507,7 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       });
       return;
     } catch (err) {
-      if (err instanceof SendWithdrawnError) return stop();
+      if (err instanceof SendWithdrawnError) return await stop();
       if (err instanceof graph.DropConflictError) {
         // The drop changed or was removed remotely — never retry (a retry
         // would resurrect what another member deleted). Remote wins; the
@@ -527,12 +531,42 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       if (attempts >= MAX_ATTEMPTS) {
         record.attempts = attempts;
         record.state = 'failed';
-        if (!(await db.updateOutboxRecord(ref, { ...record }))) return stop();
+        if (!(await db.updateOutboxRecord(ref, { ...record }))) return await stop();
         emit({ type: 'feed-updated', scopeId });
         return;
       }
       await new Promise(r => setTimeout(r, retryAfter));
     }
+  }
+}
+
+/**
+ * A file goes up before its drop's JSON, so a send that stops in between —
+ * withdrawn after its upload, or discarded after its JSON failed — leaves
+ * files/<id> in OneDrive with nothing pointing at it: storage no feed shows
+ * and nobody can free. Remove it, but only when nothing can be pointing at
+ * it. A send's row is also gone when another tab has just finished sending
+ * the same record (every tab drains the one outbox), and that drop's file
+ * must stay. So: not while the drop is held here, and not unless OneDrive
+ * has no JSON for it either. Nor during sign-out, whose wipe makes every
+ * drop look unheld. Best-effort — on any failure the file stays put.
+ *
+ * One window is left open: another tab that was already past its own check
+ * of the row, and part-way through writing the JSON, when the send was
+ * withdrawn. Its drop still lands, after the check here found none.
+ */
+async function removeUnsentUpload(scope: Scope, record: OutboxRecord): Promise<void> {
+  if (record.op !== 'create' || !record.meta.file) return;
+  try {
+    if (shuttingDown) return;
+    if (await db.getDrop(scopeIdOf(scope), record.id)) return;
+    if (await graph.hasDropJson(scope, record.id)) return;
+    if (shuttingDown) return;
+    await graph.deleteDropFiles(scope, record.id);
+  } catch (err) {
+    // Optional work, but a throttle still raises the gate everything honours.
+    noteThrottle(err);
+    console.debug('[Outbox] Left the upload of unsent drop %s in place:', record.id, err);
   }
 }
 
@@ -569,8 +603,9 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
     meta.file = { ...meta.file, itemId: uploaded.itemId };
     // A large upload can outlast its send. The JSON is what makes the drop
     // visible to everyone else: it is not written for a send that has since
-    // been withdrawn. The uploaded file is left where it is — the row is
-    // also gone when another tab has just finished sending this same drop.
+    // been withdrawn. What becomes of the uploaded file is decided by
+    // removeUnsentUpload — the row is also gone when another tab has just
+    // finished sending this same drop.
     if (!(await db.hasOutboxRecord(record))) throw new SendWithdrawnError();
   }
 
