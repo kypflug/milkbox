@@ -16,10 +16,13 @@
  * Storage is one settings row PER OP, keyed by (op, chatId), so every
  * enqueue, defer and removal is a single-key write and two tabs can never
  * lose each other's intent. A put and a delete for the same chat cancel
- * each other in the same transaction — the newest intent wins.
+ * each other in the same transaction — the newest intent wins. That goes
+ * for both halves of a leave: a join's put-pointer also cancels the
+ * delete-member an earlier leave still has queued, which would otherwise
+ * remove the member file the join has just written.
  */
 
-import { deleteSetting, getSettingsByPrefix, patchSetting, updateSettings } from './db';
+import { deleteSetting, getSetting, getSettingsByPrefix, patchSetting, updateSettings } from './db';
 import { isValidUlid, validateJoinedPointer } from './validate-drop';
 import type { JoinedChatPointer } from '../types';
 
@@ -127,27 +130,33 @@ export interface RegistryOpWrites {
 
 /**
  * What recording these intents writes: each replaces any queued op of the
- * same kind for its chat and cancels the opposite pointer op. For a caller
- * that has to record them inside a transaction of its own — a leave, which
+ * same kind for its chat and cancels what it supersedes. For a caller that
+ * has to record them inside a transaction of its own — a leave, which
  * queues its intents only if the chat it removes is still the stay it read
  * (see the coordinator's forgetChat).
+ *
+ * A put-pointer records a join, and a join supersedes everything an earlier
+ * leave of that chat still has queued: its delete-pointer, and its
+ * delete-member too. That one names the same file the join wrote
+ * (members/<me>.json), and nothing writes the file a second time, so left
+ * queued it would take the account off the chat's roster for good.
  */
 export function registryOpWrites(entries: readonly NewRegistryOp[]): RegistryOpWrites {
   const writes: RegistryOpWrites = { puts: [], deletes: [] };
   for (const entry of entries) {
-    const opposite: RegistryOpKind | null =
-      entry.op === 'put-pointer' ? 'delete-pointer'
-        : entry.op === 'delete-pointer' ? 'put-pointer'
-          : null;
+    const superseded: RegistryOpKind[] =
+      entry.op === 'put-pointer' ? ['delete-pointer', 'delete-member']
+        : entry.op === 'delete-pointer' ? ['put-pointer']
+          : [];
     const row: RegistryOp = { ...entry, enqueuedAt: Date.now(), attempts: 0, nextAt: 0 };
     writes.puts.push([keyOf(entry.op, entry.chatId), row]);
-    if (opposite) writes.deletes.push(keyOf(opposite, entry.chatId));
+    for (const op of superseded) writes.deletes.push(keyOf(op, entry.chatId));
   }
   return writes;
 }
 
 /** Record an intent. Replaces any queued op of the same kind for the chat
- *  and cancels the opposite pointer op, atomically. */
+ *  and cancels the ops it supersedes (see registryOpWrites), atomically. */
 export function enqueueRegistryOp(entry: NewRegistryOp): Promise<void> {
   const { puts, deletes } = registryOpWrites([entry]);
   return updateSettings(puts, deletes);
@@ -155,6 +164,19 @@ export function enqueueRegistryOp(entry: NewRegistryOp): Promise<void> {
 
 export function removeRegistryOp(op: RegistryOpKind, chatId: string): Promise<void> {
   return deleteSetting(keyOf(op, chatId));
+}
+
+/**
+ * The op queued under (op, chatId) as it stands now, if it may be tried at
+ * `now`. For the drain, which lists the whole queue first and is a request
+ * or more behind that listing by the time it reaches an entry: null when
+ * the op has since been cancelled (a join takes back a leave's ops, a leave
+ * a join's), been landed by another tab, or been put off (deferRegistryOp,
+ * holdRegistryOp).
+ */
+export async function dueRegistryOp(op: RegistryOpKind, chatId: string, now: number): Promise<RegistryOp | null> {
+  const queued = validateRegistryOp(await getSetting<unknown>(keyOf(op, chatId)));
+  return queued && queued.op === op && queued.chatId === chatId && queued.nextAt <= now ? queued : null;
 }
 
 /** Fallback backoff when a caller hands the write boundary a bad value. */
@@ -166,6 +188,9 @@ const DEFER_FALLBACK_MS = 60_000;
  * value from a caller (a NaN from an odd Retry-After, say) must not turn a
  * valid queued op into a row the next read would drop, so it falls back to
  * the persisted counter plus one and a fixed delay instead.
+ *
+ * Never brings the op forward: a hold placed while the try was out
+ * (holdRegistryOp) outlasts the backoff the try's failure asks for.
  */
 export function deferRegistryOp(op: RegistryOpKind, chatId: string, attempts: number, nextAt: number): Promise<void> {
   return patchSetting<unknown>(keyOf(op, chatId), current => {
@@ -174,8 +199,27 @@ export function deferRegistryOp(op: RegistryOpKind, chatId: string, attempts: nu
     return {
       ...valid,
       attempts: counter(attempts) ?? valid.attempts + 1,
-      nextAt: counter(Math.ceil(nextAt)) ?? Date.now() + DEFER_FALLBACK_MS,
+      nextAt: Math.max(valid.nextAt, counter(Math.ceil(nextAt)) ?? Date.now() + DEFER_FALLBACK_MS),
     };
+  });
+}
+
+/**
+ * Keep a queued op from being tried before `until`, leaving it queued.
+ * Nothing is written when no such op is queued.
+ *
+ * For a join about to write the member file that an earlier leave still has
+ * a removal queued for (see the coordinator's joinChat). Held there, not
+ * cancelled, because the join can still fail: a leave whose rejoin never
+ * happened would otherwise keep its member file for good. The hold lapses
+ * by itself; the op is cancelled by the join's put-pointer, once the join
+ * is on record.
+ */
+export function holdRegistryOp(op: RegistryOpKind, chatId: string, until: number): Promise<void> {
+  return patchSetting<unknown>(keyOf(op, chatId), current => {
+    const valid = validateRegistryOp(current);
+    if (!valid) return undefined;
+    return { ...valid, nextAt: Math.max(valid.nextAt, counter(Math.ceil(until)) ?? 0) };
   });
 }
 
