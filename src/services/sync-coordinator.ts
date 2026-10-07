@@ -215,6 +215,7 @@ export async function loadFeed(scopeId: ScopeId): Promise<DropRecord[]> {
       byId.set(o.id, {
         meta: o.meta,
         state: o.state === 'failed' ? 'failed' : 'sending',
+        sendToken: o.token,
       });
     }
   }
@@ -350,12 +351,23 @@ export async function enqueueDelete(scope: Scope, id: string): Promise<void> {
   void drainOutbox(scopeId);
 }
 
-/** Retry a failed outbox record. */
-export async function retryOutboxRecord(id: string): Promise<void> {
+/**
+ * Retry a failed outbox record: the one its card was showing, named by the
+ * token the feed drew that card with (DropRecord.sendToken). Rows are keyed
+ * by drop id and a card can be out of date — another tab may have queued a
+ * newer edit or delete over the failed send since. That row is not what the
+ * user asked to retry, and is left as it is.
+ */
+export async function retryOutboxRecord(id: string, token: string | undefined): Promise<void> {
   const records = await db.getOutbox();
   const record = records.find(r => r.id === id);
   if (!record) return;
   const scopeId = record.scopeId ?? PRIVATE_SCOPE_ID;
+  if (record.token !== token) {
+    // Queued over: the feed draws again, and shows what is queued now.
+    emit({ type: 'feed-updated', scopeId });
+    return;
+  }
   const scope = await resolveScope(scopeId);
   if (!scope) return;
   // The same send, tried again: it keeps its token.
@@ -371,25 +383,29 @@ export async function retryOutboxRecord(id: string): Promise<void> {
  * correct it. Removing the record and undoing the copy are one transaction
  * (db.discardOutboxRecord): a page closed in between must not be left with
  * the unsent text and nothing to discard.
+ *
+ * `token` names the record whose card was showing (DropRecord.sendToken),
+ * as for retryOutboxRecord: a row queued over it since is not discarded.
  */
-export async function discardOutboxRecord(id: string): Promise<void> {
-  const record = (await db.getOutbox()).find(r => r.id === id);
-  const scopeId = record?.scopeId ?? PRIVATE_SCOPE_ID;
+export async function discardOutboxRecord(id: string, token: string | undefined): Promise<void> {
+  const held = (await db.getOutbox()).find(r => r.id === id);
+  const scopeId = held?.scopeId ?? PRIVATE_SCOPE_ID;
+  const record = held?.token === token ? held : undefined;
   // The scope as it is held now: a discard is something the user does to
   // the feed in front of them.
   const scope = record ? await resolveScope(scopeId) : null;
   if (!record || !scope) {
-    // No such record by now (sent, or withdrawn elsewhere), or its chat has
-    // left this device, which takes a chat's rows with it: there is nothing
-    // to discard. Not by id either. A row found under it now would be one
-    // queued since — in another tab, or in the chat joined again — and
-    // nobody asked for that one to go.
+    // No such record by now (sent, withdrawn elsewhere, or queued over), or
+    // its chat has left this device, which takes a chat's rows with it:
+    // there is nothing to discard. Not by id either. A row found under it
+    // now is one queued since — in another tab, or in the chat joined again
+    // — and nobody asked for that one to go.
     emit({ type: 'feed-updated', scopeId });
     return;
   }
   const ref = scopeRefOf(scope);
-  // Only the send the card was showing. One queued over it since (from
-  // another tab) was never offered for discarding, and stays.
+  // Still only that send, if another is queued over it between the read
+  // above and this write: the token is checked again in the transaction.
   const discard = () => db.discardOutboxRecord(ref, record, graph.deltaTokenKey(scope));
 
   if (record.op === 'edit' && !record.prevMeta) {

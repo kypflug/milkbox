@@ -67,6 +67,14 @@ export interface DropRecord {
   eTag?: string;
   /** Pending outbox state overlays: 'sending' | 'failed'. Absent = synced. */
   state?: 'sending' | 'failed';
+  /**
+   * With `state`: the token of the outbox record the overlay was drawn from
+   * (OutboxRecord.token; none for a row from an older build). A card's Retry
+   * and Discard hand it back, so that they act on the send the card showed
+   * and not on one queued over it since. Set when a feed is assembled; never
+   * stored.
+   */
+  sendToken?: string;
 }
 
 /** A queued outgoing drop, persisted so uploads survive reloads. */

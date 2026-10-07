@@ -731,8 +731,10 @@ export async function renderFeed(
       case 'discard':
         // A refused or failed write leaves the row and its card as they were.
         try {
-          if (action === 'retry') await coordinator.retryOutboxRecord(id);
-          else await coordinator.discardOutboxRecord(id);
+          // For the send this card was drawn from, not whatever is queued
+          // under the drop by now (see DropRecord.sendToken).
+          if (action === 'retry') await coordinator.retryOutboxRecord(id, record.sendToken);
+          else await coordinator.discardOutboxRecord(id, record.sendToken);
         } catch (err) {
           showToast(err instanceof Error ? err.message : `Could not ${action} the drop`, 'error');
         }
