@@ -450,11 +450,19 @@ export class DropConflictError extends Error {
  * the approot itself) on first write. Pass eTag for a conditional write on
  * edits. Conflict handling differs by scope:
  * - private: retry once unconditionally — the data is single-user, conflicts
- *   are self-races, last write wins;
+ *   are self-races, last write wins. `beforeRetry` is awaited first, and
+ *   calls the retry off by throwing: the write that lost can have been out
+ *   for a long time, and what it lost to may be the caller's own newer write
+ *   (see performOp), which last-write-wins would undo;
  * - chat: strictly conditional — 412/404 becomes DropConflictError so a
  *   queued edit can never recreate a drop another member deleted.
  */
-export async function putDropJson(scope: Scope, meta: DropMeta, eTag?: string): Promise<string | undefined> {
+export async function putDropJson(
+  scope: Scope,
+  meta: DropMeta,
+  eTag?: string,
+  beforeRetry?: () => Promise<void>,
+): Promise<string | undefined> {
   const ref = scopeRef(scope);
   const tier = scopeTier(scope);
   const body = JSON.stringify(meta, null, 2);
@@ -475,6 +483,7 @@ export async function putDropJson(scope: Scope, meta: DropMeta, eTag?: string): 
   } catch (err) {
     if (err instanceof GraphHttpError && (err.status === 412 || (eTag !== undefined && err.status === 404))) {
       if (scope.kind === 'chat') throw new DropConflictError(meta.id);
+      await beforeRetry?.();
       console.debug('[Graph] eTag conflict on %s — retrying last-write-wins', meta.id);
       const res = await doPut(false);
       const item = await res.json();

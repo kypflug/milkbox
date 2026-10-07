@@ -616,8 +616,23 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
   // no condition at all would overwrite a newer version, or bring back a
   // drop another member deleted, which a chat's edit must never do
   // (putDropJson). A create has neither, and is not conditional.
+  //
+  // In the private feed an edit that loses its condition is sent again
+  // without it, on the understanding that it lost to another device. But a
+  // request can outlast its record, and then what it lost to may be what was
+  // queued over it and sent from another tab: the drop's delete, which the
+  // second write would undo by creating the drop again, or a newer edit,
+  // which it would replace with the older text. So the second write is only
+  // for a record still current; one that has been queued over ends here.
   const existing = record.op === 'edit' ? await db.getDrop(scopeId, meta.id) : undefined;
-  const eTag = await graph.putDropJson(scope, meta, existing?.eTag ?? (record.op === 'edit' ? record.prevETag : undefined));
+  const eTag = await graph.putDropJson(
+    scope,
+    meta,
+    existing?.eTag ?? (record.op === 'edit' ? record.prevETag : undefined),
+    async () => {
+      if (!(await db.hasOutboxRecord(record))) throw new SendWithdrawnError();
+    },
+  );
   // Stored in the stay the send was queued in. If the chat has been left
   // (and perhaps joined again) while the request was out, the send ends
   // here: what is stored now is not this send's to touch.
