@@ -163,6 +163,9 @@ async function graphRequest<T>(
   tier: TokenTier,
   read: (res: Response, limited: boolean) => Promise<T>,
 ): Promise<T> {
+  // Before the token is asked for: a request for a pass that has been
+  // stopped (a sign-out, a reset) starts no auth work.
+  if (init?.signal?.aborted) throw init.signal.reason;
   const headers = await authHeaders(tier);
   counters.graph++;
   const { noTimeout, timeoutMs, ...request } = init ?? {};
@@ -274,6 +277,31 @@ export class DownloadError extends Error {
 const bodyLimiter = createLimiter(6);
 const BODY_RETRY_DELAYS_MS = [500, 2000];
 
+/**
+ * Wait out a retry's delay, or reject the moment `signal` aborts. A retry
+ * that has been called off must not sit the delay out and then start again:
+ * through Graph /content the next attempt asks for a token before it looks
+ * at the signal, which is work for a pass that a sign-out or a reset has
+ * already stopped, and keeps that pass alive meanwhile.
+ */
+function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /** A dropped connection, a timeout or a server hiccup — worth a quick retry. */
 function isRetryableBodyError(err: unknown): boolean {
   if (err instanceof DownloadError || err instanceof GraphHttpError) {
@@ -309,7 +337,7 @@ export function downloadItemJson(
         const delay = BODY_RETRY_DELAYS_MS[attempt];
         if (delay === undefined || opts.signal?.aborted || !isRetryableBodyError(err)) throw err;
         if (opts.stats) opts.stats.retries++;
-        await new Promise(r => setTimeout(r, delay));
+        await retryDelay(delay, opts.signal);
       }
     }
   }, opts.signal);

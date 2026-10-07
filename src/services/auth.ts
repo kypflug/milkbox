@@ -97,10 +97,18 @@ let redirectHandled = false;
  * localStorage), we clean up the stale state and re-create the MSAL instance
  * so the second initialisation loads accounts cleanly.
  */
-export async function initAuth(force = false): Promise<AuthenticationResult | null> {
+export async function initAuth(
+  force = false,
+  stopped: () => boolean = () => false,
+): Promise<AuthenticationResult | null> {
   if (!msalInstance) {
     msalInstance = new PublicClientApplication(msalConfig);
     await msalInstance.initialize();
+    // Told to stop while MSAL was starting (a sign-out in another tab, see
+    // main.ts): take in no redirect response and no account for a page that
+    // is already signed out. The response, if there is one, stays in the
+    // address bar for the next load, and isAuthReady() stays false.
+    if (stopped()) return null;
   } else if (redirectHandled && !force) {
     // Already initialised and redirect was processed — nothing to do
     return null;
@@ -203,6 +211,16 @@ function hasRedirectResponse(): boolean {
   }
   const search = window.location.search;
   return search.includes('code=');
+}
+
+/**
+ * MSAL has started on this page and has dealt with any sign-in redirect the
+ * page was loaded with. Until then signIn() cannot work here: there is no
+ * MSAL at all (start-up stopped before it), or a redirect is still pending
+ * that MSAL will not start another over. The way forward is a reload.
+ */
+export function isAuthReady(): boolean {
+  return msalInstance !== null && redirectHandled;
 }
 
 /** Get the MSAL instance, assuming initAuth() has been called. */

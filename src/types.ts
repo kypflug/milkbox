@@ -229,4 +229,11 @@ export interface SharePayload {
   url?: string;
   files: File[];
   receivedAt: number;
+  /**
+   * Not a share: a composer draft a page left for itself across a reload
+   * (see reloadKeepingDraft in feed.ts), with the account that typed it
+   * and the scope it was typed in. It is put back once, only for that
+   * account, and only into that scope's composer.
+   */
+  draft?: { accountId: string | null; scopeId: ScopeId };
 }

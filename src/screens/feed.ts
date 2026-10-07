@@ -30,7 +30,9 @@ import { renderDayDivider } from '../components/day-divider';
 import { mountComposer, type ComposerApi } from '../components/composer';
 import { mountSettingsFlyout, type SettingsFlyoutApi } from './settings';
 import { startReconnectFlow } from '../services/chat-flows';
+import { getAccountId } from '../services/auth';
 import { showToast } from '../components/toast';
+import { putShareInbox } from '../services/share-inbox';
 import { iconBottle, iconChevronDown, iconClose } from '../components/icons';
 import { createLimiter } from '../utils/limit';
 
@@ -38,6 +40,8 @@ const PAGE_SIZE = 100;
 
 let teardownFns: Array<() => void> = [];
 let composerApi: ComposerApi | null = null;
+/** The scope the mounted composer sends to. */
+let composerScope: Scope | null = null;
 let settingsFlyoutApi: SettingsFlyoutApi | null = null;
 
 /**
@@ -58,7 +62,9 @@ const pendingDeletes = new Map<string, ReturnType<typeof setTimeout>>();
 /**
  * An unconfirmed share-target payload. Scope switches re-mount the composer,
  * so the payload is held here and re-applied — it follows the user to
- * whichever chat they pick, until they send (or it goes stale).
+ * whichever chat they pick, until they send (or it goes stale). A draft
+ * carried across a reload is held only until the scope it was typed in is
+ * on screen (see applySharePayload).
  */
 let pendingSharePayload: SharePayload | null = null;
 
@@ -74,12 +80,85 @@ export function hasUnsentDraft(): boolean {
   return Boolean(composerApi?.hasDraft() || pendingSharePayload || document.querySelector('.drop-edit'));
 }
 
+/**
+ * Reload, taking the composer's draft along. The text and the attachments
+ * are left in the share inbox, which every start drains into the composer
+ * (see share-inbox.ts). An open inline edit is not carried.
+ *
+ * With a draft to carry, the address bar is made to name this screen's
+ * scope first. A screen opened by restoring the last scope has no hash, and
+ * its reload would restore whichever scope a window opened last, which can
+ * be another window's chat: the draft has to come back where it was typed.
+ *
+ * If the draft cannot be left there, the page is not reloaded. It still
+ * holds the draft, and says so.
+ */
+export function reloadKeepingDraft(): void {
+  const scope = composerScope;
+  void stashDraftForReload().then(
+    stashed => {
+      if (stashed && scope) {
+        const hash = scope.kind === 'chat' ? `#chat/${scope.chatId}` : '#private';
+        history.replaceState(null, '', `${location.pathname}${location.search}${hash}`);
+      }
+      location.reload();
+    },
+    err => {
+      console.warn('[Feed] Could not carry the draft across the reload:', err);
+      showToast('Couldn’t keep your draft for the reload. Copy it, then reload.', 'error', {
+        label: 'Reload anyway',
+        onClick: () => location.reload(),
+        duration: 10 * 60_000,
+      });
+    },
+  );
+}
+
+/**
+ * Put what is in the composer where the next start will find it, marked as
+ * a draft of this account, typed in this scope. A carried draft still held
+ * for another scope (see applySharePayload) goes back there with it. False
+ * when the composer holds nothing.
+ */
+export async function stashDraftForReload(): Promise<boolean> {
+  if (pendingSharePayload?.draft) await putShareInbox(pendingSharePayload);
+  const draft = composerApi?.draft();
+  if (!draft || !composerScope || (!draft.text && !draft.files.length)) return false;
+  await putShareInbox({
+    text: draft.text,
+    files: draft.files,
+    receivedAt: Date.now(),
+    draft: { accountId: getAccountId(), scopeId: scopeIdOf(composerScope) },
+  });
+  return true;
+}
+
+/** showReloadPrompt has been shown: this page writes nothing until it reloads. */
+let reloadAsked = false;
+
+/**
+ * Tell the user this page has to be reloaded, with a button that does it
+ * and keeps the composer's draft. For a page whose store another window
+ * has reset: it can write nothing until it starts again, and from here on
+ * it does not route either (see route() in main.ts).
+ */
+export function showReloadPrompt(message: string): void {
+  reloadAsked = true;
+  showToast(message, 'info', { label: 'Reload', onClick: reloadKeepingDraft, duration: 10 * 60_000 });
+}
+
+/** The user has been asked to reload this page, and it has not reloaded yet. */
+export function isReloadAsked(): boolean {
+  return reloadAsked;
+}
+
 export function teardownScreenListeners(): void {
   closeLightbox?.();
   for (const fn of teardownFns) fn();
   teardownFns = [];
   composerApi?.teardown();
   composerApi = null;
+  composerScope = null;
   settingsFlyoutApi?.teardown();
   settingsFlyoutApi = null;
 }
@@ -495,8 +574,12 @@ export async function renderFeed(
   }
 
   async function send(text: string, files: File[]): Promise<void> {
-    pendingSharePayload = null; // whatever was shared has found its home
+    // Whatever was shared has found its home. A carried draft still held is
+    // waiting for another scope's composer, and goes on waiting.
+    const shared = pendingSharePayload?.draft ? null : pendingSharePayload;
+    if (shared) pendingSharePayload = null;
     const drops = buildDrops(text, files);
+    let queued = 0;
     try {
       for (const drop of drops) {
         if (drop.meta.kind === 'image' && drop.blob) {
@@ -507,9 +590,26 @@ export async function renderFeed(
           }
         }
         await coordinator.enqueueCreate(scope, drop.meta, drop.blob);
+        queued++;
       }
     } catch (err) {
-      showToast(err instanceof Error ? err.message : 'Could not send', 'error');
+      // The composer emptied itself when it handed this over, and what was
+      // not queued is going nowhere. It goes back into the composer. With
+      // attachments there is a drop per file, in order, so the files from
+      // the failed one on.
+      if (listEl.isConnected) {
+        composerApi?.restore(text, files.slice(queued));
+        if (!queued && shared) pendingSharePayload = shared;
+      }
+      if (err instanceof db.StaleStoreError) {
+        // Another window has reset the store: this page is refused every
+        // write until it reloads. The prompt stays up, and its reload takes
+        // the draft along.
+        showReloadPrompt('This window is out of date and can’t send. Reload it; your draft comes along.');
+      } else {
+        showToast(err instanceof Error ? err.message : 'Could not send', 'error');
+      }
+      if (queued) await refresh({ stick: true });
       return;
     }
     await refresh({ stick: true });
@@ -522,6 +622,7 @@ export async function renderFeed(
     () => coordinator.requestSync(scope, { force: true }),
     { placeholder: isChat ? `Message ${scope.name}` : undefined },
   );
+  composerScope = scope;
 
   /**
    * Draw this chat's screen again, on the record that is held now. The URL
@@ -766,22 +867,32 @@ export async function renderFeed(
       closeEditor();
       void refresh();
     });
-    editor.querySelector('.drop-edit-save')!.addEventListener('click', async () => {
+    const saveBtn = editor.querySelector<HTMLButtonElement>('.drop-edit-save')!;
+    saveBtn.addEventListener('click', async () => {
       const text = input.value.trim();
       if (!text || text === record.meta.text) {
         closeEditor();
         void refresh();
         return;
       }
-      closeEditor();
+      // The editor stays until the edit is queued. If it is refused, what
+      // was typed is still there, to copy or to try again; Cancel draws the
+      // card as stored.
+      saveBtn.disabled = true;
       try {
         await coordinator.enqueueEdit(scope, { ...record.meta, text, editedAt: Date.now() });
       } catch (err) {
-        showToast(err instanceof Error ? err.message : 'Could not save the edit', 'error');
-        // Nothing was queued, so no feed event follows — and the editor is
-        // gone with the text it replaced. Draw the card again as stored.
-        void refresh();
+        saveBtn.disabled = false;
+        if (err instanceof db.StaleStoreError) {
+          // As for a send. An open edit is not carried across the reload.
+          showReloadPrompt('This window is out of date and can’t save. Copy your edit, then reload.');
+        } else {
+          showToast(err instanceof Error ? err.message : 'Could not save the edit', 'error');
+        }
+        return;
       }
+      closeEditor();
+      void refresh();
     });
   }
 
@@ -931,9 +1042,15 @@ export async function renderFeed(
   teardownFns.push(() => document.removeEventListener('visibilitychange', onVisible));
 
   // A share payload that arrived before this scope was picked follows the
-  // user across switches until they send it.
+  // user across switches until they send it. A carried draft waits for the
+  // scope it was typed in, and is put back there once.
   if (pendingSharePayload && chatState === 'active') {
-    fillComposerFromShare(pendingSharePayload);
+    if (!pendingSharePayload.draft) {
+      fillComposerFromShare(pendingSharePayload);
+    } else if (pendingSharePayload.draft.scopeId === scopeId) {
+      fillComposerFromShare(pendingSharePayload);
+      pendingSharePayload = null;
+    }
   }
 
   // ── first paint: IDB-first render, then network ──
@@ -950,8 +1067,24 @@ function fillComposerFromShare(payload: SharePayload): void {
   composerApi.focus();
 }
 
-/** Handle a share-target payload: pre-fill the composer, never auto-send. */
+/**
+ * Handle a share-target payload: pre-fill the composer, never auto-send.
+ * A share follows the user from chat to chat until it is sent. A draft
+ * carried across a reload does not: it goes, once, into the composer of
+ * the scope it was typed in. The reload comes back to that scope (see
+ * reloadKeepingDraft), but the page can have moved on by the time the
+ * draft arrives, to a chat that a join resumed at start-up has just
+ * opened, for one. Then the draft is held until its own scope is on screen.
+ */
 export function applySharePayload(payload: SharePayload): void {
+  if (payload.draft) {
+    if (composerApi && composerScope && scopeIdOf(composerScope) === payload.draft.scopeId) {
+      fillComposerFromShare(payload);
+    } else {
+      pendingSharePayload = payload;
+    }
+    return;
+  }
   pendingSharePayload = payload;
   fillComposerFromShare(payload);
 }

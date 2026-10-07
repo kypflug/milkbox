@@ -7,7 +7,7 @@ import { resumePendingAction, startCreateChatFlow, startJoinFlow, startReconnect
 import { setPendingAction } from './services/pending-actions';
 import { isValidShareToken } from './services/chats';
 import { renderSignIn } from './screens/sign-in';
-import { renderFeed, applySharePayload, hasUnsentDraft, teardownScreenListeners } from './screens/feed';
+import { renderFeed, applySharePayload, hasUnsentDraft, isReloadAsked, showReloadPrompt, teardownScreenListeners } from './screens/feed';
 import { closeAllModals, showManageSheet } from './screens/chat-sheets';
 import { mountChatMenu, type ChatSwitcherHandlers } from './components/chat-switcher';
 import { showToast } from './components/toast';
@@ -80,6 +80,12 @@ boot(app).catch(err => {
   document.getElementById('bootErrorReload')?.addEventListener('click', () => window.location.reload());
 });
 
+/** The invite this page was opened with, if its link holds one that can be used. */
+function inviteInAddressBar(): string | null {
+  const raw = location.hash.startsWith('#join=') ? decodeInvite(location.hash.slice(6)) : null;
+  return raw && isValidShareToken(raw) ? raw : null;
+}
+
 async function boot(app: HTMLElement): Promise<void> {
   applyTheme();
   trackWindowControlsSide();
@@ -94,10 +100,22 @@ async function boot(app: HTMLElement): Promise<void> {
   if (cacheRestored) {
     console.info('[Boot] MSAL cache restored from IndexedDB backup');
   }
+  // Told of a sign-out while that read was pending: this page is signed out
+  // before MSAL has started, so it is not started. It would read whatever
+  // account the other tab's logout has yet to clear, and take in a sign-in
+  // redirect, for a page that has already been told to stop. (A redirect
+  // left in the address bar is for the next load to deal with, and so is
+  // an invite link: the screen greets as invited, and its button reloads.)
+  if (signedOutElsewhere) {
+    invitedSignIn = inviteInAddressBar() !== null;
+    showSignedOutElsewhere(app);
+    return;
+  }
 
   // initAuth() returns a non-null AuthenticationResult when this page load
-  // is the result of a loginRedirect completing.
-  const redirectResponse = await initAuth();
+  // is the result of a loginRedirect completing. Told of a sign-out while
+  // MSAL is starting, it stops short of taking that redirect in.
+  const redirectResponse = await initAuth(false, () => signedOutElsewhere);
 
   // Auth redirect handling is done — safe to activate pending SW update
   authBootComplete = true;
@@ -108,8 +126,7 @@ async function boot(app: HTMLElement): Promise<void> {
 
   // An invite link opened while signed out: park the join (IDB — survives
   // the sign-in redirect and iOS storage wipes) and greet as invited.
-  const rawInvited = location.hash.startsWith('#join=') ? decodeInvite(location.hash.slice(6)) : null;
-  const invitedToken = rawInvited && isValidShareToken(rawInvited) ? rawInvited : null;
+  const invitedToken = inviteInAddressBar();
   // Signed out in another tab while this one was starting: whatever account
   // MSAL has just loaded is on its way out, so this page is not signed in.
   const signedIn = !signedOutElsewhere && (Boolean(redirectResponse?.account) || isSignedIn());
@@ -301,11 +318,7 @@ async function enterApp(app: HTMLElement): Promise<void> {
     // This page has to reload before it can write again — but not over
     // something the user hasn't sent yet. Then it is their call.
     if (hasUnsentDraft()) {
-      showToast('Milkbox was re-synced in another window. Reload this one when you’re ready.', 'info', {
-        label: 'Reload',
-        onClick: () => location.reload(),
-        duration: 10 * 60_000,
-      });
+      showReloadPrompt('Milkbox was re-synced in another window. Reload this one when you’re ready.');
     } else {
       location.reload();
     }
@@ -382,6 +395,22 @@ let chatUiTeardown: (() => void) | null = null;
 
 async function route(app: HTMLElement): Promise<void> {
   if (signedOutElsewhere) return;
+  // Waiting to be reloaded after another window reset the store (the user
+  // has been asked, on the reset's broadcast or on a write it refused): no
+  // route can go through. Its first write would be refused, and by then
+  // the screen's listeners, the composer's among them, would have been
+  // taken down with nothing drawn in their place. The screen is left
+  // whole, its draft with it, and the user is asked again.
+  if (isReloadAsked()) {
+    // An invite link opened here is not started, since a join writes to the
+    // store, and it is not carried across the reload: the user is told.
+    showReloadPrompt(
+      inviteInAddressBar()
+        ? 'This window is out of date. Reload it, then open the invite link again.'
+        : 'This window is out of date. Reload it when you’re ready.',
+    );
+    return;
+  }
   const rawHash = location.hash.slice(1);
 
   if (rawHash.startsWith('join=')) {
@@ -538,7 +567,12 @@ async function handleShareTarget(): Promise<void> {
   const flagged = params.has('share');
   if (flagged) history.replaceState(null, '', '/');
 
-  const payloads = await drainShareInbox();
+  // A draft a page left for itself across a reload (see reloadKeepingDraft
+  // in feed.ts) is only for the account that typed it.
+  const accountId = getAccountId();
+  const payloads = (await drainShareInbox()).filter(
+    payload => !payload.draft || payload.draft.accountId === accountId,
+  );
   if (payloads.length === 0) return;
 
   // Hold SW updates while shared content sits unconfirmed in the composer

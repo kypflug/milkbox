@@ -1,4 +1,4 @@
-import { signIn } from '../services/auth';
+import { isAuthReady, signIn } from '../services/auth';
 import { showToast } from '../components/toast';
 import { iconBottle } from '../components/icons';
 
@@ -36,6 +36,13 @@ export function renderSignIn(
   `;
 
   document.getElementById('signInBtn')!.addEventListener('click', async () => {
+    // A page whose start-up was stopped by a sign-out in another tab never
+    // got MSAL ready (see main.ts). It starts over; the screen that load
+    // draws has a button that signs in.
+    if (!isAuthReady()) {
+      location.reload();
+      return;
+    }
     try {
       await signIn({ preConsentShare: opts.invited });
       // loginRedirect navigates away; if we're still here something failed.

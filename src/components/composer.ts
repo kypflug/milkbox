@@ -17,6 +17,14 @@ export interface ComposerApi {
   addFiles(files: File[]): void;
   /** Text or attachments not sent yet. */
   hasDraft(): boolean;
+  /** What is in the composer now. */
+  draft(): { text: string; files: File[] };
+  /**
+   * Put back a draft that could not be queued. The composer empties itself
+   * as it hands a draft over; if nothing came of it, the text and the
+   * attachments return, ahead of anything typed or attached since.
+   */
+  restore(text: string, files: File[]): void;
   focus(): void;
   /** `progress` labels a pass that is fetching drops: "Syncing — 120 of 312". */
   setSyncState(state: 'syncing' | 'synced' | 'error', progress?: { received: number; total: number }): void;
@@ -216,6 +224,13 @@ export function mountComposer(
     },
     addFiles,
     hasDraft: () => inputEl.value.trim() !== '' || pendingFiles.length > 0,
+    draft: () => ({ text: inputEl.value.trim(), files: [...pendingFiles] }),
+    restore(text: string, files: File[]) {
+      if (text) inputEl.value = inputEl.value.trim() ? `${text}\n${inputEl.value}` : text;
+      pendingFiles = [...files, ...pendingFiles];
+      renderChips();
+      autoGrow();
+    },
     focus: () => inputEl.focus(),
     setSyncState,
     setDisabled(disabled: boolean, placeholder?: string) {
