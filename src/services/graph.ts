@@ -485,9 +485,10 @@ export async function putDropJson(scope: Scope, meta: DropMeta, eTag?: string): 
 }
 
 /**
- * Whether the scope holds a JSON for this drop. Only a 404 says it does not:
- * every other failure throws, so a caller deciding what may be deleted never
- * reads a request that failed as a drop that is absent.
+ * Whether the scope holds a JSON for this drop. Only "not found" says it
+ * does not (a 404, or a 410: see isGoneError). Every other failure throws,
+ * so a caller deciding what may be deleted never reads a request that failed
+ * as a drop that is absent.
  */
 export async function hasDropJson(scope: Scope, id: string): Promise<boolean> {
   try {

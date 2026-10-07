@@ -584,7 +584,14 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       record.attempts = attempts;
       record.state = 'sending';
       if (!(await db.updateOutboxRecord(ref, { ...record }))) return await stop();
-      await performOp(scope, record);
+      if (isFileSend(record)) {
+        // Refused the lock: its upload is being cleared away, which is only
+        // done for a send whose row is no longer its own.
+        const sent = await withPublishLock(record.id, 'shared', () => performOp(scope, record));
+        if (!sent) throw new SendWithdrawnError();
+      } else {
+        await performOp(scope, record);
+      }
       // Sent — and the row goes only if it is still this send's. A request
       // can outlast its record: an edit that stalls, then lands after the
       // drop's delete was queued in its place. That newer row stays: whoever
@@ -640,29 +647,68 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
   }
 }
 
+/** A send with a file to upload ahead of its drop's JSON. */
+function isFileSend(record: OutboxRecord): boolean {
+  return record.op === 'create' && Boolean(record.meta.file);
+}
+
+/**
+ * Run `body` holding a file drop's publish lock, if the lock is free in that
+ * mode right now. Resolves false, without running `body`, when it is not.
+ *
+ * Every tab drains the one outbox, so a file drop can be mid-send in one tab
+ * while another decides its upload is nobody's and deletes it (see
+ * removeUnsentUpload). Those must not overlap: a send that has checked its
+ * row and is writing the JSON would land a drop pointing at a file that has
+ * just gone. A Web Lock per drop keeps them apart across tabs. A send holds
+ * it shared from start to finish, so senders do not hold each other up; the
+ * clearing-away takes it exclusive.
+ *
+ * Nobody waits for it. Refused, a send knows its upload is being cleared
+ * away, and the clearing-away knows a send is still under way — and whichever
+ * send finishes last clears up after itself. Waiting would tie one tab's
+ * drain to another tab's upload, or to a tab the browser has frozen.
+ *
+ * Without Web Locks (Safari before 15.4) tabs cannot be kept apart: a send
+ * goes ahead as it always did, and nothing is cleared away.
+ */
+async function withPublishLock(dropId: string, mode: LockMode, body: () => Promise<void>): Promise<boolean> {
+  const locks: LockManager | undefined = navigator.locks;
+  if (!locks) {
+    if (mode === 'exclusive') return false;
+    await body();
+    return true;
+  }
+  return locks.request(`milkbox:publish:${dropId}`, { mode, ifAvailable: true }, async lock => {
+    if (!lock) return false;
+    await body();
+    return true;
+  });
+}
+
 /**
  * A file goes up before its drop's JSON, so a send that stops in between —
  * withdrawn after its upload, or discarded after its JSON failed — leaves
  * files/<id> in OneDrive with nothing pointing at it: storage no feed shows
  * and nobody can free. Remove it, but only when nothing can be pointing at
- * it. A send's row is also gone when another tab has just finished sending
- * the same record (every tab drains the one outbox), and that drop's file
- * must stay. So: not while the drop is held here, and not unless OneDrive
- * has no JSON for it either. Nor during sign-out, whose wipe makes every
- * drop look unheld. Best-effort — on any failure the file stays put.
- *
- * One window is left open: another tab that was already past its own check
- * of the row, and part-way through writing the JSON, when the send was
- * withdrawn. Its drop still lands, after the check here found none.
+ * it, or about to. A send's row is also gone when another tab has just
+ * finished sending the same record, and that drop's file must stay. So: not
+ * while the drop is held here, and not unless OneDrive has no JSON for it
+ * either — both looked at with every tab's send of this drop shut out (see
+ * withPublishLock), so that none can write the JSON between the look and
+ * the delete. Nor during sign-out, whose wipe makes every drop look unheld.
+ * Best-effort — on any failure the file stays put.
  */
 async function removeUnsentUpload(scope: Scope, record: OutboxRecord): Promise<void> {
-  if (record.op !== 'create' || !record.meta.file) return;
+  if (!isFileSend(record)) return;
   try {
-    if (shuttingDown) return;
-    if (await db.getDrop(scopeIdOf(scope), record.id)) return;
-    if (await graph.hasDropJson(scope, record.id)) return;
-    if (shuttingDown) return;
-    await graph.deleteDropFiles(scope, record.id);
+    await withPublishLock(record.id, 'exclusive', async () => {
+      if (shuttingDown) return;
+      if (await db.getDrop(scopeIdOf(scope), record.id)) return;
+      if (await graph.hasDropJson(scope, record.id)) return;
+      if (shuttingDown) return;
+      await graph.deleteDropFiles(scope, record.id);
+    });
   } catch (err) {
     // Optional work, but a throttle still raises the gate everything honours.
     noteThrottle(err);
