@@ -254,12 +254,16 @@ export async function signIn(opts: { preConsentShare?: boolean } = {}): Promise<
 export async function signOut(): Promise<boolean> {
   const msal = getMsal();
   const account = getAccount();
-  if (!account) return false;
 
+  // Both cleared even when MSAL reports no account — iOS can drop the live
+  // cache while the backup survives. The caller reloads a page that isn't
+  // redirecting, and a backup left behind would be restored on that load and
+  // sign the user straight back in.
   clearAccountHint();
   // Awaited: the delete has to be committed before the redirect unloads the
   // page, or the next boot would restore the snapshot it was meant to remove.
   await clearMsalCacheBackup();
+  if (!account) return false;
 
   await msal.logoutRedirect({
     account,

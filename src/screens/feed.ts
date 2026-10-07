@@ -703,7 +703,11 @@ export async function renderFeed(
         return;
       }
       closeEditor();
-      await coordinator.enqueueEdit(scope, { ...record.meta, text, editedAt: Date.now() });
+      try {
+        await coordinator.enqueueEdit(scope, { ...record.meta, text, editedAt: Date.now() });
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : 'Could not save the edit', 'error');
+      }
     });
   }
 

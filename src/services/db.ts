@@ -234,6 +234,38 @@ function tx<T>(
   );
 }
 
+/**
+ * A write on behalf of one scope. For a chat it happens only while the chat
+ * is still on this device, checked in the same transaction: work that
+ * outlives a leave or delete — an outbox drain mid-retry, a sync batch, a
+ * preview finishing its download — must not put rows back under the scope
+ * that was just cleared. Resolves false when the write was skipped.
+ */
+async function writeForScope(
+  scopeId: ScopeId,
+  stores: string[],
+  body: (t: IDBTransaction) => void,
+): Promise<boolean> {
+  const db = await openDb();
+  const chatId = scopeId.startsWith('chat:') ? scopeId.slice(5) : null;
+  let written = false;
+  await write(db, chatId ? [...stores, 'chats'] : stores, t => {
+    const apply = () => {
+      body(t);
+      written = true;
+    };
+    if (!chatId) {
+      apply();
+      return;
+    }
+    const chat = t.objectStore('chats').get(chatId);
+    chat.onsuccess = () => {
+      if (chat.result) apply();
+    };
+  });
+  return written;
+}
+
 // ─── drops (scoped) ───
 
 function scopeRange(scopeId: ScopeId): IDBKeyRange {
@@ -244,8 +276,10 @@ export function getScopeDrops(scopeId: ScopeId): Promise<DropRecord[]> {
   return tx('drops', 'readonly', s => s.getAll(scopeRange(scopeId)) as IDBRequest<DropRecord[]>);
 }
 
-export function putDrop(scopeId: ScopeId, record: DropRecord): Promise<void> {
-  return tx('drops', 'readwrite', s => { s.put({ ...record, scopeId } satisfies StoredDropRecord); });
+export async function putDrop(scopeId: ScopeId, record: DropRecord): Promise<void> {
+  await writeForScope(scopeId, ['drops'], t => {
+    t.objectStore('drops').put({ ...record, scopeId } satisfies StoredDropRecord);
+  });
 }
 
 export function deleteDrop(scopeId: ScopeId, id: string): Promise<void> {
@@ -298,39 +332,24 @@ export interface DropCommitResult {
  * not write drops back under the cleared scope.
  */
 export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): Promise<DropCommitResult> {
-  const db = await openDb();
-  const chatId = scopeId.startsWith('chat:') ? scopeId.slice(5) : null;
-  const stores = ['drops', 'thumbs', 'blobs', 'settings', ...(chatId ? ['chats'] : [])];
-  let written = false;
   const added = new Set<string>();
-  await write(db, stores, t => {
-    const apply = () => {
-      const drops = t.objectStore('drops');
-      for (const r of commit.puts ?? []) {
-        const held = drops.getKey([scopeId, r.meta.id]);
-        held.onsuccess = () => {
-          if (held.result === undefined) added.add(r.meta.id);
-        };
-        drops.put({ ...r, scopeId } satisfies StoredDropRecord);
-      }
-      for (const id of commit.deletes ?? []) {
-        drops.delete([scopeId, id]);
-        t.objectStore('thumbs').delete(mediaKey(scopeId, id));
-        t.objectStore('blobs').delete(mediaKey(scopeId, id));
-      }
-      const settings = t.objectStore('settings');
-      for (const [key, value] of commit.settingsPut ?? []) settings.put(value, key);
-      for (const key of commit.settingsDelete ?? []) settings.delete(key);
-      written = true;
-    };
-    if (chatId) {
-      const req = t.objectStore('chats').get(chatId);
-      req.onsuccess = () => {
-        if (req.result) apply();
+  const written = await writeForScope(scopeId, ['drops', 'thumbs', 'blobs', 'settings'], t => {
+    const drops = t.objectStore('drops');
+    for (const r of commit.puts ?? []) {
+      const held = drops.getKey([scopeId, r.meta.id]);
+      held.onsuccess = () => {
+        if (held.result === undefined) added.add(r.meta.id);
       };
-    } else {
-      apply();
+      drops.put({ ...r, scopeId } satisfies StoredDropRecord);
     }
+    for (const id of commit.deletes ?? []) {
+      drops.delete([scopeId, id]);
+      t.objectStore('thumbs').delete(mediaKey(scopeId, id));
+      t.objectStore('blobs').delete(mediaKey(scopeId, id));
+    }
+    const settings = t.objectStore('settings');
+    for (const [key, value] of commit.settingsPut ?? []) settings.put(value, key);
+    for (const key of commit.settingsDelete ?? []) settings.delete(key);
   });
   return { written, added };
 }
@@ -347,8 +366,10 @@ export function getThumb(scopeId: ScopeId, dropId: string): Promise<Blob | undef
   return tx('thumbs', 'readonly', s => s.get(mediaKey(scopeId, dropId)) as IDBRequest<Blob | undefined>);
 }
 
-export function putThumb(scopeId: ScopeId, dropId: string, blob: Blob): Promise<void> {
-  return tx('thumbs', 'readwrite', s => { s.put(blob, mediaKey(scopeId, dropId)); });
+export async function putThumb(scopeId: ScopeId, dropId: string, blob: Blob): Promise<void> {
+  await writeForScope(scopeId, ['thumbs'], t => {
+    t.objectStore('thumbs').put(blob, mediaKey(scopeId, dropId));
+  });
 }
 
 export function deleteThumb(scopeId: ScopeId, dropId: string): Promise<void> {
@@ -378,8 +399,10 @@ export async function getCachedBlob(scopeId: ScopeId, dropId: string): Promise<B
 }
 
 export async function putCachedBlob(scopeId: ScopeId, dropId: string, blob: Blob): Promise<void> {
-  await tx('blobs', 'readwrite', s => {
-    s.put({ id: mediaKey(scopeId, dropId), blob, size: blob.size, lastAccess: Date.now() } satisfies BlobEntry);
+  await writeForScope(scopeId, ['blobs'], t => {
+    t.objectStore('blobs').put(
+      { id: mediaKey(scopeId, dropId), blob, size: blob.size, lastAccess: Date.now() } satisfies BlobEntry,
+    );
   });
   sweepBlobCache().catch(() => {});
 }
@@ -407,8 +430,39 @@ export function getOutbox(): Promise<OutboxRecord[]> {
   return tx('outbox', 'readonly', s => s.getAll() as IDBRequest<OutboxRecord[]>);
 }
 
-export function putOutboxRecord(record: OutboxRecord): Promise<void> {
-  return tx('outbox', 'readwrite', s => { s.put(record); });
+/**
+ * Queue a record. Resolves false, writing nothing, for a chat that has left
+ * this device.
+ */
+export function putOutboxRecord(record: OutboxRecord): Promise<boolean> {
+  return writeForScope(record.scopeId ?? 'private', ['outbox'], t => {
+    t.objectStore('outbox').put(record);
+  });
+}
+
+/**
+ * Update a record that is still queued; resolves false, writing nothing,
+ * when it no longer is. A drain can sit in a retry backoff for seconds: if
+ * the send was cancelled meanwhile, or its chat removed (which deletes its
+ * rows), the drain must find that out here — in any tab, and even if the
+ * chat has been joined again since — and not put the row back.
+ */
+export async function updateOutboxRecord(record: OutboxRecord): Promise<boolean> {
+  let updated = false;
+  await writeForScope(record.scopeId ?? 'private', ['outbox'], t => {
+    const store = t.objectStore('outbox');
+    const held = store.getKey(record.id);
+    held.onsuccess = () => {
+      if (held.result === undefined) return;
+      store.put(record);
+      updated = true;
+    };
+  });
+  return updated;
+}
+
+export async function hasOutboxRecord(id: string): Promise<boolean> {
+  return (await tx('outbox', 'readonly', s => s.getKey(id))) !== undefined;
 }
 
 export function deleteOutboxRecord(id: string): Promise<void> {
@@ -471,6 +525,19 @@ export function getSetting<T>(key: string): Promise<T | undefined> {
 
 export function putSetting<T>(key: string, value: T): Promise<void> {
   return tx('settings', 'readwrite', s => { s.put(value, key); });
+}
+
+/**
+ * A setting kept on behalf of one scope (its member roster, its
+ * notifications-primed flag). Not written for a chat that has left this
+ * device: a pass can still be finishing when its chat is removed, and a
+ * primed flag left behind would make a later re-join announce the chat's
+ * whole history as new.
+ */
+export async function putScopeSetting(scopeId: ScopeId, key: string, value: unknown): Promise<void> {
+  await writeForScope(scopeId, ['settings'], t => {
+    t.objectStore('settings').put(value, key);
+  });
 }
 
 export function deleteSetting(key: string): Promise<void> {
