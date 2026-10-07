@@ -89,6 +89,13 @@ export interface OutboxRecord {
   attempts: number;
   state: 'queued' | 'sending' | 'failed';
   /**
+   * Deletes only: the earliest time the drain may try again. A failed create
+   * or edit stops on a card that offers a retry; a delete hides its drop, so
+   * there is no card to stop on, and it is never given up on — past its
+   * quick tries it waits here between attempts instead. Absent until then.
+   */
+  nextAt?: number;
+  /**
    * Destination scope. Optional so pre-v3 records parse; the v3 migration
    * stamps 'private' and the coordinator treats absence as 'private'.
    */
