@@ -19,7 +19,11 @@
  * each other in the same transaction — the newest intent wins. That goes
  * for both halves of a leave: a join's put-pointer also cancels the
  * delete-member an earlier leave still has queued, which would otherwise
- * remove the member file the join has just written.
+ * remove the member file the join has just written. A join made on another
+ * device cannot reach this queue. For a delete-member that has outlived its
+ * leave's delete-pointer, the drain asks OneDrive whether there has been
+ * one before it removes the file (see the coordinator's
+ * memberRemovalStands).
  */
 
 import { deleteSetting, getSetting, getSettingsByPrefix, patchSetting, updateSettings } from './db';
@@ -177,6 +181,25 @@ export function removeRegistryOp(op: RegistryOpKind, chatId: string): Promise<vo
 export async function dueRegistryOp(op: RegistryOpKind, chatId: string, now: number): Promise<RegistryOp | null> {
   const queued = validateRegistryOp(await getSetting<unknown>(keyOf(op, chatId)));
   return queued && queued.op === op && queued.chatId === chatId && queued.nextAt <= now ? queued : null;
+}
+
+/** Whether an op of this kind is queued for the chat as things stand now, due or not. */
+export async function isRegistryOpQueued(op: RegistryOpKind, chatId: string): Promise<boolean> {
+  const queued = validateRegistryOp(await getSetting<unknown>(keyOf(op, chatId)));
+  return queued !== null && queued.op === op && queued.chatId === chatId;
+}
+
+/**
+ * Take a queued op back unsent: the intent `entry` was read as, and only
+ * that one. The caller decided this on a request's answer, and the row can
+ * have been replaced while the request was out. A leave made meanwhile
+ * queues a removal of its own under the same key, and that one is owed.
+ */
+export function withdrawRegistryOp(entry: RegistryOp): Promise<void> {
+  return patchSetting<unknown>(keyOf(entry.op, entry.chatId), current => {
+    const queued = validateRegistryOp(current);
+    return queued && queued.enqueuedAt !== entry.enqueuedAt ? current : undefined;
+  });
 }
 
 /** Fallback backoff when a caller hands the write boundary a bad value. */
