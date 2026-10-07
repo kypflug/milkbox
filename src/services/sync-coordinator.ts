@@ -2007,7 +2007,10 @@ const REGISTRY_CTAG_KEY = 'milkbox:registry-ctags';
  *
  * The listings are the truth: a local record absent from them is removed,
  * unless it is younger than the grace window or has a registry write still
- * queued. A listing that fails aborts the pass without touching anything.
+ * queued. A listing that fails aborts the pass without touching anything,
+ * and without recording it. That is why the listings reject rather than
+ * leave out an entry they could not read: a pass recorded here is not
+ * repeated until a folder's cTag moves.
  */
 export async function hydrateChatRegistry(eager = false): Promise<void> {
   if (shuttingDown || hydrating || Date.now() < throttledUntil) return;

@@ -14,6 +14,7 @@
  */
 
 import {
+  DownloadError,
   GRAPH_BASE,
   GraphHttpError,
   PAGE_TIMEOUT_MS,
@@ -385,12 +386,36 @@ export async function deleteJoinedPointer(chatId: string): Promise<void> {
  * the listing named — the complete remote registry, which reconciliation
  * compares local records against — while `pointers`/`records` carry only
  * the entries the caller did not already know, fully resolved. Keeping the
- * two apart matters: an entry whose body failed to download is still
- * present remotely and must never read as a removal.
+ * two apart matters: an entry that cannot be read is still present remotely
+ * and must never read as a removal.
+ *
+ * A listing that resolves is a whole answer: the caller records the registry
+ * as reconciled on the strength of it (see hydrateChatRegistry) and does not
+ * list again until a folder changes. So the only entries it may leave out
+ * are those unreadable in themselves (see isEntryUnreadable). An entry whose
+ * read merely failed rejects the listing instead.
  */
 export interface JoinedPointerListing {
   ids: Set<string>;
   pointers: JoinedChatPointer[];
+}
+
+/**
+ * Whether a failed read of one registry entry says something about the entry:
+ * an answer that would be the same on the next try (a chat folder with no
+ * chat.json, a pointer deleted since it was listed). Such an entry is
+ * skipped, or it would fail the listing on every poll tick.
+ *
+ * Anything else (a throttle, a server error, a timeout, a dropped connection)
+ * says nothing about the entry and has to fail the listing. Skipped, the
+ * entry would be missing from a listing its caller goes on to record as
+ * complete, and the chat would not turn up on this device until its folder
+ * next changed.
+ */
+function isEntryUnreadable(err: unknown): boolean {
+  if (!(err instanceof GraphHttpError || err instanceof DownloadError)) return false;
+  // 408 and 429 are 4xx in number only: "ask again", not a verdict on the entry.
+  return err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429;
 }
 
 export async function listJoinedPointers(skipChatIds?: ReadonlySet<string>): Promise<JoinedPointerListing> {
@@ -416,7 +441,8 @@ export async function listJoinedPointers(skipChatIds?: ReadonlySet<string>): Pro
     try {
       const pointer = validateJoinedPointer(await downloadJson(item, undefined, 'base'));
       return pointer && pointer.chatId === chatId ? pointer : null;
-    } catch {
+    } catch (err) {
+      if (!isEntryUnreadable(err)) throw err;
       return null; // unreadable pointer — it stays in ids, so it is not a removal
     }
   });
@@ -486,7 +512,10 @@ export async function listHostChats(me: AuthorAttribution, skipChatIds?: Readonl
       // The descriptor and the drops folder id are independent — ask for both at once.
       const [descriptor, dropsItem] = await Promise.all([
         graphFetch(contentUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/chat.json`))
-          .then(res => res.json())
+          // graphFetch has already read the body, so what fails here is a
+          // body that is not JSON: this folder's own problem, like any
+          // other descriptor that fails validation.
+          .then(res => res.json().catch(() => undefined))
           .then(validateChatDescriptor),
         graphFetch(`${itemByPathUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/drops`)}?$select=id`)
           .then(res => res.json() as Promise<{ id?: string }>),
@@ -504,7 +533,8 @@ export async function listHostChats(me: AuthorAttribution, skipChatIds?: Readonl
         joinedAt: descriptor.createdAt,
         state: 'active',
       };
-    } catch {
+    } catch (err) {
+      if (!isEntryUnreadable(err)) throw err;
       return null; // a chat folder we can't read — it stays in ids, so it is not a removal
     }
   });
