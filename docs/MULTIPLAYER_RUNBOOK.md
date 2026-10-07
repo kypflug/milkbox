@@ -69,7 +69,9 @@ Messaging
 - [ ] Moderation race: GUEST queues an edit offline, HOST deletes that drop, GUEST reconnects → edit is discarded with the conflict toast; the drop stays deleted (no resurrection).
 - [ ] Offline queue in a chat: SENDING/FAILED overlays, retry, discard.
 - [ ] Unread badge increments on the other account (including from an author whose clock is skewed hours behind) and clears on opening the chat.
+- [ ] Unread on the chat that is on screen (desktop, notify on): with a chat open, minimise the window and send a drop from the other account. The notification fires and the badge counts it. Bring the window back and touch nothing: the badge clears within a second.
 - [ ] Notifications (iOS standalone, notify on): "<chat> · <author>" fires for a backgrounded app; tapping opens the right chat; joining a chat with history does **not** replay the backlog.
+- [ ] Notification tap for another chat (desktop, notify on, two chats): with the first chat open and the window minimised, send a drop to each chat from the other account. Tap the **second** chat's notification: the window opens on the second chat and its count clears within a second; the first chat still shows its unread count in the chat menu. Repeat with the window as a background tab rather than minimised.
 
 Lifecycle
 - [ ] Rename (host, Chat options → Rename chat): the header, composer placeholder and switcher row retitle at once on that device; the host's other device and GUEST retitle within one poll tick (chat-folder cTag moves → sync pass re-reads `chat.json`); the invite sheet and manage sheet open with the new name. GUEST has no Rename button.
