@@ -31,7 +31,7 @@ import * as graph from './graph';
 import * as chatsApi from './chats';
 import * as device from './device';
 import * as notify from './notify';
-import { ConsentRequiredError } from './auth';
+import { ConsentRequiredError, getAccessToken } from './auth';
 import { postBroadcast } from './broadcast';
 import { errorLabel, newPassCounts, recordPass, requestCount, type PassStats } from './sync-stats';
 import { PENDING_ACTION_KEY, type PendingAction } from './pending-actions';
@@ -42,8 +42,10 @@ import {
   getRegistryOutbox,
   hasPendingRegistryOp,
   holdRegistryOp,
+  isRegistryOpQueued,
   registryOpWrites,
   removeRegistryOp,
+  withdrawRegistryOp,
   type NewRegistryOp,
   type RegistryOp,
 } from './registry-outbox';
@@ -2278,10 +2280,63 @@ async function performRegistryOp(entry: RegistryOp): Promise<void> {
 }
 
 /**
+ * Whether a queued member-file removal is still to be sent. Where it is
+ * not, the drain leaves it alone: it has been taken back here, or it is no
+ * longer the due op the drain read (held, cancelled or landed from another
+ * tab meanwhile).
+ *
+ * The roaming pointer is the account's word on whether it is in a chat,
+ * whichever device gave it, and the account has one member file per chat.
+ * So the file is removed only while the pointer is gone, or while this
+ * leave's own removal of the pointer is still queued here. A pointer that
+ * is there after that removal landed was written since: the account joined
+ * again on another device, or a join made there earlier got its pointer
+ * through late. The file is that stay's now, and nothing writes it a second
+ * time (see joinChat), so this removal would leave the account in the chat
+ * and off everyone's roster.
+ *
+ * OneDrive is asked, not this device's chat list, which runs behind the
+ * pointer both ways: catchUpRegistry drains before it reconciles, so a chat
+ * joined again elsewhere while this device was closed is not held here yet
+ * when its removal comes up, and one left elsewhere is held until the next
+ * reconcile.
+ *
+ * A removal the account has joined over is taken back for good, as one is
+ * by a join made here (see registryOpWrites). The leave that ends the later
+ * stay queues a removal of its own. Kept, this one would cost a request
+ * each time it came due for as long as the account stayed, to be sent in
+ * the end at whatever moment the pointer was next missing, and that can be
+ * the moment between another device's member write and its pointer write.
+ */
+async function memberRemovalStands(
+  entry: Extract<RegistryOp, { op: 'delete-member' }>,
+  now: number,
+): Promise<boolean> {
+  // The ordinary leave: the pointer still on OneDrive is the one this leave
+  // is about to remove, and says nothing about a later join. No request.
+  if (await isRegistryOpQueued('delete-pointer', entry.chatId)) return true;
+  // The pointer is in our own approot and can be read without the share
+  // grant; the member file cannot be removed without it. A removal parked
+  // on that grant is asked about when it can be sent, not on every drain
+  // until then: this throws what the removal itself would have.
+  await getAccessToken('share');
+  if (await chatsApi.hasJoinedPointer(entry.chatId)) {
+    await withdrawRegistryOp(entry);
+    console.debug('[Chats] Member removal for %s is void: the account has joined again since that leave', entry.chatId);
+    return false;
+  }
+  // A request has gone by since the row was read, long enough for a join in
+  // another tab to have held it back or taken it back (see the drain).
+  return (await dueRegistryOp(entry.op, entry.chatId, now)) !== null;
+}
+
+/**
  * Land queued registry writes, oldest first. Never gives up on an entry:
  * these are the writes that keep the account's devices agreeing about
  * which chats it is in, so they back off (capped, Retry-After honoured)
  * rather than fail. A share-tier consent gap parks the entry untouched.
+ * The one entry not sent is a member-file removal that the account has
+ * since joined over (see memberRemovalStands).
  *
  * Serialized: a call that arrives mid-drain (a join or leave enqueued while
  * an earlier drain is still writing) asks for one more pass instead of
@@ -2319,16 +2374,10 @@ async function drainRegistryOnce(): Promise<void> {
     // earlier reading: what is queued now is what is sent.
     const entry = await dueRegistryOp(listed.op, listed.chatId, now);
     if (!entry) continue;
-    // A member file is not removed for a chat this device holds. The
-    // removal was queued by a leave, and the chat is here again without a
-    // join made here having cancelled it: joined again on another device,
-    // and found by the registry pass. The account has one member file per
-    // chat, whichever device wrote it, so sending this now would take a
-    // member off the roster. Skipped, not dropped: should the chat turn
-    // out not to be the account's after all and go again, the removal is
-    // still owed.
-    if (entry.op === 'delete-member' && (await db.getChat(entry.chatId))) continue;
     try {
+      // Inside the try: a pointer that could not be read is a failed try of
+      // the removal, backed off like any other, and the file stays.
+      if (entry.op === 'delete-member' && !(await memberRemovalStands(entry, now))) continue;
       await performRegistryOp(entry);
       await removeRegistryOp(entry.op, entry.chatId);
     } catch (err) {
