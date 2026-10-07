@@ -76,6 +76,24 @@ let pendingSharePayload: SharePayload | null = null;
 let closeLightbox: (() => void) | null = null;
 
 /**
+ * How long the window has to have been back in view before the chat on
+ * screen is taken as read. Coming back to the window is not yet looking at
+ * that chat: a notification tap, or a link the OS hands to this window,
+ * brings the window forward and routes it to another scope, and the page
+ * has no way to know a route is on its way. The worker sends the route
+ * ahead of the focus (notificationclick in sw.ts), but an older worker, and
+ * a link, bring the window forward first. This is how long such a route is
+ * given to arrive. A guess: one that takes longer finds the chat it leaves
+ * already marked read.
+ */
+const RETURN_SETTLE_MS = 400;
+/** When the window last came into view from hidden, on performance.now()'s clock. */
+let returnedAt = -Infinity;
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') returnedAt = performance.now();
+});
+
+/**
  * Something on this screen the user has not sent or saved yet: composer
  * text or attachments, a shared payload waiting in it, an open inline edit.
  * A reload would lose it.
@@ -281,6 +299,21 @@ export async function renderFeed(
     return { canEdit: own, canDelete: own || scope.role === 'host' };
   }
 
+  /** This screen has been taken down. A refresh can still be under way. */
+  let left = false;
+  /**
+   * The user is looking at this chat, so what the feed draws is read: the
+   * window is in view, with this screen up, and has been for a moment (see
+   * RETURN_SETTLE_MS). Never set for the private feed, which has no unread
+   * count.
+   */
+  let looking = false;
+  let lookTimer: ReturnType<typeof setTimeout> | undefined;
+  teardownFns.push(() => {
+    left = true;
+    clearTimeout(lookTimer);
+  });
+
   /** Re-render deferred while an inline editor is open — any member posting
    *  would otherwise destroy in-progress typing (full-innerHTML pipeline). */
   let pendingRefresh: { stick?: boolean } | null = null;
@@ -378,9 +411,12 @@ export async function renderFeed(
     // asked for the bottom (a send, the first paint).
     if (rebuilt ? stick : opts.stick === true) scrollToBottom();
 
-    // Not for a list the user has already left: this refresh was under way
-    // when they went to another feed, and nothing it drew was shown.
-    if (isChat && document.visibilityState === 'visible' && listEl.isConnected) {
+    // Read only while the user is looking at the chat (see `looking`), and
+    // not by a screen they have already left: this refresh was under way
+    // when they went to another feed, and nothing it drew was shown. The
+    // list is no sign of that: it stays in the document until the route to
+    // the next feed has drawn it, several reads of the store later.
+    if (looking && !left && document.visibilityState === 'visible' && listEl.isConnected) {
       const lastId = feed.length ? feed[feed.length - 1].meta.id : undefined;
       // What was drawn: the page of the feed that is in the list, not all of it.
       void coordinator
@@ -429,6 +465,30 @@ export async function renderFeed(
       lastRefreshAt = performance.now();
       if (refreshWanted) scheduleRefresh();
     }
+  }
+
+  /**
+   * Take the chat as looked at once the window has stayed in view, with this
+   * screen up, for `wait` more milliseconds, and refresh then, which marks
+   * read what the feed drew before that: while the window was hidden, or in
+   * those first moments. Nothing else would. A window the user comes back
+   * to syncs only what moved, so a feed that already shows everything is
+   * not drawn again, and the unread count its arrivals were given while the
+   * window was hidden would stand until something else refreshed the feed.
+   */
+  function startLooking(wait: number): void {
+    stopLooking();
+    if (!isChat) return;
+    lookTimer = setTimeout(() => {
+      looking = true;
+      scheduleRefresh();
+    }, wait);
+  }
+
+  /** Nothing drawn from here on is read: the window is hidden, or only just back. */
+  function stopLooking(): void {
+    clearTimeout(lookTimer);
+    looking = false;
   }
 
   /**
@@ -1078,11 +1138,26 @@ export async function renderFeed(
   teardownFns.push(() => clearInterval(poll));
 
   // Back from the background: a cTag probe decides whether a pass is needed.
+  // The chat is not read yet (see RETURN_SETTLE_MS): a route that follows
+  // the return takes this screen down, and its timer with it.
   const onVisible = () => {
-    if (document.visibilityState === 'visible') void coordinator.syncIfDirty(scope);
+    if (document.visibilityState === 'visible') {
+      startLooking(RETURN_SETTLE_MS);
+      void coordinator.syncIfDirty(scope);
+    } else {
+      stopLooking();
+    }
   };
   document.addEventListener('visibilitychange', onVisible);
   teardownFns.push(() => document.removeEventListener('visibilitychange', onVisible));
+  // A screen drawn in a window that is in view is looked at from the start,
+  // unless the window has only just come back: then it waits out the rest of
+  // that moment, like the screen it replaced.
+  if (isChat && document.visibilityState === 'visible') {
+    const wait = returnedAt + RETURN_SETTLE_MS - performance.now();
+    if (wait > 0) startLooking(wait);
+    else looking = true;
+  }
 
   // A share payload that arrived before this scope was picked follows the
   // user across switches until they send it. A carried draft waits for the
