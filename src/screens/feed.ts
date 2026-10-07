@@ -732,9 +732,13 @@ export async function renderFeed(
         // A refused or failed write leaves the row and its card as they were.
         try {
           // For the send this card was drawn from, not whatever is queued
-          // under the drop by now (see DropRecord.sendToken).
-          if (action === 'retry') await coordinator.retryOutboxRecord(id, record.sendToken);
-          else await coordinator.discardOutboxRecord(id, record.sendToken);
+          // under the drop by now (see DropRecord.sendToken). Read off the
+          // card, not from `feed`: a refresh that finds the inline editor
+          // open keeps the cards in place, and by then `feed` can describe
+          // a newer row than the one this card shows.
+          const token = card.dataset.sendToken;
+          if (action === 'retry') await coordinator.retryOutboxRecord(id, token);
+          else await coordinator.discardOutboxRecord(id, token);
         } catch (err) {
           showToast(err instanceof Error ? err.message : `Could not ${action} the drop`, 'error');
         }
