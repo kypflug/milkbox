@@ -785,8 +785,8 @@ function isFromSomeoneElse(scope: Scope, meta: DropMeta, selfId: string | undefi
  * drawn in one that was not focused they are announced here with the rest.
  *
  * Called at the end of a pass that completed, of one that failed after
- * storing something, and by a poll that finds the scope clean (pollScope:
- * no pass will run to do it).
+ * committing a batch (whether or not that commit wrote a drop), and by a
+ * poll that finds the scope clean (pollScope: no pass will run to do it).
  */
 async function settleArrivals(scope: Scope, mayPrime: boolean): Promise<void> {
   const scopeId = scopeIdOf(scope);
@@ -1116,7 +1116,11 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
             });
             if (!batch.written) stopForRemovedScope(controller);
             leftOut += batch.leftOut.size;
-            firstCommitMs ??= performance.now() - t0;
+            // "First drops" is the first commit that stored one, not the
+            // first that was handed some: it may have left them all out, or
+            // found them stored already (by another tab, or by this tab's
+            // outbox drain).
+            if (batch.landed.size) firstCommitMs ??= performance.now() - t0;
             received += records.length;
             emit({ type: 'sync-progress', scopeId, received, total });
             emit({ type: 'feed-updated', scopeId });
@@ -1176,13 +1180,15 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         });
         if (!last.written) stopForRemovedScope(controller);
         leftOut += last.leftOut.size;
-        // "First drops" only when this commit carried some: an empty account,
-        // or a pass that skipped every body, shows no such moment.
-        if (result.upserts.length) firstCommitMs ??= performance.now() - t0;
+        // "First drops" only when this commit stored some: an empty account,
+        // a pass that skipped every body, or one whose bodies were all left
+        // out or already stored, shows no such moment.
+        if (last.landed.size) firstCommitMs ??= performance.now() - t0;
         received += result.upserts.length;
-        // Only what this device actually held: the tombstone for a drop it
-        // deleted itself (already gone locally) is not a removal.
-        removed = [...deletes].filter(id => heldBefore.has(id)).length;
+        // Only what this device held when the commit removed it: the
+        // tombstone for a drop it deleted itself (already gone locally, before
+        // the pass or during it) is not a removal.
+        removed = last.removed.size;
         st.completedOnce = true;
         st.retryCount = 0;
         st.lastPassFailed = false;
@@ -1266,7 +1272,7 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           }
           // Batches that did commit are real arrivals: settle them now.
           // (Anything not settled here stays recorded, for the next pass
-          // that completes or fails after storing something, or the poll
+          // that completes, or fails after committing a batch, or the poll
           // that finds the scope clean.)
           if (received > 0) {
             try {

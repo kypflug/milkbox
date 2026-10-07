@@ -366,6 +366,17 @@ export interface DropCommitResult {
    */
   added: Set<string>;
   /**
+   * Ids among `puts` for which this commit issued a put. Under a snapshot
+   * (see DropCommit.snapshot) that excludes the ones it left out, and the
+   * ones something else — another tab, or this tab's outbox drain — brought
+   * to the very version it was handed since the snapshot: a commit can be
+   * handed drops and write none of them. With no snapshot every put is
+   * written, whatever is held.
+   */
+  landed: Set<string>;
+  /** Ids among `deletes` that were stored when this commit removed them. */
+  removed: Set<string>;
+  /**
    * Ids among `puts` that were not stored, because the copy held had changed
    * since the pass's snapshot (see DropCommit.snapshot). When there are any,
    * the commit's settings were not written either.
@@ -388,6 +399,8 @@ export interface DropCommitResult {
 export async function commitDropChanges(ref: ScopeRef, commit: DropCommit): Promise<DropCommitResult> {
   const { scopeId } = ref;
   const added = new Set<string>();
+  const landed = new Set<string>();
+  const removed = new Set<string>();
   const leftOut = new Set<string>();
   const { snapshot } = commit;
   const written = await writeForScope(ref, ['drops', 'thumbs', 'blobs', 'settings'], t => {
@@ -397,6 +410,10 @@ export async function commitDropChanges(ref: ScopeRef, commit: DropCommit): Prom
     // whether the settings go in at all.
     const theRest = () => {
       for (const id of commit.deletes ?? []) {
+        const there = drops.getKey([scopeId, id]);
+        there.onsuccess = () => {
+          if (there.result !== undefined) removed.add(id);
+        };
         drops.delete([scopeId, id]);
         t.objectStore('thumbs').delete(mediaKey(scopeId, id));
         t.objectStore('blobs').delete(mediaKey(scopeId, id));
@@ -429,6 +446,7 @@ export async function commitDropChanges(ref: ScopeRef, commit: DropCommit): Prom
         if (asSnapshot) {
           if (!stored) added.add(id);
           drops.put({ ...r, scopeId } satisfies StoredDropRecord);
+          landed.add(id);
         } else if (!(stored && stored.eTag !== undefined && stored.eTag === r.eTag)) {
           // Changed here since the snapshot, and not to this very version.
           leftOut.add(id);
@@ -437,7 +455,7 @@ export async function commitDropChanges(ref: ScopeRef, commit: DropCommit): Prom
       };
     }
   });
-  return { written, added, leftOut };
+  return { written, added, landed, removed, leftOut };
 }
 
 /** Where a scope keeps its unsettled arrivals (see DropCommit.arrivalCandidates). */
