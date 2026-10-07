@@ -552,7 +552,8 @@ export async function listDeviceProfiles(skipIfCTag?: string, signal?: AbortSign
   }
   if (skipIfCTag && cTag === skipIfCTag) return { cTag };
 
-  let url = `${itemByPathUrl(APPROOT, DEVICES_FOLDER)}:/children?$select=id,name,file,@microsoft.graph.downloadUrl`;
+  const start = `${itemByPathUrl(APPROOT, DEVICES_FOLDER)}:/children?$select=id,name,file,@microsoft.graph.downloadUrl`;
+  let url = start;
   const items: GraphFileItem[] = [];
 
   while (url) {
@@ -561,7 +562,13 @@ export async function listDeviceProfiles(skipIfCTag?: string, signal?: AbortSign
       const res = await graphFetch(url, { timeoutMs: PAGE_TIMEOUT_MS, signal });
       data = await res.json();
     } catch (err) {
-      if (isGoneError(err)) return { profiles: [], cTag };
+      // Only the opening request can say the folder is gone (deleted since
+      // its cTag was read). "Gone" on a later page is a listing that broke
+      // off: reported as no profiles, it would replace every stored profile
+      // with this device's alone and mark the registry clean, and the others
+      // would stay away until the folder next changed. So it fails the
+      // listing instead, as runDelta does for drops.
+      if (url === start && isGoneError(err)) return { profiles: [], cTag };
       throw err;
     }
     items.push(...data.value.filter(item => item.file && item.name?.endsWith('.json')));
