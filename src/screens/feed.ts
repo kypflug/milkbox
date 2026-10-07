@@ -74,11 +74,13 @@ let closeLightbox: (() => void) | null = null;
 /**
  * How long the window has to have been back in view before the chat on
  * screen is taken as read. Coming back to the window is not yet looking at
- * that chat: a notification tap (notificationclick in sw.ts), or a link the
- * OS hands to this window, brings the window forward first and routes it to
- * another scope a moment later, and the page has no way to know a route is
- * on its way. This is how long such a route is given to arrive. A guess:
- * one that takes longer finds the chat it leaves already marked read.
+ * that chat: a notification tap, or a link the OS hands to this window,
+ * brings the window forward and routes it to another scope, and the page
+ * has no way to know a route is on its way. The worker sends the route
+ * ahead of the focus (notificationclick in sw.ts), but an older worker, and
+ * a link, bring the window forward first. This is how long such a route is
+ * given to arrive. A guess: one that takes longer finds the chat it leaves
+ * already marked read.
  */
 const RETURN_SETTLE_MS = 400;
 /** When the window last came into view from hidden, on performance.now()'s clock. */

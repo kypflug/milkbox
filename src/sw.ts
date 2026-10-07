@@ -139,9 +139,16 @@ self.addEventListener('notificationclick', event => {
         client => new URL(client.url).origin === self.location.origin,
       );
       if (existing) {
-        await existing.focus();
-        // The page routes by hash; tell it which scope the tap meant.
+        // The page routes by hash; tell it which scope the tap meant. Told
+        // before it is brought forward, not after. A chat on screen when its
+        // window comes back into view is taken as read a moment later (see
+        // RETURN_SETTLE_MS in feed.ts), and the chat on screen now is not
+        // the one this tap is for. A page running in the background acts on
+        // the message while still hidden, and has left that chat before it
+        // is in view. One that is frozen finds the message waiting when it
+        // wakes, and that moment has not begun until then.
         existing.postMessage({ type: 'MILKBOX_OPEN_SCOPE', scopeId: scopeId ?? 'private' });
+        await existing.focus();
         return;
       }
       await self.clients.openWindow(target);
