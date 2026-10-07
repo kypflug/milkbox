@@ -67,6 +67,7 @@ Messaging
 - [ ] Attribution shows author names; own drops right-aligned for each side.
 - [ ] GUEST can edit/delete only their own drops; HOST additionally sees delete on GUEST drops; GUEST sees no delete on HOST drops.
 - [ ] Moderation race: GUEST queues an edit offline, HOST deletes that drop, GUEST reconnects → edit is discarded with the conflict toast; the drop stays deleted (no resurrection).
+- [ ] Moderation race, editor open: GUEST opens the inline editor on their own drop, HOST deletes that drop, GUEST waits one poll tick (~45 s) with the editor still open, then presses Save → the editor stays, with "This drop has been removed — your edit was not saved."; Cancel removes the card; the drop stays deleted for HOST (no resurrection).
 - [ ] Offline queue in a chat: SENDING/FAILED overlays, retry, discard.
 - [ ] Unread badge increments on the other account (including from an author whose clock is skewed hours behind) and clears on opening the chat.
 - [ ] Notifications (iOS standalone, notify on): "<chat> · <author>" fires for a backgrounded app; tapping opens the right chat; joining a chat with history does **not** replay the backlog.

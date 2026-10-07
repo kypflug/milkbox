@@ -452,7 +452,9 @@ export class DropConflictError extends Error {
  * - private: retry once unconditionally — the data is single-user, conflicts
  *   are self-races, last write wins;
  * - chat: strictly conditional — 412/404 becomes DropConflictError so a
- *   queued edit can never recreate a drop another member deleted.
+ *   queued edit can never recreate a drop another member deleted. Only with
+ *   an eTag, though: without one this is a create, so the caller sends no
+ *   chat edit that has none.
  */
 export async function putDropJson(scope: Scope, meta: DropMeta, eTag?: string): Promise<string | undefined> {
   const ref = scopeRef(scope);
