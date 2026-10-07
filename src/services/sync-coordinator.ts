@@ -56,6 +56,8 @@ export type CoordinatorEvent =
   | { type: 'drop-progress'; scopeId: ScopeId; dropId: string; fraction: number }
   /** A queued chat edit lost its conditional write — the drop changed or was removed remotely. */
   | { type: 'drop-conflict'; scopeId: ScopeId; dropId: string }
+  /** A queued private-feed edit found its drop deleted on another device, and ended there. */
+  | { type: 'drop-gone'; scopeId: ScopeId; dropId: string }
   | { type: 'chats-changed' }
   /** A chat left the local registry because the account left or deleted it on another device. */
   | { type: 'chat-removed'; chatId: string; name: string };
@@ -639,6 +641,22 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
         emit({ type: 'feed-updated', scopeId });
         return;
       }
+      if (err instanceof graph.DropGoneError) {
+        // Private feed: the drop was deleted on another device while this
+        // edit waited to be sent. The delete stands and the edit ends, as a
+        // chat's does above. The local copy goes with it: it shows the edit
+        // as though it had been saved, and OneDrive has just said there is
+        // no drop for it to be a copy of. Left for a sync pass, it would
+        // stay on show until one came — and for good, if the pass that
+        // would have removed it has already been.
+        if (await db.removeOutboxRecord(ref, record)) {
+          await db.commitDropChanges(ref, { deletes: [record.id] });
+          emit({ type: 'drop-gone', scopeId, dropId: record.id });
+          postBroadcast({ type: 'drop-mutated', dropId: record.id, action: 'delete', scopeId });
+        }
+        emit({ type: 'feed-updated', scopeId });
+        return;
+      }
       attempts++;
       const throttled = graph.isThrottleError(err);
       const retryAfter =
@@ -781,8 +799,25 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
   // no condition at all would overwrite a newer version, or bring back a
   // drop another member deleted, which a chat's edit must never do
   // (putDropJson). A create has neither, and is not conditional.
+  //
+  // In the private feed an edit that loses its condition is written once
+  // more, over whatever version OneDrive holds by then, on the understanding
+  // that it lost to another device. But a request can outlast its record,
+  // and then what it lost to may be what was queued over it and sent from
+  // another tab: a newer edit, which the second write would replace with
+  // the older text. So the second write is only for a record still current;
+  // one that has been queued over ends here. (Queued over by the drop's
+  // delete, it ends here too, though that write could not have undone the
+  // delete: it cannot create the drop.)
   const existing = record.op === 'edit' ? await db.getDrop(scopeId, meta.id) : undefined;
-  const eTag = await graph.putDropJson(scope, meta, existing?.eTag ?? (record.op === 'edit' ? record.prevETag : undefined));
+  const eTag = await graph.putDropJson(
+    scope,
+    meta,
+    existing?.eTag ?? (record.op === 'edit' ? record.prevETag : undefined),
+    async () => {
+      if (!(await db.hasOutboxRecord(record))) throw new SendWithdrawnError();
+    },
+  );
   // Stored in the stay the send was queued in. If the chat has been left
   // (and perhaps joined again) while the request was out, the send ends
   // here: what is stored now is not this send's to touch.
