@@ -14,6 +14,7 @@
  */
 
 import {
+  DownloadError,
   GRAPH_BASE,
   GraphHttpError,
   PAGE_TIMEOUT_MS,
@@ -70,16 +71,33 @@ interface GraphChildItem {
   '@microsoft.graph.downloadUrl'?: string;
 }
 
+/**
+ * Every child of a folder, or null when the folder does not exist.
+ *
+ * Only the opening request can say that. "Gone" on a later page is a listing
+ * that broke off part-way, and it rejects like any other failed page. The
+ * callers read a missing folder as one that holds nothing, and the registry
+ * pass acts on it: said of a later page, it would clear the chats of that
+ * role held on this device, unsent drops included (see
+ * reconcileChatRegistry). runDelta draws the same line for drops.
+ */
 async function listChildren(
   ref: DriveRef,
   path: string,
   select: string,
   tier: 'base' | 'share',
-): Promise<GraphChildItem[]> {
-  let url = `${itemByPathUrl(ref, path)}:/children?$select=${select}`;
+): Promise<GraphChildItem[] | null> {
+  const start = `${itemByPathUrl(ref, path)}:/children?$select=${select}`;
+  let url = start;
   const items: GraphChildItem[] = [];
   while (url) {
-    const res = await graphFetch(url, { timeoutMs: PAGE_TIMEOUT_MS }, tier);
+    let res: Response;
+    try {
+      res = await graphFetch(url, { timeoutMs: PAGE_TIMEOUT_MS }, tier);
+    } catch (err) {
+      if (url === start && isGoneError(err)) return null;
+      throw err;
+    }
     const data: { value: GraphChildItem[]; '@odata.nextLink'?: string } = await res.json();
     items.push(...data.value);
     url = data['@odata.nextLink'] || '';
@@ -304,13 +322,8 @@ export async function deleteMemberFile(chat: { driveId: string; itemId: string }
 }
 
 export async function listMembers(chat: { driveId: string; itemId: string }): Promise<ChatMember[]> {
-  let items: GraphChildItem[];
-  try {
-    items = await listChildren(chatRef(chat), 'members', 'id,name,file,@microsoft.graph.downloadUrl', 'share');
-  } catch (err) {
-    if (isGoneError(err)) return [];
-    throw err;
-  }
+  const items = await listChildren(chatRef(chat), 'members', 'id,name,file,@microsoft.graph.downloadUrl', 'share');
+  if (!items) return [];
   const files = items.filter(item => item.file && item.name?.endsWith('.json'));
   const members = await mapLimited(files, 4, async item => {
     try {
@@ -385,24 +398,45 @@ export async function deleteJoinedPointer(chatId: string): Promise<void> {
  * the listing named — the complete remote registry, which reconciliation
  * compares local records against — while `pointers`/`records` carry only
  * the entries the caller did not already know, fully resolved. Keeping the
- * two apart matters: an entry whose body failed to download is still
- * present remotely and must never read as a removal.
+ * two apart matters: an entry that cannot be read is still present remotely
+ * and must never read as a removal.
+ *
+ * A listing that resolves is a whole answer: the caller records the registry
+ * as reconciled on the strength of it (see hydrateChatRegistry) and does not
+ * list again until a folder changes. So the only entries it may leave out
+ * are those unreadable in themselves (see isEntryUnreadable). An entry whose
+ * read merely failed rejects the listing instead, and so does a page of the
+ * listing that failed, "gone" for any page after the first included (see
+ * listChildren).
  */
 export interface JoinedPointerListing {
   ids: Set<string>;
   pointers: JoinedChatPointer[];
 }
 
+/**
+ * Whether a failed read of one registry entry says something about the entry:
+ * an answer that would be the same on the next try (a chat folder with no
+ * chat.json, a pointer deleted since it was listed). Such an entry is
+ * skipped, or it would fail the listing on every poll tick.
+ *
+ * Anything else (a throttle, a server error, a timeout, a dropped connection)
+ * says nothing about the entry and has to fail the listing. Skipped, the
+ * entry would be missing from a listing its caller goes on to record as
+ * complete, and the chat would not turn up on this device until its folder
+ * next changed.
+ */
+function isEntryUnreadable(err: unknown): boolean {
+  if (!(err instanceof GraphHttpError || err instanceof DownloadError)) return false;
+  // 408 and 429 are 4xx in number only: "ask again", not a verdict on the entry.
+  return err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429;
+}
+
 export async function listJoinedPointers(skipChatIds?: ReadonlySet<string>): Promise<JoinedPointerListing> {
   const ids = new Set<string>();
   const pointers: JoinedChatPointer[] = [];
-  let items: GraphChildItem[];
-  try {
-    items = await listChildren(APPROOT, JOINED_FOLDER, 'id,name,file,@microsoft.graph.downloadUrl', 'base');
-  } catch (err) {
-    if (isGoneError(err)) return { ids, pointers }; // folder never created — no joined chats
-    throw err;
-  }
+  const items = await listChildren(APPROOT, JOINED_FOLDER, 'id,name,file,@microsoft.graph.downloadUrl', 'base');
+  if (!items) return { ids, pointers }; // folder never created — no joined chats
   const unknown: Array<{ item: GraphChildItem; chatId: string }> = [];
   for (const item of items) {
     if (!item.file || !item.name?.endsWith('.json')) continue;
@@ -416,7 +450,8 @@ export async function listJoinedPointers(skipChatIds?: ReadonlySet<string>): Pro
     try {
       const pointer = validateJoinedPointer(await downloadJson(item, undefined, 'base'));
       return pointer && pointer.chatId === chatId ? pointer : null;
-    } catch {
+    } catch (err) {
+      if (!isEntryUnreadable(err)) throw err;
       return null; // unreadable pointer — it stays in ids, so it is not a removal
     }
   });
@@ -466,13 +501,8 @@ export async function getRegistryCTags(): Promise<RegistryCTags> {
 export async function listHostChats(me: AuthorAttribution, skipChatIds?: ReadonlySet<string>): Promise<HostChatListing> {
   const ids = new Set<string>();
   const records: ChatRecord[] = [];
-  let items: GraphChildItem[];
-  try {
-    items = await listChildren(APPROOT, CHATS_FOLDER, 'id,name,folder,parentReference', 'base');
-  } catch (err) {
-    if (isGoneError(err)) return { ids, records }; // folder never created — no hosted chats
-    throw err;
-  }
+  const items = await listChildren(APPROOT, CHATS_FOLDER, 'id,name,folder,parentReference', 'base');
+  if (!items) return { ids, records }; // folder never created — no hosted chats
   const unknown: Array<GraphChildItem & { name: string }> = [];
   for (const item of items) {
     if (!item.folder || !item.name) continue;
@@ -486,7 +516,10 @@ export async function listHostChats(me: AuthorAttribution, skipChatIds?: Readonl
       // The descriptor and the drops folder id are independent — ask for both at once.
       const [descriptor, dropsItem] = await Promise.all([
         graphFetch(contentUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/chat.json`))
-          .then(res => res.json())
+          // graphFetch has already read the body, so what fails here is a
+          // body that is not JSON: this folder's own problem, like any
+          // other descriptor that fails validation.
+          .then(res => res.json().catch(() => undefined))
           .then(validateChatDescriptor),
         graphFetch(`${itemByPathUrl(APPROOT, `${CHATS_FOLDER}/${item.name}/drops`)}?$select=id`)
           .then(res => res.json() as Promise<{ id?: string }>),
@@ -504,7 +537,8 @@ export async function listHostChats(me: AuthorAttribution, skipChatIds?: Readonl
         joinedAt: descriptor.createdAt,
         state: 'active',
       };
-    } catch {
+    } catch (err) {
+      if (!isEntryUnreadable(err)) throw err;
       return null; // a chat folder we can't read — it stays in ids, so it is not a removal
     }
   });
