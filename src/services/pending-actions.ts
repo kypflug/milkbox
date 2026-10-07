@@ -16,7 +16,18 @@ const KEY = PENDING_ACTION_KEY;
 const STALE_MS = 15 * 60_000;
 
 export type PendingAction =
-  | { type: 'join'; token: string; createdAt: number; consentRequested?: boolean }
+  | {
+      type: 'join';
+      token: string;
+      createdAt: number;
+      consentRequested?: boolean;
+      /**
+       * Set when the invite was opened while signed out and parked for
+       * whoever signs in next — the one record that survives the wipe when
+       * a different account takes over the store.
+       */
+      parkedSignedOut?: boolean;
+    }
   | { type: 'create-chat'; name: string; createdAt: number; consentRequested?: boolean }
   | { type: 'reconnect'; chatId: string; createdAt: number; consentRequested?: boolean };
 

@@ -55,7 +55,20 @@ const pendingDeletes = new Map<string, ReturnType<typeof setTimeout>>();
  */
 let pendingSharePayload: SharePayload | null = null;
 
+/** Closes the open lightbox, if any. */
+let closeLightbox: (() => void) | null = null;
+
+/**
+ * Something on this screen the user has not sent or saved yet: composer
+ * text or attachments, a shared payload waiting in it, an open inline edit.
+ * A reload would lose it.
+ */
+export function hasUnsentDraft(): boolean {
+  return Boolean(composerApi?.hasDraft() || pendingSharePayload || document.querySelector('.drop-edit'));
+}
+
 export function teardownScreenListeners(): void {
+  closeLightbox?.();
   for (const fn of teardownFns) fn();
   teardownFns = [];
   composerApi?.teardown();
@@ -620,18 +633,23 @@ export async function renderFeed(
       <img class="lightbox-img" alt="${escapeAttr(f.name)}">
       <div class="lightbox-caption">${escapeHtml(f.name)}</div>
     `;
-    const close = () => overlay.remove();
+    const close = () => {
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+      if (closeLightbox === close) closeLightbox = null;
+    };
     overlay.addEventListener('click', e => {
       if (e.target === overlay || (e.target as HTMLElement).closest('.lightbox-close')) close();
     });
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        close();
-        document.removeEventListener('keydown', onKey);
-      }
+      if (e.key === 'Escape') close();
     };
     document.addEventListener('keydown', onKey);
     document.body.appendChild(overlay);
+    // It hangs off <body>, not the feed: closed with the screen, or it
+    // would outlive it (a scope switch, another tab signing out).
+    closeLightbox?.();
+    closeLightbox = close;
 
     const img = overlay.querySelector<HTMLImageElement>('.lightbox-img')!;
     // Show the thumb instantly, then swap in the full-res image

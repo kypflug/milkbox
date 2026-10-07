@@ -21,6 +21,14 @@ export interface ModalHandle {
 
 /** The house sheet: portaled to body, scrim, Escape/backdrop/close-button
  *  dismissal. Also the shell for the chat switcher dialog. */
+/** Close functions of the sheets currently open. */
+const openModals = new Set<() => void>();
+
+/** Close every open sheet — the page is being taken over (signed out in another tab). */
+export function closeAllModals(): void {
+  for (const close of [...openModals]) close();
+}
+
 export function openModal(title: string, bodyHtml: string, opts: { onClose?: () => void } = {}): ModalHandle {
   const scrim = document.createElement('div');
   scrim.className = 'chat-modal-scrim';
@@ -34,10 +42,12 @@ export function openModal(title: string, bodyHtml: string, opts: { onClose?: () 
     </div>
   `;
   const close = () => {
+    openModals.delete(close);
     document.removeEventListener('keydown', onKey);
     scrim.remove();
     opts.onClose?.();
   };
+  openModals.add(close);
   const onKey = (e: KeyboardEvent) => {
     if (e.key === 'Escape') close();
   };

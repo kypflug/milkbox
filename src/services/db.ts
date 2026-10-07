@@ -576,32 +576,89 @@ export async function resetScopeStore(scopeId: ScopeId, settingsKeys: string[]):
   });
 }
 
+/** Every store, for the two operations that empty the database. */
+const ALL_STORES = ['drops', 'thumbs', 'blobs', 'outbox', 'devices', 'chats', 'settings'];
+
 /**
- * Wipe all local data and start a new epoch.
+ * Wipe all local data (sign-out) and start a new epoch. This page does not
+ * adopt it: from here on its own late writes — and those of every other tab
+ * still open on the old account — are refused, so nothing of that account
+ * can land after the wipe. The page is on its way out (or reloads).
  *
- * At sign-out (the default) this page does not adopt the new epoch: from
- * here on its own late writes — and those of every other tab still open on
- * the old account — are refused, so nothing of that account can land after
- * the wipe. The page is on its way out (or reloads).
- *
- * `adopt` is for a page that carries on afterwards: the boot-time wipe when
- * a different account signs in over leftovers from the last one.
- *
- * `settings` are written into the emptied store in the same transaction —
- * the marker saying who (or that nobody) owns what is stored from here on.
+ * `settings` are written into the emptied store in the same transaction:
+ * the marker saying the store was emptied on purpose.
  */
-export async function clearAllData(
-  opts: { adopt?: boolean; settings?: Array<[string, unknown]> } = {},
-): Promise<void> {
+export async function clearAllData(opts: { settings?: Array<[string, unknown]> } = {}): Promise<void> {
   const db = await openDb();
-  const stores = ['drops', 'thumbs', 'blobs', 'outbox', 'devices', 'chats', 'settings'];
   return new Promise((resolve, reject) => {
-    const t = db.transaction(stores, 'readwrite');
-    for (const s of stores) t.objectStore(s).clear();
-    renewEpoch(t, opts.adopt === true);
+    const t = db.transaction(ALL_STORES, 'readwrite');
+    for (const s of ALL_STORES) t.objectStore(s).clear();
+    renewEpoch(t, false);
     for (const [key, value] of opts.settings ?? []) t.objectStore('settings').put(value, key);
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);
+  });
+}
+
+/**
+ * A page entering the app claims the store for `owner`, in one transaction:
+ * - already marked as `owner`'s: kept ('kept');
+ * - no marker at all: marked, data untouched ('adopted');
+ * - marked as anything else: emptied, a new epoch started, marked as
+ *   `owner`'s ('wiped'). Settings named in `carry` survive the wipe when
+ *   `shouldCarry` says so.
+ *
+ * Reading the marker and acting on it in the same transaction is what makes
+ * two pages entering at once safe: the second finds the store already its
+ * own and keeps it, where two separate wipes would leave the first page on
+ * a superseded epoch. Either way the page ends up on the store's current
+ * epoch — it has read nothing else yet, so there is nothing stale to protect.
+ */
+export async function claimStore(
+  ownerKey: string,
+  owner: string,
+  carry: string[] = [],
+  shouldCarry: (key: string, value: unknown) => boolean = () => true,
+): Promise<'kept' | 'adopted' | 'wiped'> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const t = db.transaction(ALL_STORES, 'readwrite');
+    const settings = t.objectStore('settings');
+    let outcome: 'kept' | 'adopted' | 'wiped' = 'kept';
+    const epochAtOpen = pageEpoch;
+    const marker = settings.get(ownerKey);
+    const epoch = settings.get(EPOCH_KEY);
+    const carried: Array<[string, unknown]> = [];
+    for (const key of carry) {
+      const held = settings.get(key);
+      held.onsuccess = () => {
+        if (held.result !== undefined && shouldCarry(key, held.result)) carried.push([key, held.result]);
+      };
+    }
+    // Requests settle in the order they were made, so by the time this last
+    // read comes back every one above has.
+    const decide = settings.get(ownerKey);
+    decide.onsuccess = () => {
+      if (marker.result === owner || marker.result === undefined) {
+        pageEpoch = (epoch.result as string | undefined) ?? null;
+        if (marker.result === undefined) {
+          outcome = 'adopted';
+          settings.put(owner, ownerKey);
+        }
+        return;
+      }
+      outcome = 'wiped';
+      for (const s of ALL_STORES) t.objectStore(s).clear();
+      renewEpoch(t, true);
+      settings.put(owner, ownerKey);
+      for (const [key, value] of carried) settings.put(value, key);
+    };
+    t.oncomplete = () => resolve(outcome);
+    t.onerror = () => reject(t.error);
+    t.onabort = () => {
+      if (outcome !== 'wiped') pageEpoch = epochAtOpen; // renewEpoch undoes its own
+      reject(t.error);
+    };
   });
 }

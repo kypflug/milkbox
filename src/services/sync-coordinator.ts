@@ -33,7 +33,7 @@ import * as notify from './notify';
 import { ConsentRequiredError } from './auth';
 import { postBroadcast } from './broadcast';
 import { errorLabel, newPassCounts, recordPass, requestCount, type PassStats } from './sync-stats';
-import { PENDING_ACTION_KEY, getPendingAction } from './pending-actions';
+import { PENDING_ACTION_KEY, type PendingAction } from './pending-actions';
 import {
   deferRegistryOp,
   enqueueRegistryOp,
@@ -130,24 +130,18 @@ export function wipeForSignOut(): Promise<void> {
  * - No marker at all: an install from before the marker existed, whose
  *   data is the signed-in account's — adopted as it is.
  *
- * One thing survives the wipe of a signed-out store: an invite opened while
- * signed out, which is parked there until sign-in and belongs to whoever
- * signs in next. A join parked under another account goes with its data.
+ * One thing survives a wipe: an invite opened while signed out, which is
+ * parked in the store until sign-in (main.ts) and belongs to whoever signs
+ * in next. It is recognised by the tag it was parked with — a join left by
+ * an account's own session carries none and goes with that account's data.
  */
 export async function claimStoreFor(accountId: string): Promise<void> {
-  const owner = await db.getSetting<string>(STORE_OWNER_KEY);
-  if (owner === accountId) return;
-  if (owner === undefined) {
-    await db.putSetting(STORE_OWNER_KEY, accountId);
-    return;
-  }
-  console.info('[Sync] Local data is not this account’s — clearing it');
-  const keep: Array<[string, unknown]> = [[STORE_OWNER_KEY, accountId]];
-  if (owner === SIGNED_OUT) {
-    const pending = await getPendingAction();
-    if (pending?.type === 'join') keep.push([PENDING_ACTION_KEY, pending]);
-  }
-  await db.clearAllData({ adopt: true, settings: keep });
+  const outcome = await db.claimStore(STORE_OWNER_KEY, accountId, [PENDING_ACTION_KEY], (_key, value) => {
+    const action = value as Partial<PendingAction> | null;
+    return action?.type === 'join' && action.parkedSignedOut === true;
+  });
+  if (outcome !== 'wiped') return;
+  console.info('[Sync] Local data is not this account’s — cleared it');
   mePromise = null;
 }
 
@@ -1506,6 +1500,8 @@ const REGISTRY_BACKOFF_CAP_MS = 30 * 60_000;
  * failed drain never skips the reconcile.
  */
 export async function catchUpRegistry(eager = false): Promise<void> {
+  // Signed out (here or in another tab): nothing more to ask OneDrive for.
+  if (shuttingDown) return;
   await drainRegistryOutbox();
   await hydrateChatRegistry(eager);
 }

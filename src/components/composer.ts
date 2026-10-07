@@ -15,6 +15,8 @@ export interface ComposerApi {
   setText(text: string): void;
   /** Add attachments (share target, drag-drop). */
   addFiles(files: File[]): void;
+  /** Text or attachments not sent yet. */
+  hasDraft(): boolean;
   focus(): void;
   /** `progress` labels a pass that is fetching drops: "Syncing — 120 of 312". */
   setSyncState(state: 'syncing' | 'synced' | 'error', progress?: { received: number; total: number }): void;
@@ -213,6 +215,7 @@ export function mountComposer(
       autoGrow();
     },
     addFiles,
+    hasDraft: () => inputEl.value.trim() !== '' || pendingFiles.length > 0,
     focus: () => inputEl.focus(),
     setSyncState,
     setDisabled(disabled: boolean, placeholder?: string) {

@@ -7,8 +7,8 @@ import { resumePendingAction, startCreateChatFlow, startJoinFlow, startReconnect
 import { setPendingAction } from './services/pending-actions';
 import { isValidShareToken } from './services/chats';
 import { renderSignIn } from './screens/sign-in';
-import { renderFeed, applySharePayload, teardownScreenListeners } from './screens/feed';
-import { showManageSheet } from './screens/chat-sheets';
+import { renderFeed, applySharePayload, hasUnsentDraft, teardownScreenListeners } from './screens/feed';
+import { closeAllModals, showManageSheet } from './screens/chat-sheets';
 import { mountChatMenu, type ChatSwitcherHandlers } from './components/chat-switcher';
 import { showToast } from './components/toast';
 import { applyTheme } from './theme';
@@ -106,7 +106,7 @@ async function boot(app: HTMLElement): Promise<void> {
   const signedIn = Boolean(redirectResponse?.account) || isSignedIn();
   if (invitedToken && !signedIn) {
     invitedSignIn = true;
-    await setPendingAction({ type: 'join', token: invitedToken, createdAt: Date.now() });
+    await setPendingAction({ type: 'join', token: invitedToken, createdAt: Date.now(), parkedSignedOut: true });
     history.replaceState(null, '', '/');
   }
 
@@ -220,9 +220,12 @@ let signedOutElsewhere = false;
 
 /** Stop this page and put the sign-in screen up — whatever it was in the middle of drawing. */
 function showSignedOutElsewhere(app: HTMLElement): void {
-  teardownScreenListeners();
+  teardownScreenListeners(); // the lightbox with it
   chatUiTeardown?.();
   chatUiTeardown = null;
+  // Sheets hang off <body>: left open they would keep showing the signed-out
+  // account's chat members or invite link over the sign-in screen.
+  closeAllModals();
   renderSignIn(app, () => location.reload());
 }
 
@@ -246,7 +249,17 @@ async function enterApp(app: HTMLElement): Promise<void> {
       void clearMsalCacheBackup();
       showSignedOutElsewhere(app);
     } else if (event.type === 'store-reset') {
-      location.reload();
+      // This page has to reload before it can write again — but not over
+      // something the user hasn't sent yet. Then it is their call.
+      if (hasUnsentDraft()) {
+        showToast('Milkbox was re-synced in another window. Reload this one when you’re ready.', 'info', {
+          label: 'Reload',
+          onClick: () => location.reload(),
+          duration: 10 * 60_000,
+        });
+      } else {
+        location.reload();
+      }
     }
   });
   postBroadcast({ type: 'auth-changed', signedIn: true });
@@ -333,10 +346,18 @@ async function route(app: HTMLElement): Promise<void> {
   }
   restoredActiveScope = true;
 
-  await coordinator.setActiveScopeId(scopeIdOf(scope));
-  await renderFeed(app, { openSettings: hash === 'settings', scope });
+  try {
+    await coordinator.setActiveScopeId(scopeIdOf(scope));
+    if (signedOutElsewhere) return;
+    await renderFeed(app, { openSettings: hash === 'settings', scope });
+  } catch (err) {
+    // Storage refuses this page's writes once another tab has signed out;
+    // a route that fails on that is handled just below, not an error.
+    if (!signedOutElsewhere) throw err;
+  }
   // The sign-out arrived while the feed was being drawn: the feed may have
-  // been painted over the sign-in screen, so put that back.
+  // been painted over the sign-in screen — and its listeners left running,
+  // if drawing then failed — so put the sign-in screen back.
   if (signedOutElsewhere) {
     showSignedOutElsewhere(app);
     return;
