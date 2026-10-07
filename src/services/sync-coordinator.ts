@@ -863,29 +863,40 @@ async function announceArrivals(scope: Scope, ids: string[], mayPrime: boolean):
  * focused they are dropped from the list, as the worker would say nothing
  * about them now. In a window that is visible but not focused they stay, to
  * be announced once with the rest when the list is settled.
+ *
+ * What was drawn is noted before the badge is cleared. The two are separate
+ * transactions, and the list can be settled between them: the user moves to
+ * another feed or hides the window, or another tab's pass ends. In this
+ * order a settling that comes after the first sees what was drawn and does
+ * not count it, and one that got in before it, and did count it, is
+ * followed by the clearing. The other way round, a settling in between
+ * counted what the user had just read, and nothing took that back.
  */
 export async function markScopeRead(scope: Scope, lastDropId?: string, drawn?: ReadonlySet<string>): Promise<void> {
   if (scope.kind !== 'chat') return;
+  if (drawn?.size) {
+    try {
+      // For the stay the feed belongs to only (scopeRefOf carries it).
+      if ((await db.getSetting<string[]>(db.arrivalsKey(scopeIdOf(scope))))?.length) {
+        await db.markArrivalsShown(scopeRefOf(scope), drawn, document.hasFocus());
+      }
+    } catch (err) {
+      console.debug('[Sync] Could not note the arrivals that were shown:', err);
+    }
+  }
+  // Read now, after that write: a settling that got in ahead of it has
+  // raised the count since this call began.
   const record = await db.getChat(scope.chatId);
   if (!record || record.generation !== scope.generation) return;
-  if ((record.unreadCount ?? 0) !== 0 || record.lastReadDropId !== lastDropId) {
-    // Checked again inside the write: the chat can be left and joined
-    // again between the read above and this.
-    const patched = await db.patchChat(
-      scope.chatId,
-      { unreadCount: 0, ...(lastDropId ? { lastReadDropId: lastDropId } : {}) },
-      { generation: scope.generation },
-    );
-    if (!patched) return;
-    emit({ type: 'chats-changed' });
-  }
-  if (!drawn?.size) return;
-  try {
-    if (!(await db.getSetting<string[]>(db.arrivalsKey(scopeIdOf(scope))))?.length) return;
-    await db.markArrivalsShown(scopeRefOf(scope), drawn, document.hasFocus());
-  } catch (err) {
-    console.debug('[Sync] Could not note the arrivals that were shown:', err);
-  }
+  if ((record.unreadCount ?? 0) === 0 && record.lastReadDropId === lastDropId) return;
+  // Checked again inside the write: the chat can be left and joined
+  // again between the read above and this.
+  const patched = await db.patchChat(
+    scope.chatId,
+    { unreadCount: 0, ...(lastDropId ? { lastReadDropId: lastDropId } : {}) },
+    { generation: scope.generation },
+  );
+  if (patched) emit({ type: 'chats-changed' });
 }
 
 /** `scope` is the chat as the failing work knew it: a chat joined again since is not touched. */
@@ -1231,6 +1242,12 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           } catch (err) {
             console.debug('[Sync] Descriptor refresh failed; name may be stale:', err);
           }
+        } else if (passChanged) {
+          // The same for the private feed: its drops are shown now, not
+          // after the device profiles awaited below. Those only label drops
+          // (runDevicesPhase), and a registry slow to answer would keep a
+          // pass's last drops off the screen until it had.
+          emit({ type: 'feed-updated', scopeId });
         }
 
         // Announcements name the sending device, so let its profile land
@@ -1500,12 +1517,26 @@ async function pollScope(scopeId: ScopeId): Promise<void> {
     if (!record || (record.state ?? 'active') !== 'active') return;
   }
   try {
-    const [feed, devicesDirty] = await Promise.all([
-      graph.isFeedDirty(scope),
-      scope.kind === 'private' ? graph.isDeviceRegistryDirty() : Promise.resolve(false),
-    ]);
+    // The device registry is the optional half of a private poll: it holds
+    // profile names, nothing a drop waits on. A probe of it that fails is
+    // kept from rejecting the pair, or a feed this poll found changed would
+    // wait for a later one. It still raises the throttle gate, and reads as
+    // unchanged: the stored cTag is as it was, so the next poll asks again.
+    const devicesProbe =
+      scope.kind === 'private'
+        ? graph.isDeviceRegistryDirty().catch(err => {
+            noteThrottle(err);
+            console.debug('[Sync] Device registry probe failed:', err);
+            return false;
+          })
+        : Promise.resolve(false);
+    const [feed, devicesDirty] = await Promise.all([graph.isFeedDirty(scope), devicesProbe]);
     if (feed.dirty || devicesDirty) {
-      await requestSync(scope, { force: true, knownCTag: feed.cTag });
+      // Not with the gate up, which the registry probe may just have
+      // raised. With no pass running requestSync would refuse by itself;
+      // with one running it would be told to go round again, inside the
+      // wait the throttle asked for.
+      if (!isThrottled()) await requestSync(scope, { force: true, knownCTag: feed.cTag });
     } else if (!scopeStates.get(scopeId)?.syncing) {
       await settleLeftOverArrivals(scope);
     }
