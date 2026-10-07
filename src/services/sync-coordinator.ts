@@ -249,12 +249,20 @@ const MAX_ATTEMPTS = 3;
 const BACKOFF_BASE_MS = 1000;
 
 /**
- * Nothing was queued: the chat left this device (removed in another tab,
- * say) while its feed was still open here. Thrown so the sender is told —
- * the alternative is a message that silently disappears.
+ * Storage refused to queue something for a chat (see db.writeForScope): the
+ * chat left this device while its feed was still open here — removed in
+ * another tab, say — or it was left and joined again, and the screen that
+ * asked still belongs to the earlier stay. Thrown so the sender is told, in
+ * terms that fit which of the two it was; the alternative is a message that
+ * silently disappears.
  */
-function chatGoneError(what: string): Error {
-  return new Error(`This chat is no longer on this device — ${what}.`);
+async function chatRefusal(scope: Scope, what: string): Promise<Error> {
+  const heldAgain = scope.kind === 'chat' && Boolean(await db.getChat(scope.chatId));
+  return new Error(
+    heldAgain
+      ? `This chat was left and joined again — ${what}. Open the chat again to carry on.`
+      : `This chat is no longer on this device — ${what}.`,
+  );
 }
 
 /** Queue a new drop (optionally with a file payload) and start draining. */
@@ -274,7 +282,7 @@ export async function enqueueCreate(scope: Scope, meta: DropMeta, blob?: Blob): 
     state: 'queued',
     scopeId,
   });
-  if (!queued) throw chatGoneError('your drop was not sent');
+  if (!queued) throw await chatRefusal(scope, 'your drop was not sent');
   emit({ type: 'feed-updated', scopeId });
   // Upload now, even if a long pass (a first sync) is mid-download; the
   // forced pass then picks up anything else that changed.
@@ -302,7 +310,7 @@ export async function enqueueEdit(scope: Scope, meta: DropMeta): Promise<void> {
     prevMeta,
     prevETag,
   });
-  if (!written) throw chatGoneError('your edit was not saved');
+  if (!written) throw await chatRefusal(scope, 'your edit was not saved');
   // Optimistically update the local record so the edit shows immediately
   if (existing) await db.putDrop(scopeRefOf(scope), { ...existing, meta });
   emit({ type: 'feed-updated', scopeId });
@@ -320,7 +328,18 @@ export async function enqueueDelete(scope: Scope, id: string): Promise<void> {
     emit({ type: 'feed-updated', scopeId });
     return;
   }
-  await db.putOutboxRecord(scopeRefOf(scope), { id, meta, op: 'delete', attempts: 0, state: 'queued', scopeId });
+  const queued = await db.putOutboxRecord(scopeRefOf(scope), { id, meta, op: 'delete', attempts: 0, state: 'queued', scopeId });
+  if (!queued) {
+    // Refused: the chat was removed while the delete waited out its undo
+    // window. If it is simply gone, the drop went with it and there is
+    // nothing to report. If it has been joined again, the drop is back
+    // with it and nothing was queued to delete it: the caller is told.
+    if (scope.kind === 'chat' && (await db.getChat(scope.chatId))) {
+      throw await chatRefusal(scope, 'the drop was not deleted');
+    }
+    emit({ type: 'feed-updated', scopeId });
+    return;
+  }
   emit({ type: 'feed-updated', scopeId });
   void drainOutbox(scopeId);
 }
@@ -1854,8 +1873,12 @@ async function reconcileChatRegistry(me: AuthorAttribution): Promise<void> {
     // Gone on every other device too: the host deleted it, or we left it.
     const current = await db.getChat(record.id);
     if (!current) continue; // already left/removed while we listed
+    // Left and joined again while we listed — in another tab, say: the chat
+    // held now is a later stay, which those listings say nothing about. The
+    // clear checks the generation itself, in its own transaction.
+    if (current.generation !== record.generation) continue;
+    if (!(await db.clearScopeData(`chat:${record.id}`, { generation: record.generation }))) continue;
     dropScopeState(`chat:${record.id}`);
-    await db.clearScopeData(`chat:${record.id}`);
     removed.push(current);
     changed = true;
   }

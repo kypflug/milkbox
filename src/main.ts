@@ -108,17 +108,25 @@ async function boot(app: HTMLElement): Promise<void> {
 
   // An invite link opened while signed out: park the join (IDB — survives
   // the sign-in redirect and iOS storage wipes) and greet as invited.
-  const rawInvited = location.hash.startsWith('#join=')
-    ? decodeURIComponent(location.hash.slice(6))
-    : null;
+  const rawInvited = location.hash.startsWith('#join=') ? decodeInvite(location.hash.slice(6)) : null;
   const invitedToken = rawInvited && isValidShareToken(rawInvited) ? rawInvited : null;
   // Signed out in another tab while this one was starting: whatever account
   // MSAL has just loaded is on its way out, so this page is not signed in.
   const signedIn = !signedOutElsewhere && (Boolean(redirectResponse?.account) || isSignedIn());
   if (invitedToken && !signedIn) {
     invitedSignIn = true;
-    await setPendingAction({ type: 'join', token: invitedToken, createdAt: Date.now(), parkedSignedOut: true });
-    history.replaceState(null, '', '/');
+    // Not while another tab is signing out: its wipe would refuse this
+    // write, or take the parked invite with it a moment later. The link
+    // stays in the address bar instead, for the next load to pick up.
+    if (!signedOutElsewhere) {
+      try {
+        await setPendingAction({ type: 'join', token: invitedToken, createdAt: Date.now(), parkedSignedOut: true });
+      } catch (err) {
+        if (!signedOutElsewhere) throw err;
+      }
+      // Parked for sure only if no sign-out arrived while it was written.
+      if (!signedOutElsewhere) history.replaceState(null, '', '/');
+    }
   }
   if (signedOutElsewhere) {
     // Its screen is up already; drawn again now that this is known to be an
@@ -316,8 +324,10 @@ async function enterApp(app: HTMLElement): Promise<void> {
     }
     await route(app);
     window.addEventListener('hashchange', () => void route(app));
-    // Anything a consent redirect / sign-in / iOS sheet interrupted.
-    if (!signedOutElsewhere) await resumePendingAction();
+    // Anything a consent redirect / sign-in / iOS sheet interrupted — unless
+    // this launch's own invite link has just started a join: that flow has
+    // parked the same join itself, and resuming it here would run it twice.
+    if (!signedOutElsewhere && !joinStartedFromLink) await resumePendingAction();
     if (!signedOutElsewhere) await handleShareTarget();
   } catch (err) {
     // Once another tab has signed out, storage refuses this page's writes.
@@ -353,6 +363,18 @@ async function enterApp(app: HTMLElement): Promise<void> {
   }
 }
 
+/** route() found an invite link in the address bar and started its join. */
+let joinStartedFromLink = false;
+
+/** The token of an invite link, or null when its escaping is broken. */
+function decodeInvite(encoded: string): string | null {
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return null;
+  }
+}
+
 /** Only the very first empty-hash route restores the remembered scope —
  *  after that, an empty hash means the user chose the private feed. */
 let restoredActiveScope = false;
@@ -366,9 +388,13 @@ async function route(app: HTMLElement): Promise<void> {
     // Strip the hash first so a reload doesn't re-trigger the join, then
     // run the flow on top of whatever scope renders below.
     history.replaceState(null, '', '/');
-    const token = decodeURIComponent(rawHash.slice(5));
-    if (isValidShareToken(token)) void startJoinFlow(token);
-    else showToast('This invite link doesn’t work anymore. Ask the host for a new one.', 'error');
+    const token = decodeInvite(rawHash.slice(5));
+    if (token && isValidShareToken(token)) {
+      joinStartedFromLink = true;
+      void startJoinFlow(token);
+    } else {
+      showToast('This invite link doesn’t work anymore. Ask the host for a new one.', 'error');
+    }
   }
   const hash = rawHash.startsWith('join=') ? '' : rawHash;
 

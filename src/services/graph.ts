@@ -1001,9 +1001,12 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
           { signal, stats },
         );
         if (stats) stats.downloaded++;
+        // The file is there, whatever it holds. Seen, so that a full pass
+        // does not sweep the copy already held as if the drop had been
+        // deleted: only the unreadable replacement is passed over.
+        seenIds.add(op.id);
         const meta = validateDropMeta(parsed, { expectedId: op.id, requireAuthor: isChat });
         if (meta) {
-          seenIds.add(op.id);
           slots[index] = { meta, eTag: op.eTag };
         } else {
           console.debug('[Sync] Discarding malformed drop JSON: %s.json', op.id);

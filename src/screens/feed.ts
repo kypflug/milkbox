@@ -584,7 +584,12 @@ export async function renderFeed(
     const id = record.meta.id;
     const timer = setTimeout(() => {
       pendingDeletes.delete(mkey(id));
-      void coordinator.enqueueDelete(scope, id);
+      coordinator.enqueueDelete(scope, id).catch(err => {
+        // Nothing was queued: say so, and have whichever screen shows this
+        // scope now draw the drop again (this one may be long gone).
+        showToast(err instanceof Error ? err.message : 'Could not delete the drop', 'error');
+        coordinator.refreshFromCache(scopeId);
+      });
     }, 5000);
     pendingDeletes.set(mkey(id), timer);
     void refresh();
@@ -711,6 +716,9 @@ export async function renderFeed(
         await coordinator.enqueueEdit(scope, { ...record.meta, text, editedAt: Date.now() });
       } catch (err) {
         showToast(err instanceof Error ? err.message : 'Could not save the edit', 'error');
+        // Nothing was queued, so no feed event follows — and the editor is
+        // gone with the text it replaced. Draw the card again as stored.
+        void refresh();
       }
     });
   }

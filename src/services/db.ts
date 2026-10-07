@@ -668,23 +668,48 @@ function scopeSettingsKeys(scopeId: ScopeId): string[] {
   ];
 }
 
-/** Remove everything a scope owns locally (leave chat / chat gone / delete). */
-export async function clearScopeData(scopeId: ScopeId): Promise<void> {
+/**
+ * Remove everything a scope owns locally (leave chat / chat gone / delete).
+ *
+ * With `only`, a chat is cleared only while the record held is still the
+ * stay `only.generation` names: for a removal decided from an earlier
+ * reading (the registry pass lists OneDrive first), which must not take a
+ * chat that has been left and joined again since. Resolves false when
+ * nothing was cleared for that reason.
+ */
+export async function clearScopeData(
+  scopeId: ScopeId,
+  only?: { generation: string | undefined },
+): Promise<boolean> {
   const db = await openDb();
+  const chatId = scopeId.startsWith('chat:') ? scopeId.slice(5) : null;
+  let cleared = false;
   await write(db, ['drops', 'thumbs', 'blobs', 'outbox', 'settings', 'chats'], t => {
-    t.objectStore('drops').delete(scopeRange(scopeId));
-    t.objectStore('thumbs').delete(mediaRange(scopeId));
-    t.objectStore('blobs').delete(mediaRange(scopeId));
-    for (const key of scopeSettingsKeys(scopeId)) t.objectStore('settings').delete(key);
-    if (scopeId.startsWith('chat:')) t.objectStore('chats').delete(scopeId.slice(5));
-    const outboxStore = t.objectStore('outbox');
-    const req = outboxStore.getAll() as IDBRequest<OutboxRecord[]>;
-    req.onsuccess = () => {
-      for (const record of req.result) {
-        if ((record.scopeId ?? 'private') === scopeId) outboxStore.delete(record.id);
-      }
+    const clear = () => {
+      t.objectStore('drops').delete(scopeRange(scopeId));
+      t.objectStore('thumbs').delete(mediaRange(scopeId));
+      t.objectStore('blobs').delete(mediaRange(scopeId));
+      for (const key of scopeSettingsKeys(scopeId)) t.objectStore('settings').delete(key);
+      if (chatId) t.objectStore('chats').delete(chatId);
+      const outboxStore = t.objectStore('outbox');
+      const req = outboxStore.getAll() as IDBRequest<OutboxRecord[]>;
+      req.onsuccess = () => {
+        for (const record of req.result) {
+          if ((record.scopeId ?? 'private') === scopeId) outboxStore.delete(record.id);
+        }
+      };
+      cleared = true;
+    };
+    if (!only || !chatId) {
+      clear();
+      return;
+    }
+    const held = t.objectStore('chats').get(chatId) as IDBRequest<ChatRecord | undefined>;
+    held.onsuccess = () => {
+      if (held.result && held.result.generation === only.generation) clear();
     };
   });
+  return cleared;
 }
 
 /**
