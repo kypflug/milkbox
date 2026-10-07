@@ -1707,17 +1707,26 @@ export async function removeMember(chatId: string, memberId: string): Promise<vo
   await chatsApi.deleteChatPermission(record, direct.id);
   await chatsApi.deleteMemberFile(record, memberId).catch(() => {});
   const scopeId: ScopeId = `chat:${chatId}`;
-  const members = await chatsApi.listMembers(record).catch(async err => {
+  const ref = scopeRefOf(chatScopeOf(record));
+  let members: import('../types').ChatMember[] | undefined;
+  try {
+    members = await chatsApi.listMembers(record);
+  } catch (err) {
     noteThrottle(err);
     console.debug('[Chats] Roster read after a removal failed; the next pass reads it:', err);
     // The chat's next pass reads the roster again, whatever that pass moves.
     stateFor(scopeId).lastMembersFetch = 0;
     // Until then the cached roster stands in, less the member just removed:
     // the manage sheet is drawn from it, and left as it was it would offer
-    // them for removal again.
-    return (await getCachedMembers(scopeId))?.filter(member => member.id !== memberId);
-  });
-  if (members) await db.putScopeSetting(scopeRefOf(chatScopeOf(record)), membersKey(scopeId), members);
+    // them for removal again. Read and written in one transaction, so that
+    // two removals whose roster reads both fail cannot each write the
+    // other's member back; and where no roster is cached none is made up,
+    // since an absent cache is what has the next pass read it.
+    await db.updateScopeSetting<import('../types').ChatMember[]>(ref, membersKey(scopeId), cached =>
+      cached?.filter(member => member.id !== memberId),
+    );
+  }
+  if (members) await db.putScopeSetting(ref, membersKey(scopeId), members);
   emit({ type: 'chats-changed' });
 }
 
