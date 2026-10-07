@@ -645,14 +645,28 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
   // delete, it ends here too, though that write could not have undone the
   // delete: it cannot create the drop.)
   const existing = record.op === 'edit' ? await db.getDrop(scopeId, meta.id) : undefined;
-  const eTag = await graph.putDropJson(
-    scope,
-    meta,
-    existing?.eTag ?? (record.op === 'edit' ? record.prevETag : undefined),
-    async () => {
-      if (!(await db.hasOutboxRecord(record))) throw new SendWithdrawnError();
-    },
-  );
+  let ifMatch = existing?.eTag ?? (record.op === 'edit' ? record.prevETag : undefined);
+  const stillCurrent = async () => {
+    if (!(await db.hasOutboxRecord(record))) throw new SendWithdrawnError();
+  };
+  // A private edit can have neither. Its row records no version — it was
+  // queued with no copy held (the editor was open while a pass removed the
+  // drop), or by a build that kept none — and the copy is gone, or is held
+  // with no eTag. Sent like that it would carry no condition, and a PUT by
+  // path with none creates the file when there is none: a drop deleted on
+  // another device would be back on every device, with the edited text. So
+  // OneDrive is asked first which version there is to replace, and the edit
+  // is made conditional on that one: last write wins, as for any private
+  // edit, but only over a drop that is there. Whether the record is still
+  // current is asked after that read, not before it, for the reason
+  // putDropJson gives for its own.
+  if (record.op === 'edit' && scope.kind === 'private' && !ifMatch) {
+    const current = await graph.currentDropETag(scope, meta.id);
+    await stillCurrent();
+    if (current === null) throw new graph.DropGoneError(meta.id);
+    ifMatch = current;
+  }
+  const eTag = await graph.putDropJson(scope, meta, ifMatch, stillCurrent);
   // Stored in the stay the send was queued in. If the chat has been left
   // (and perhaps joined again) while the request was out, the send ends
   // here: what is stored now is not this send's to touch.

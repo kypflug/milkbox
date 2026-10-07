@@ -469,7 +469,9 @@ export class DropGoneError extends Error {
  *   `beforeRetry` is awaited before that second write, and calls it off by
  *   throwing: the write that lost can have been out for a long time, and
  *   what it lost to may be the caller's own newer write (see performOp),
- *   which last-write-wins would undo;
+ *   which last-write-wins would undo. All of this only with an eTag: with
+ *   none the write is a create, so performOp sends no private edit that
+ *   way, and reads a version for one that has none (currentDropETag);
  * - chat: strictly conditional — 412/404 becomes DropConflictError so a
  *   queued edit can never recreate a drop another member deleted.
  */
@@ -539,9 +541,11 @@ export async function hasDropJson(scope: Scope, id: string): Promise<boolean> {
 
 /**
  * The eTag a drop's JSON is at now, or null when the scope holds none. As
- * with hasDropJson, only a 404 says that: every other failure throws.
+ * with hasDropJson, only a 404 says that: every other failure throws. What
+ * a private edit is made conditional on when the version it was made on is
+ * no longer the one to name — its condition was lost — or was never known.
  */
-async function currentDropETag(scope: Scope, id: string): Promise<string | null> {
+export async function currentDropETag(scope: Scope, id: string): Promise<string | null> {
   try {
     const res = await graphFetch(`${itemByPathUrl(scopeRef(scope), dropJsonPath(id))}?$select=eTag`, undefined, scopeTier(scope));
     const item = await res.json();
