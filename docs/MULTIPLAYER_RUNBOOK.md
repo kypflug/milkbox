@@ -68,6 +68,7 @@ Messaging
 - [ ] GUEST can edit/delete only their own drops; HOST additionally sees delete on GUEST drops; GUEST sees no delete on HOST drops.
 - [ ] Moderation race: GUEST queues an edit offline, HOST deletes that drop, GUEST reconnects → edit is discarded with the conflict toast; the drop stays deleted (no resurrection).
 - [ ] Offline queue in a chat: SENDING/FAILED overlays, retry, discard.
+- [ ] Delete a synced drop with the network cut: once the undo window and three tries have passed (~8 s) the drop is back, marked DELETE FAILED, and still there after a reload. Reconnect and Retry: it goes, for the other account too. On a second one choose Keep drop instead: it stays, as an ordinary card, here and on OneDrive.
 - [ ] Unread badge increments on the other account (including from an author whose clock is skewed hours behind) and clears on opening the chat.
 - [ ] Notifications (iOS standalone, notify on): "<chat> · <author>" fires for a backgrounded app; tapping opens the right chat; joining a chat with history does **not** replay the backlog.
 

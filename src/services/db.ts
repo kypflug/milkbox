@@ -715,7 +715,9 @@ export type DiscardOutcome = 'gone' | 'removed' | 'restored' | 'kept' | 'invalid
  * Discard a queued record and, if it was an edit, undo what the edit left on
  * the local copy — one transaction, because the two must not come apart:
  * with the record gone and the optimistic text still stored under the
- * server's eTag, no sync pass would ever correct the drop.
+ * server's eTag, no sync pass would ever correct the drop. A delete queued
+ * over an edit that was never sent is undone the same way: it carries that
+ * edit's prevMeta, and the edit's text is still what the local copy holds.
  *
  * - 'restored' / 'kept': the edit kept the version it was made on
  *   (prevMeta). That version is put back — unless a pass has since stored a
@@ -725,7 +727,8 @@ export type DiscardOutcome = 'gone' | 'removed' | 'restored' | 'kept' | 'invalid
  *   setting under `invalidateKey` — the scope's delta token — is deleted,
  *   so that the next pass enumerates everything and downloads the real
  *   version.
- * - 'removed': there was nothing to undo (not an edit, or no local copy).
+ * - 'removed': there was nothing to undo (a send, a delete that replaced no
+ *   unsent edit, or no local copy).
  * - 'gone': no such record in this scope, or `ref` is not the stay held;
  *   nothing was touched.
  */
@@ -739,7 +742,9 @@ export async function discardOutboxRecord(ref: ScopeRef, id: string, invalidateK
       if (!record || (record.scopeId ?? 'private') !== ref.scopeId) return;
       outbox.delete(id);
       outcome = 'removed';
-      if (record.op !== 'edit') return;
+      // Only an edit puts anything on the local copy — its own, or the
+      // unsent one whose original a delete took over (prevMeta).
+      if (record.op !== 'edit' && !record.prevMeta) return;
       const drops = t.objectStore('drops');
       const stored = drops.get([ref.scopeId, id]) as IDBRequest<StoredDropRecord | undefined>;
       stored.onsuccess = () => {

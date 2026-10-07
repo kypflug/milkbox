@@ -67,6 +67,12 @@ export interface DropRecord {
   eTag?: string;
   /** Pending outbox state overlays: 'sending' | 'failed'. Absent = synced. */
   state?: 'sending' | 'failed';
+  /**
+   * With `state`: the queued operation it is the state of. A delete that
+   * failed is said differently from a send that did, and what its card
+   * offers to give up is the delete, not the drop.
+   */
+  op?: OutboxRecord['op'];
 }
 
 /** A queued outgoing drop, persisted so uploads survive reloads. */
@@ -88,7 +94,8 @@ export interface OutboxRecord {
   /**
    * Edits only: the drop as OneDrive held it before this edit, so discarding
    * a failed edit can restore it over the optimistic local copy. Absent on
-   * records from older builds.
+   * records from older builds. A delete queued over an edit that was never
+   * sent takes this and `prevETag` over from it, for the same restore.
    */
   prevMeta?: DropMeta;
   /**

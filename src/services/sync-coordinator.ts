@@ -198,6 +198,17 @@ export function setActiveScopeId(scopeId: ScopeId): Promise<void> {
  * The rendered feed for one scope: synced drops from IDB with pending outbox
  * records overlaid (an outbox create shows as 'sending'/'failed'; an outbox
  * delete hides the drop before the server confirms). Sorted by ULID.
+ *
+ * A delete that has failed hides nothing. The drain gives it up after
+ * MAX_ATTEMPTS and nothing queues it again but the card's own Retry, so a
+ * drop it kept hidden would be gone from this device for good — no card to
+ * retry or discard from — while still on OneDrive and on everyone else's
+ * screen. The drop is shown as stored, marked failed: Retry sends the delete
+ * again, Discard gives the delete up and keeps the drop.
+ *
+ * Only a drop still stored is shown that way. One a pass has since removed
+ * (another member deleted it) is gone, as the delete wanted, and the row's
+ * own copy of it is not drawn in its place.
  */
 export async function loadFeed(scopeId: ScopeId): Promise<DropRecord[]> {
   const [drops, outbox] = await Promise.all([db.getScopeDrops(scopeId), db.getOutbox()]);
@@ -206,11 +217,14 @@ export async function loadFeed(scopeId: ScopeId): Promise<DropRecord[]> {
   for (const o of outbox) {
     if ((o.scopeId ?? PRIVATE_SCOPE_ID) !== scopeId) continue;
     if (o.op === 'delete') {
-      byId.delete(o.id);
+      const stored = byId.get(o.id);
+      if (o.state === 'failed' && stored) byId.set(o.id, { ...stored, state: 'failed', op: 'delete' });
+      else byId.delete(o.id);
     } else {
       byId.set(o.id, {
         meta: o.meta,
         state: o.state === 'failed' ? 'failed' : 'sending',
+        op: o.op,
       });
     }
   }
@@ -316,7 +330,24 @@ export async function enqueueDelete(scope: Scope, id: string): Promise<void> {
     emit({ type: 'feed-updated', scopeId });
     return;
   }
-  const queued = await db.putOutboxRecord(scopeRefOf(scope), { id, meta, op: 'delete', attempts: 0, state: 'queued', scopeId });
+  // A delete queued over an edit that has not been sent takes that row's
+  // place (rows are keyed by drop id), and the local copy already carries
+  // the edit. The row's record of the version OneDrive holds goes with the
+  // delete. If the delete then fails and is given up (Keep drop on its
+  // card), that version is put back, as discarding the edit would have
+  // done. Otherwise the unsent text would stay on this device under the
+  // server's eTag, where no pass corrects it.
+  const replaced = (await db.getOutbox()).find(r => r.id === id);
+  const original = replaced?.prevMeta ? { prevMeta: replaced.prevMeta, prevETag: replaced.prevETag } : {};
+  const queued = await db.putOutboxRecord(scopeRefOf(scope), {
+    id,
+    meta,
+    op: 'delete',
+    attempts: 0,
+    state: 'queued',
+    scopeId,
+    ...original,
+  });
   if (!queued) {
     // Refused: the chat was removed while the delete waited out its undo
     // window. If it is simply gone, the drop went with it and there is
@@ -352,6 +383,12 @@ export async function retryOutboxRecord(id: string): Promise<void> {
  * correct it. Removing the record and undoing the copy are one transaction
  * (db.discardOutboxRecord): a page closed in between must not be left with
  * the unsent text and nothing to discard.
+ *
+ * A delete leaves nothing of its own to undo: the local copy is only
+ * removed once OneDrive has answered, so with the record gone the drop is
+ * simply shown again. One queued over an edit that was never sent carries
+ * that edit's original (see enqueueDelete), and is undone as the edit
+ * would have been.
  */
 export async function discardOutboxRecord(id: string): Promise<void> {
   const record = (await db.getOutbox()).find(r => r.id === id);
@@ -513,6 +550,11 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       if (throttled) noteThrottle(err);
       console.warn('[Outbox] %s %s failed (attempt %d):', record.op, record.id, attempts, err);
       if (attempts >= MAX_ATTEMPTS) {
+        // A delete ends here as a send does: given up where the user can
+        // see it and say what happens next (loadFeed shows the drop again,
+        // marked failed). Left queued it would be sent again by every later
+        // pass with the drop hidden meanwhile, for as long as OneDrive kept
+        // refusing, and with no card to call it off from.
         record.attempts = attempts;
         record.state = 'failed';
         await db.updateOutboxRecord(ref, { ...record });
