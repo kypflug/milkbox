@@ -8,6 +8,7 @@
 import {
   PRIVATE_SCOPE,
   scopeIdOf,
+  scopeRefOf,
   type DeviceProfile,
   type DropMeta,
   type DropRecord,
@@ -83,6 +84,9 @@ export async function renderFeed(
 ): Promise<void> {
   const scope: Scope = options.scope ?? PRIVATE_SCOPE;
   const scopeId = scopeIdOf(scope);
+  // What this screen's cache writes are made for: the chat as it was held
+  // when the screen was drawn.
+  const scopeRef = scopeRefOf(scope);
   const isChat = scope.kind === 'chat';
   const title = isChat ? scope.name : 'Milkbox';
   const logLabel = isChat ? `Drops in ${scope.name}` : 'Your drops';
@@ -338,14 +342,14 @@ export async function renderFeed(
         if (coordinator.isThrottled()) return undefined;
         const fetched = await fetchThumbnail(scope, itemId);
         if (fetched) {
-          await db.putThumb(scopeId, id, fetched).catch(() => {});
+          await db.putThumb(scopeRef, id, fetched).catch(() => {});
           return fetched;
         }
         // No thumbnail (not generated yet, or unsupported format) — the
         // image itself is small enough to be its own preview.
         if (file.size > FULL_IMAGE_PREVIEW_LIMIT) return undefined;
         const blob = await downloadDropFile(scope, itemId, { timeoutMs: FULL_IMAGE_PREVIEW_TIMEOUT_MS });
-        await db.putCachedBlob(scopeId, id, blob).catch(() => {});
+        await db.putCachedBlob(scopeRef, id, blob).catch(() => {});
         return blob;
       }, previewsAbort.signal);
     } catch (err) {
@@ -608,7 +612,7 @@ export async function renderFeed(
         infoToast('Downloading…');
         blob = await downloadDropFile(scope, f.itemId);
         if (record.meta.kind === 'image') {
-          await db.putCachedBlob(scopeId, record.meta.id, blob).catch(() => {});
+          await db.putCachedBlob(scopeRef, record.meta.id, blob).catch(() => {});
         }
       }
       const url = URL.createObjectURL(blob);
@@ -659,7 +663,7 @@ export async function renderFeed(
       let blob = await db.getCachedBlob(scopeId, record.meta.id).catch(() => undefined);
       if (!blob && f.itemId) {
         blob = await downloadDropFile(scope, f.itemId);
-        await db.putCachedBlob(scopeId, record.meta.id, blob).catch(() => {});
+        await db.putCachedBlob(scopeRef, record.meta.id, blob).catch(() => {});
       }
       if (blob) img.src = URL.createObjectURL(blob);
     } catch { /* keep the thumb */ }

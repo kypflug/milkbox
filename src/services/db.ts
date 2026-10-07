@@ -13,7 +13,7 @@
  * - settings: small key/value pairs (per-scope delta tokens / cTags, etc.)
  */
 
-import type { ChatRecord, DeviceProfile, DropRecord, OutboxRecord, ScopeId } from '../types';
+import type { ChatRecord, DeviceProfile, DropRecord, OutboxRecord, ScopeId, ScopeRef } from '../types';
 
 const DB_NAME = 'milkbox-db';
 /**
@@ -246,18 +246,21 @@ function tx<T>(
 
 /**
  * A write on behalf of one scope. For a chat it happens only while the chat
- * is still on this device, checked in the same transaction: work that
- * outlives a leave or delete — an outbox drain mid-retry, a sync batch, a
- * preview finishing its download — must not put rows back under the scope
- * that was just cleared. Resolves false when the write was skipped.
+ * is held on this device in the same stay the writer started under, checked
+ * in the same transaction: work that outlives a leave or delete — an outbox
+ * drain mid-retry, a sync batch, a preview finishing its download, in this
+ * tab or another — must not put rows back under the scope that was just
+ * cleared, nor into the same chat joined again since. Presence alone would
+ * not tell those two stays apart; the record's generation does. Resolves
+ * false when the write was skipped.
  */
 async function writeForScope(
-  scopeId: ScopeId,
+  ref: ScopeRef,
   stores: string[],
   body: (t: IDBTransaction) => void,
 ): Promise<boolean> {
   const db = await openDb();
-  const chatId = scopeId.startsWith('chat:') ? scopeId.slice(5) : null;
+  const chatId = ref.scopeId.startsWith('chat:') ? ref.scopeId.slice(5) : null;
   let written = false;
   await write(db, chatId ? [...stores, 'chats'] : stores, t => {
     const apply = () => {
@@ -268,9 +271,9 @@ async function writeForScope(
       apply();
       return;
     }
-    const chat = t.objectStore('chats').get(chatId);
+    const chat = t.objectStore('chats').get(chatId) as IDBRequest<ChatRecord | undefined>;
     chat.onsuccess = () => {
-      if (chat.result) apply();
+      if (chat.result && chat.result.generation === ref.generation) apply();
     };
   });
   return written;
@@ -286,9 +289,9 @@ export function getScopeDrops(scopeId: ScopeId): Promise<DropRecord[]> {
   return tx('drops', 'readonly', s => s.getAll(scopeRange(scopeId)) as IDBRequest<DropRecord[]>);
 }
 
-export async function putDrop(scopeId: ScopeId, record: DropRecord): Promise<void> {
-  await writeForScope(scopeId, ['drops'], t => {
-    t.objectStore('drops').put({ ...record, scopeId } satisfies StoredDropRecord);
+export async function putDrop(ref: ScopeRef, record: DropRecord): Promise<void> {
+  await writeForScope(ref, ['drops'], t => {
+    t.objectStore('drops').put({ ...record, scopeId: ref.scopeId } satisfies StoredDropRecord);
   });
 }
 
@@ -341,9 +344,10 @@ export interface DropCommitResult {
  * when the chat record is gone — a pass that outlived a leave or delete must
  * not write drops back under the cleared scope.
  */
-export async function commitDropChanges(scopeId: ScopeId, commit: DropCommit): Promise<DropCommitResult> {
+export async function commitDropChanges(ref: ScopeRef, commit: DropCommit): Promise<DropCommitResult> {
+  const { scopeId } = ref;
   const added = new Set<string>();
-  const written = await writeForScope(scopeId, ['drops', 'thumbs', 'blobs', 'settings'], t => {
+  const written = await writeForScope(ref, ['drops', 'thumbs', 'blobs', 'settings'], t => {
     const drops = t.objectStore('drops');
     for (const r of commit.puts ?? []) {
       const held = drops.getKey([scopeId, r.meta.id]);
@@ -376,9 +380,9 @@ export function getThumb(scopeId: ScopeId, dropId: string): Promise<Blob | undef
   return tx('thumbs', 'readonly', s => s.get(mediaKey(scopeId, dropId)) as IDBRequest<Blob | undefined>);
 }
 
-export async function putThumb(scopeId: ScopeId, dropId: string, blob: Blob): Promise<void> {
-  await writeForScope(scopeId, ['thumbs'], t => {
-    t.objectStore('thumbs').put(blob, mediaKey(scopeId, dropId));
+export async function putThumb(ref: ScopeRef, dropId: string, blob: Blob): Promise<void> {
+  await writeForScope(ref, ['thumbs'], t => {
+    t.objectStore('thumbs').put(blob, mediaKey(ref.scopeId, dropId));
   });
 }
 
@@ -401,17 +405,24 @@ export async function getCachedBlob(scopeId: ScopeId, dropId: string): Promise<B
   const key = mediaKey(scopeId, dropId);
   const entry = await tx<BlobEntry | undefined>('blobs', 'readonly', s => s.get(key) as IDBRequest<BlobEntry | undefined>);
   if (entry) {
-    // Touch lastAccess (fire-and-forget)
-    tx('blobs', 'readwrite', s => { s.put({ ...entry, lastAccess: Date.now() }); }).catch(() => {});
+    // Touch lastAccess (fire-and-forget) — only if the entry is still there:
+    // the scope may have been cleared since the read, and a plain put would
+    // bring the image back.
+    tx('blobs', 'readwrite', s => {
+      const held = s.getKey(key);
+      held.onsuccess = () => {
+        if (held.result !== undefined) s.put({ ...entry, lastAccess: Date.now() });
+      };
+    }).catch(() => {});
     return entry.blob;
   }
   return undefined;
 }
 
-export async function putCachedBlob(scopeId: ScopeId, dropId: string, blob: Blob): Promise<void> {
-  await writeForScope(scopeId, ['blobs'], t => {
+export async function putCachedBlob(ref: ScopeRef, dropId: string, blob: Blob): Promise<void> {
+  await writeForScope(ref, ['blobs'], t => {
     t.objectStore('blobs').put(
-      { id: mediaKey(scopeId, dropId), blob, size: blob.size, lastAccess: Date.now() } satisfies BlobEntry,
+      { id: mediaKey(ref.scopeId, dropId), blob, size: blob.size, lastAccess: Date.now() } satisfies BlobEntry,
     );
   });
   sweepBlobCache().catch(() => {});
@@ -441,11 +452,12 @@ export function getOutbox(): Promise<OutboxRecord[]> {
 }
 
 /**
- * Queue a record. Resolves false, writing nothing, for a chat that has left
- * this device.
+ * Queue a record for the scope `ref` names. Resolves false, writing nothing,
+ * for a chat that has left this device (or is no longer the stay `ref` was
+ * resolved from).
  */
-export function putOutboxRecord(record: OutboxRecord): Promise<boolean> {
-  return writeForScope(record.scopeId ?? 'private', ['outbox'], t => {
+export function putOutboxRecord(ref: ScopeRef, record: OutboxRecord): Promise<boolean> {
+  return writeForScope(ref, ['outbox'], t => {
     t.objectStore('outbox').put(record);
   });
 }
@@ -457,9 +469,9 @@ export function putOutboxRecord(record: OutboxRecord): Promise<boolean> {
  * rows), the drain must find that out here — in any tab, and even if the
  * chat has been joined again since — and not put the row back.
  */
-export async function updateOutboxRecord(record: OutboxRecord): Promise<boolean> {
+export async function updateOutboxRecord(ref: ScopeRef, record: OutboxRecord): Promise<boolean> {
   let updated = false;
-  await writeForScope(record.scopeId ?? 'private', ['outbox'], t => {
+  await writeForScope(ref, ['outbox'], t => {
     const store = t.objectStore('outbox');
     const held = store.getKey(record.id);
     held.onsuccess = () => {
@@ -512,19 +524,59 @@ export function getChat(id: string): Promise<ChatRecord | undefined> {
   return tx('chats', 'readonly', s => s.get(id) as IDBRequest<ChatRecord | undefined>);
 }
 
-export function putChat(record: ChatRecord): Promise<void> {
-  return tx('chats', 'readwrite', s => { s.put(record); });
+/**
+ * Store a chat this device does not hold, stamped with a new generation —
+ * the start of a stay. Resolves the record as stored, or null when the chat
+ * is already held (a join and a discovery can race): that record, and the
+ * stay it stands for, are left as they are.
+ */
+export async function addChat(record: ChatRecord): Promise<ChatRecord | null> {
+  const db = await openDb();
+  const stored: ChatRecord = { ...record, generation: crypto.randomUUID() };
+  let added = false;
+  await write(db, ['chats'], t => {
+    const store = t.objectStore('chats');
+    const held = store.getKey(record.id);
+    held.onsuccess = () => {
+      if (held.result !== undefined) return;
+      store.put(stored);
+      added = true;
+    };
+  });
+  return added ? stored : null;
 }
 
 export function deleteChat(id: string): Promise<void> {
   return tx('chats', 'readwrite', s => { s.delete(id); });
 }
 
-/** Read-modify-write a chat record; a no-op when the chat is unknown. */
-export async function patchChat(id: string, partial: Partial<ChatRecord>): Promise<void> {
-  const existing = await getChat(id);
-  if (!existing) return;
-  await putChat({ ...existing, ...partial, id });
+/**
+ * Read-modify-write a chat record in one transaction, so a chat removed
+ * meanwhile is never put back by its own patch. Resolves false, writing
+ * nothing, when the chat is not held.
+ *
+ * With `only`, also when the record is not the stay `only.generation` names:
+ * for work started under an earlier one (a sync pass), which must not touch
+ * a chat that has been joined again since.
+ */
+export async function patchChat(
+  id: string,
+  partial: Partial<Omit<ChatRecord, 'id' | 'generation'>>,
+  only?: { generation: string | undefined },
+): Promise<boolean> {
+  const db = await openDb();
+  let patched = false;
+  await write(db, ['chats'], t => {
+    const store = t.objectStore('chats');
+    const held = store.get(id) as IDBRequest<ChatRecord | undefined>;
+    held.onsuccess = () => {
+      const existing = held.result;
+      if (!existing || (only && existing.generation !== only.generation)) return;
+      store.put({ ...existing, ...partial });
+      patched = true;
+    };
+  });
+  return patched;
 }
 
 // ─── settings (kv) ───
@@ -544,8 +596,8 @@ export function putSetting<T>(key: string, value: T): Promise<void> {
  * primed flag left behind would make a later re-join announce the chat's
  * whole history as new.
  */
-export async function putScopeSetting(scopeId: ScopeId, key: string, value: unknown): Promise<void> {
-  await writeForScope(scopeId, ['settings'], t => {
+export async function putScopeSetting(ref: ScopeRef, key: string, value: unknown): Promise<void> {
+  await writeForScope(ref, ['settings'], t => {
     t.objectStore('settings').put(value, key);
   });
 }

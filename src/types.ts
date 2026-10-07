@@ -124,12 +124,34 @@ export interface ChatScope {
   /** driveItem id of the drops/ subfolder — the delta target. */
   dropsItemId: string;
   host: AuthorAttribution;
+  /**
+   * The stay of this chat on this device the scope was resolved from (see
+   * ChatRecord.generation). Work that carries the scope — a sync pass, a
+   * queued send, a preview download — is refused by local storage once that
+   * stay has ended, even if the chat has been joined again since.
+   */
+  generation?: string;
 }
 
 export type Scope = PrivateScope | ChatScope;
 
 export function scopeIdOf(scope: Scope): ScopeId {
   return scope.kind === 'private' ? 'private' : `chat:${scope.chatId}`;
+}
+
+/**
+ * What a write to local storage is made for: the scope and, for a chat, the
+ * stay of it on this device that the writer started under.
+ */
+export interface ScopeRef {
+  scopeId: ScopeId;
+  generation?: string;
+}
+
+export function scopeRefOf(scope: Scope): ScopeRef {
+  return scope.kind === 'private'
+    ? { scopeId: 'private' }
+    : { scopeId: `chat:${scope.chatId}`, generation: scope.generation };
 }
 
 /** Local chat registry record — IDB `chats` store, keyed by chat ULID. */
@@ -158,6 +180,13 @@ export interface ChatRecord {
    * between a local create/join and its OneDrive write landing.
    */
   registeredAt?: number;
+  /**
+   * Names this stay of the chat on this device: minted when the record is
+   * stored (db.addChat) and never changed, so a chat removed and joined
+   * again gets a new one. Local only — never written to OneDrive. Absent on
+   * records stored by builds from before it existed.
+   */
+  generation?: string;
 }
 
 /** OneDrive-side descriptor: chats/<id>/chat.json in the host's approot. */
