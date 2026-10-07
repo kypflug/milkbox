@@ -58,6 +58,23 @@ const EPOCH_KEY = 'milkbox:epoch';
  */
 let pageEpoch: string | null | undefined;
 
+/**
+ * How many times this page has emptied a scope's stored drops and media in
+ * a re-sync from scratch (resetScopeStore). The page adopts the epoch such
+ * a re-sync starts, so the epoch check does not stop what it was doing
+ * before: a cache kept in memory beside that media, or a write of something
+ * fetched for it, notes the count it began under and is dropped once the
+ * count has moved (see writeForScope's `asOf`). Per scope, since a re-sync
+ * empties one scope and leaves the others' media where it is. This page
+ * only: a page that another one's re-sync leaves behind is stale, and its
+ * writes are refused outright.
+ */
+const mediaResets = new Map<ScopeId, number>();
+
+export function mediaResetCount(scopeId: ScopeId): number {
+  return mediaResets.get(scopeId) ?? 0;
+}
+
 /** A write from a page whose view of local storage has been superseded. */
 export class StaleStoreError extends Error {
   constructor() {
@@ -253,16 +270,24 @@ function tx<T>(
  * cleared, nor into the same chat joined again since. Presence alone would
  * not tell those two stays apart; the record's generation does. Resolves
  * false when the write was skipped.
+ *
+ * With `asOf` (a mediaResetCount of the scope) it also happens only while
+ * that count stands: what this page began fetching before it re-synced the
+ * scope from scratch (a preview) is not stored in what was just emptied.
  */
 async function writeForScope(
   ref: ScopeRef,
   stores: string[],
   body: (t: IDBTransaction) => void,
+  asOf?: number,
 ): Promise<boolean> {
   const db = await openDb();
   const chatId = ref.scopeId.startsWith('chat:') ? ref.scopeId.slice(5) : null;
   let written = false;
   await write(db, chatId ? [...stores, 'chats'] : stores, t => {
+    // A re-sync is counted as its transaction completes (resetScopeStore),
+    // and this one runs wholly before that transaction or wholly after it.
+    if (asOf !== undefined && asOf !== mediaResetCount(ref.scopeId)) return;
     const apply = () => {
       body(t);
       written = true;
@@ -566,10 +591,11 @@ export function getThumb(scopeId: ScopeId, dropId: string): Promise<Blob | undef
   return tx('thumbs', 'readonly', s => s.get(mediaKey(scopeId, dropId)) as IDBRequest<Blob | undefined>);
 }
 
-export async function putThumb(ref: ScopeRef, dropId: string, blob: Blob): Promise<void> {
+/** `asOf`: the scope's mediaResetCount when the preview was asked for (see writeForScope). */
+export async function putThumb(ref: ScopeRef, dropId: string, blob: Blob, asOf?: number): Promise<void> {
   await writeForScope(ref, ['thumbs'], t => {
     t.objectStore('thumbs').put(blob, mediaKey(ref.scopeId, dropId));
-  });
+  }, asOf);
 }
 
 // ─── blobs (full images, LRU capped, scoped keys) ───
@@ -602,12 +628,13 @@ export async function getCachedBlob(scopeId: ScopeId, dropId: string): Promise<B
   return undefined;
 }
 
-export async function putCachedBlob(ref: ScopeRef, dropId: string, blob: Blob): Promise<void> {
+/** `asOf`: the scope's mediaResetCount when the image was asked for (see writeForScope). */
+export async function putCachedBlob(ref: ScopeRef, dropId: string, blob: Blob, asOf?: number): Promise<void> {
   await writeForScope(ref, ['blobs'], t => {
     t.objectStore('blobs').put(
       { id: mediaKey(ref.scopeId, dropId), blob, size: blob.size, lastAccess: Date.now() } satisfies BlobEntry,
     );
-  });
+  }, asOf);
   sweepBlobCache().catch(() => {});
 }
 
@@ -631,13 +658,29 @@ export function getOutbox(): Promise<OutboxRecord[]> {
 }
 
 /**
- * Queue a record for the scope `ref` names. Resolves false, writing nothing,
- * for a chat that has left this device (or is no longer the stay `ref` was
- * resolved from).
+ * A record as it is queued: under a token of its own. Rows are keyed by drop
+ * id, so queueing replaces whatever is queued for the same drop, and the
+ * token is all that tells this record from the one it replaced.
  */
-export function putOutboxRecord(ref: ScopeRef, record: OutboxRecord): Promise<boolean> {
+function asQueued(record: Omit<OutboxRecord, 'token'>): OutboxRecord {
+  return { ...record, token: crypto.randomUUID() };
+}
+
+/** Whether the row stored under a record's id is still that record's own. */
+function isSameQueueing(held: OutboxRecord | undefined, record: Pick<OutboxRecord, 'token'>): held is OutboxRecord {
+  // Rows from before tokens carry none, and so match each other as they did.
+  return held !== undefined && held.token === record.token;
+}
+
+/**
+ * Queue a record for the scope `ref` names, replacing whatever is queued for
+ * the same drop (see asQueued). Resolves false, writing nothing, for a chat
+ * that has left this device (or is no longer the stay `ref` was resolved
+ * from).
+ */
+export function putOutboxRecord(ref: ScopeRef, record: Omit<OutboxRecord, 'token'>): Promise<boolean> {
   return writeForScope(ref, ['outbox'], t => {
-    t.objectStore('outbox').put(record);
+    t.objectStore('outbox').put(asQueued(record));
   });
 }
 
@@ -695,16 +738,20 @@ export async function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<QueueEdi
           outcome = held ? 'unversioned' : 'missing';
           return;
         }
-        outbox.put({
-          id: meta.id,
-          meta,
-          op: 'edit',
-          attempts: 0,
-          state: 'queued',
-          scopeId: ref.scopeId,
-          prevMeta: earlier ? earlier.prevMeta : held?.meta,
-          prevETag,
-        } satisfies OutboxRecord);
+        // Its own token, not the earlier edit's: a drain still holding that
+        // one must find the row is no longer its to update or remove.
+        outbox.put(
+          asQueued({
+            id: meta.id,
+            meta,
+            op: 'edit',
+            attempts: 0,
+            state: 'queued',
+            scopeId: ref.scopeId,
+            prevMeta: earlier ? earlier.prevMeta : held?.meta,
+            prevETag,
+          }),
+        );
         if (held) drops.put({ ...held, meta } satisfies StoredDropRecord);
         outcome = 'queued';
       };
@@ -718,15 +765,18 @@ export async function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<QueueEdi
  * when it no longer is. A drain can sit in a retry backoff for seconds: if
  * the send was cancelled meanwhile, or its chat removed (which deletes its
  * rows), the drain must find that out here — in any tab, and even if the
- * chat has been joined again since — and not put the row back.
+ * chat has been joined again since — and not put the row back. Nor may it
+ * write over a newer edit or delete queued for the same drop in that time:
+ * the row has to be the one this record was read from, not just one with
+ * its id.
  */
 export async function updateOutboxRecord(ref: ScopeRef, record: OutboxRecord): Promise<boolean> {
   let updated = false;
   await writeForScope(ref, ['outbox'], t => {
     const store = t.objectStore('outbox');
-    const held = store.getKey(record.id);
+    const held = store.get(record.id) as IDBRequest<OutboxRecord | undefined>;
     held.onsuccess = () => {
-      if (held.result === undefined) return;
+      if (!isSameQueueing(held.result, record)) return;
       store.put(record);
       updated = true;
     };
@@ -743,25 +793,34 @@ export type DiscardOutcome = 'gone' | 'removed' | 'restored' | 'kept' | 'invalid
  * server's eTag, no sync pass would ever correct the drop.
  *
  * - 'restored' / 'kept': the edit kept the version it was made on
- *   (prevMeta). That version is put back — unless a pass has since stored a
- *   newer one (the eTag moved on), which is the server's truth and stays.
+ *   (prevMeta). That version is put back — unless a newer one has been
+ *   stored since (a pass brought it, or an edit this one was queued over
+ *   landed after all): the eTag moved on, and that is the server's truth
+ *   and stays.
  * - 'invalidated': it kept none (it was queued by an older build). The
  *   drop's eTag is cleared, so it stops matching the server's, and the
  *   setting under `invalidateKey` — the scope's delta token — is deleted,
  *   so that the next pass enumerates everything and downloads the real
  *   version.
  * - 'removed': there was nothing to undo (not an edit, or no local copy).
- * - 'gone': no such record in this scope, or `ref` is not the stay held;
- *   nothing was touched.
+ * - 'gone': the record is no longer queued in this scope, or `ref` is not
+ *   the stay held; nothing was touched. That includes a row under the same
+ *   drop id that is another queueing by now (see updateOutboxRecord): only
+ *   the record `discarded` names goes, the one its card was showing.
  */
-export async function discardOutboxRecord(ref: ScopeRef, id: string, invalidateKey: string): Promise<DiscardOutcome> {
+export async function discardOutboxRecord(
+  ref: ScopeRef,
+  discarded: OutboxRecord,
+  invalidateKey: string,
+): Promise<DiscardOutcome> {
+  const { id } = discarded;
   let outcome: DiscardOutcome = 'gone';
   await writeForScope(ref, ['outbox', 'drops', 'settings'], t => {
     const outbox = t.objectStore('outbox');
     const queued = outbox.get(id) as IDBRequest<OutboxRecord | undefined>;
     queued.onsuccess = () => {
       const record = queued.result;
-      if (!record || (record.scopeId ?? 'private') !== ref.scopeId) return;
+      if (!isSameQueueing(record, discarded) || (record.scopeId ?? 'private') !== ref.scopeId) return;
       outbox.delete(id);
       outcome = 'removed';
       if (record.op !== 'edit') return;
@@ -788,25 +847,39 @@ export async function discardOutboxRecord(ref: ScopeRef, id: string, invalidateK
   return outcome;
 }
 
-export async function hasOutboxRecord(id: string): Promise<boolean> {
-  return (await tx('outbox', 'readonly', s => s.getKey(id))) !== undefined;
+/** Whether this record is still queued, as itself (see updateOutboxRecord). */
+export async function hasOutboxRecord(record: OutboxRecord): Promise<boolean> {
+  const held = await tx('outbox', 'readonly', s => s.get(record.id) as IDBRequest<OutboxRecord | undefined>);
+  return isSameQueueing(held, record);
 }
 
+/** Remove whatever is queued for a drop: a send cancelled before it landed. */
 export function deleteOutboxRecord(id: string): Promise<void> {
   return tx('outbox', 'readwrite', s => { s.delete(id); });
 }
 
 /**
- * Remove a record whose send has ended — from the stay the send was made
- * in, and no other. Rows are keyed by drop id: after a chat has been left
- * and joined again, the row under that id can be one the new stay queued
- * for the same drop, which an earlier stay's send must not take with it.
- * Resolves false when `ref` is not the stay held.
+ * Remove a record whose send has ended — its own row, from the stay the
+ * send was made in, and no other. Rows are keyed by drop id, so the row
+ * under that id can by now be someone else's: a newer edit or delete queued
+ * for the same drop, which has not been sent and would be lost without a
+ * trace; or, after a chat has been left and joined again, one the new stay
+ * queued, which an earlier stay's send must not take with it. Checked and
+ * removed in one transaction. Resolves false, removing nothing, when the
+ * row is no longer this record's or `ref` is not the stay held.
  */
-export function removeOutboxRecord(ref: ScopeRef, id: string): Promise<boolean> {
-  return writeForScope(ref, ['outbox'], t => {
-    t.objectStore('outbox').delete(id);
+export async function removeOutboxRecord(ref: ScopeRef, record: OutboxRecord): Promise<boolean> {
+  let removed = false;
+  await writeForScope(ref, ['outbox'], t => {
+    const store = t.objectStore('outbox');
+    const held = store.get(record.id) as IDBRequest<OutboxRecord | undefined>;
+    held.onsuccess = () => {
+      if (!isSameQueueing(held.result, record)) return;
+      store.delete(record.id);
+      removed = true;
+    };
   });
+  return removed;
 }
 
 // ─── device profiles ───
@@ -917,6 +990,28 @@ export function putSetting<T>(key: string, value: T): Promise<void> {
 export async function putScopeSetting(ref: ScopeRef, key: string, value: unknown): Promise<void> {
   await writeForScope(ref, ['settings'], t => {
     t.objectStore('settings').put(value, key);
+  });
+}
+
+/**
+ * Read a scope setting and write what `update` makes of it, in the one
+ * transaction (and only for the stay `ref` names, as putScopeSetting). Two
+ * callers moving the same setting at once cannot each read the value from
+ * before the other and write the other's change away. `update` is given
+ * undefined when nothing is stored; returning undefined writes nothing.
+ */
+export async function updateScopeSetting<T>(
+  ref: ScopeRef,
+  key: string,
+  update: (current: T | undefined) => T | undefined,
+): Promise<void> {
+  await writeForScope(ref, ['settings'], t => {
+    const settings = t.objectStore('settings');
+    const current = settings.get(key) as IDBRequest<T | undefined>;
+    current.onsuccess = () => {
+      const next = update(current.result);
+      if (next !== undefined) settings.put(next, key);
+    };
   });
 }
 
@@ -1056,6 +1151,12 @@ export async function resetScopeStore(scopeId: ScopeId, settingsKeys: string[]):
     for (const key of settingsKeys) t.objectStore('settings').delete(key);
     renewEpoch(t, true);
   });
+  // Counted once the transaction has committed, and not before: a re-sync
+  // that fails has emptied nothing. Its `complete` is what resolved the
+  // line above, and this runs before anything else does: a transaction that
+  // was waiting behind it has not had its first answer yet, so it finds the
+  // count already moved (see mediaResetCount).
+  mediaResets.set(scopeId, mediaResetCount(scopeId) + 1);
 }
 
 /** Every store, for the two operations that empty the database. */

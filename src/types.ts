@@ -67,11 +67,27 @@ export interface DropRecord {
   eTag?: string;
   /** Pending outbox state overlays: 'sending' | 'failed'. Absent = synced. */
   state?: 'sending' | 'failed';
+  /**
+   * With `state`: the token of the outbox record the overlay was drawn from
+   * (OutboxRecord.token; none for a row from an older build). A card's Retry
+   * and Discard hand it back, so that they act on the send the card showed
+   * and not on one queued over it since. Set when a feed is assembled; never
+   * stored.
+   */
+  sendToken?: string;
 }
 
 /** A queued outgoing drop, persisted so uploads survive reloads. */
 export interface OutboxRecord {
   id: string;
+  /**
+   * Which queueing of this drop the row is, minted as it is queued. Rows are
+   * keyed by drop id, so an edit or delete queued over an unfinished send
+   * takes its place under the same key — and a drain still holding the
+   * earlier record must not write that back, or remove the newer row as
+   * sent. Absent on rows from older builds, which match only each other.
+   */
+  token?: string;
   meta: DropMeta;
   /** File payload for file/image drops. */
   blob?: Blob;
@@ -80,6 +96,13 @@ export interface OutboxRecord {
   op: 'create' | 'edit' | 'delete';
   attempts: number;
   state: 'queued' | 'sending' | 'failed';
+  /**
+   * Deletes only: the earliest time the drain may try again. A failed create
+   * or edit stops on a card that offers a retry; a delete hides its drop, so
+   * there is no card to stop on, and it is never given up on — past its
+   * quick tries it waits here between attempts instead. Absent until then.
+   */
+  nextAt?: number;
   /**
    * Destination scope. Optional so pre-v3 records parse; the v3 migration
    * stamps 'private' and the coordinator treats absence as 'private'.
