@@ -523,6 +523,18 @@ export async function renderFeed(
     { placeholder: isChat ? `Message ${scope.name}` : undefined },
   );
 
+  /**
+   * Draw this chat's screen again, on the record that is held now. The URL
+   * is made to name the chat first: a screen opened by restoring the last
+   * scope (a bare launch) has no hash, and routing on that a second time
+   * draws the private feed. The query string is kept as it is.
+   */
+  const redrawThisChat = (): void => {
+    if (scope.kind !== 'chat') return;
+    history.replaceState(null, '', `${location.pathname}${location.search}#chat/${scope.chatId}`);
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+  };
+
   // Gone / paused chat: banner + composer greyed out. Read-only otherwise.
   const banner = document.getElementById('chatBanner')!;
   if (isChat && chatState !== 'active') {
@@ -541,10 +553,19 @@ export async function renderFeed(
     banner.addEventListener('click', async e => {
       const action = (e.target as HTMLElement).closest<HTMLElement>('[data-banner]')?.dataset.banner;
       if (action === 'remove') {
+        let removed: boolean;
         try {
-          await coordinator.removeChatLocally(scope.chatId);
+          removed = await coordinator.removeChatLocally(scope.chatId, { generation: scope.generation });
         } catch (err) {
           showToast(err instanceof Error ? err.message : 'Could not remove the chat', 'error');
+          return;
+        }
+        if (!removed) {
+          // Joined again in another tab since this screen was drawn. That
+          // later stay is not the gone chat this button is for: it stays,
+          // and this screen is drawn again, on it.
+          showToast(`${scope.name} was joined again in another tab, so it is still here.`, 'error');
+          redrawThisChat();
           return;
         }
         history.replaceState(null, '', '/');
@@ -804,7 +825,7 @@ export async function renderFeed(
     // under the same scope, while its sends and its mark-read are refused
     // as an earlier stay's. Drawn again, it opens on the stay that is held.
     if (((record.state ?? 'active') !== chatState || record.generation !== scope.generation) && listEl.isConnected) {
-      window.dispatchEvent(new HashChangeEvent('hashchange'));
+      redrawThisChat();
       return;
     }
     if (record.name === scope.name) return;

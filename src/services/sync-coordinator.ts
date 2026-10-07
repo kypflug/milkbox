@@ -1724,12 +1724,15 @@ export async function joinChat(shareToken: string): Promise<ChatRecord> {
  * (member file, roaming pointer) is queued durably so the leave reaches
  * the account's other devices even if this attempt is throttled or offline.
  *
- * Resolves false when the chat is still here because it is no longer the
- * stay that was being left: left and joined again in another tab meanwhile.
+ * `only` names the stay the caller's screen was drawn for. Resolves false
+ * when the chat is still here because it is no longer that stay: left and
+ * joined again in another tab, before this was asked or while it waited.
+ * The later stay is not the one the user asked to leave.
  */
-export async function leaveChat(chatId: string): Promise<boolean> {
+export async function leaveChat(chatId: string, only?: { generation: string | undefined }): Promise<boolean> {
   const record = await db.getChat(chatId);
   if (!record) return true;
+  if (only && record.generation !== only.generation) return false;
   const intents: NewRegistryOp[] = [];
   if (record.role === 'guest') {
     if (record.state !== 'gone') {
@@ -1790,12 +1793,19 @@ export async function deleteChatHosted(chatId: string): Promise<void> {
  * member file to clean up — but a guest's roaming pointer must still go,
  * or the next registry pass would bring the dead chat back here and keep
  * it on every other device.
+ *
+ * `only` names the stay the caller's screen was drawn for, as in leaveChat.
+ * Resolves false when a later stay is held instead: the chat joined again
+ * in another tab is not the gone one the user asked to remove, and it
+ * stays, with nothing queued against it.
  */
-export async function removeChatLocally(chatId: string): Promise<void> {
+export async function removeChatLocally(chatId: string, only?: { generation: string | undefined }): Promise<boolean> {
   const record = await db.getChat(chatId);
-  if (!record) return;
-  await forgetChat(record, record.role === 'guest' ? [{ op: 'delete-pointer', chatId }] : []);
+  if (!record) return true;
+  if (only && record.generation !== only.generation) return false;
+  const removed = await forgetChat(record, record.role === 'guest' ? [{ op: 'delete-pointer', chatId }] : []);
   void drainRegistryOutbox();
+  return removed;
 }
 
 // ─── registry outbox drain ───

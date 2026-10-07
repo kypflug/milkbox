@@ -309,11 +309,11 @@ export async function showManageSheet(
       if (!confirm(`Leave ${chat.name}? You'll stop seeing it on your devices. To fully remove your access, ask the host to remove you.`)) return;
       modal.close();
       try {
-        if (await coordinator.leaveChat(chatId)) {
+        if (await coordinator.leaveChat(chatId, { generation: chat.generation })) {
           showToast(`You left ${chat.name}`);
           opts.onGoneFromList?.();
         } else {
-          // Left and joined again in another tab while this was under way:
+          // Left and joined again in another tab since this sheet was drawn:
           // the chat in the list is that later one, and it was not left.
           showToast(`${chat.name} was joined again in another tab, so it is still here.`, 'error');
         }
