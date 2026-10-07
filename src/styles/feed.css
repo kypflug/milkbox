@@ -331,6 +331,10 @@
 /* Touch devices have no hover — keep actions visible on tap/focus instead. */
 @media (pointer: coarse) {
   .drop-actions { top: auto; bottom: -13px; }
+  /* A failed card's bar is always shown, and down here it would lie over the
+   * end of the meta line, where the status is. Keep a strip clear for the
+   * 19px of the bar that overlaps the card, plus 4px under the text. */
+  .drop-card--failed { padding-bottom: 23px; }
 }
 
 /* ── inline edit ── */
