@@ -319,8 +319,14 @@ export async function enqueueEdit(scope: Scope, meta: DropMeta): Promise<void> {
   // The row that sends the edit and the local copy that shows it at once
   // are written together or not at all (db.queueEdit): the editor is told
   // "not saved" only when nothing was queued.
-  if (!(await db.queueEdit(scopeRefOf(scope), meta))) {
-    throw await chatRefusal(scope, 'your edit was not saved');
+  const outcome = await db.queueEdit(scopeRefOf(scope), meta);
+  if (outcome === 'refused') throw await chatRefusal(scope, 'your edit was not saved');
+  // A chat's edit that could only go out with no condition is never sent
+  // (performOp), so it is not queued: said here, the editor still holds
+  // what was typed.
+  if (outcome === 'missing') throw new Error('This drop has been removed — your edit was not saved.');
+  if (outcome === 'unversioned') {
+    throw new Error('This drop hasn’t finished syncing — your edit was not saved. Try again in a moment.');
   }
   emit({ type: 'feed-updated', scopeId });
   void drainOutbox(scopeId);
@@ -814,6 +820,15 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
   const stillCurrent = async () => {
     if (!(await db.hasOutboxRecord(record))) throw new SendWithdrawnError();
   };
+  // A chat's edit can have neither. Its row records no version — it was
+  // queued by a build that kept none, or with no copy held (db.queueEdit
+  // turns those away now) — and the copy is gone, removed by a pass, or is
+  // held with no eTag. Such an edit is not sent. The PUT is by path, and
+  // with no condition it creates the file when there is none: a drop
+  // another member deleted would be back for everyone, with the edited
+  // text. It ends as the conflict the server would have answered with
+  // (processOutboxRecord): the row goes, and nothing is tried again.
+  if (record.op === 'edit' && scope.kind === 'chat' && !ifMatch) throw new graph.DropConflictError(meta.id);
   // A private edit can have neither. Its row records no version — it was
   // queued with no copy held (the editor was open while a pass removed the
   // drop), or by a build that kept none — and the copy is gone, or is held
