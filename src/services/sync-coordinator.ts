@@ -639,13 +639,23 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       if (err instanceof SendWithdrawnError) return await stop();
       if (err instanceof graph.DropConflictError) {
         // The drop changed or was removed remotely — never retry (a retry
-        // would resurrect what another member deleted). Remote wins; the
-        // next sync pass reconciles the local record. (Nothing to report if
-        // the chat has been left since: the conflict was an earlier stay's.
-        // Nor if the edit has been queued over: the newer record gets its
-        // own answer from the server.)
+        // would resurrect what another member deleted). Remote wins, and a
+        // pass is asked for at once to bring it here: until one has run,
+        // the local copy is the edit that lost, at the eTag it was made on,
+        // and another edit of the drop would be refused the same way.
+        // (Nothing to report or to fetch if the chat has been left since:
+        // the conflict was an earlier stay's. Nor if the edit has been
+        // queued over: the newer record gets its own answer from the
+        // server.)
         const ended = await db.removeOutboxRecord(ref, record);
-        if (ended) emit({ type: 'drop-conflict', scopeId, dropId: record.id });
+        if (ended) {
+          emit({ type: 'drop-conflict', scopeId, dropId: record.id });
+          // Not waited for: a pass may be waiting on this drain. (That one
+          // lists the drop in the round it is in, and goes round again.)
+          // Nor asked for with the throttle gate up: a pass already running
+          // would go round again inside the wait the throttle asked for.
+          if (!isThrottled()) void requestSync(scope, { force: true });
+        }
         emit({ type: 'feed-updated', scopeId });
         return;
       }
