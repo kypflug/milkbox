@@ -253,7 +253,6 @@ export async function signIn(opts: { preConsentShare?: boolean } = {}): Promise<
  */
 export async function signOut(): Promise<boolean> {
   const msal = getMsal();
-  const account = getAccount();
 
   // Both cleared even when MSAL reports no account — iOS can drop the live
   // cache while the backup survives. The caller reloads a page that isn't
@@ -263,6 +262,12 @@ export async function signOut(): Promise<boolean> {
   // Awaited: the delete has to be committed before the redirect unloads the
   // page, or the next boot would restore the snapshot it was meant to remove.
   await clearMsalCacheBackup();
+  // Looked up only now. A page launching in another tab can restore the
+  // token cache a moment before the backup is revoked; an account that
+  // turned up that way is signed out like any other, not left for the
+  // caller's reload to find. (The lookup saves the hint again: clear it.)
+  const account = getAccount();
+  clearAccountHint();
   if (!account) return false;
 
   await msal.logoutRedirect({

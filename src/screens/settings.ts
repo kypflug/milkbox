@@ -7,6 +7,7 @@ import { iconClose } from '../components/icons';
 import { renameCurrentDevice, resetScope, shutdown, wipeForSignOut } from '../services/sync-coordinator';
 import { getDiagnostics, type Diagnostics, type PassStats } from '../services/sync-stats';
 import { postBroadcast } from '../services/broadcast';
+import { revokeMsalCacheBackup } from '../services/msal-cache-backup';
 import {
   isNotifySupported,
   isNotifyEnabled,
@@ -300,6 +301,9 @@ export function mountSettingsFlyout(
       // new store epoch, so a batch still in flight — in any tab — can't
       // land this account's drops afterwards.
       shutdown();
+      // Before the first await: the wipe below can take seconds, and a page
+      // launched meanwhile must not restore this account's token backup.
+      revokeMsalCacheBackup();
       postBroadcast({ type: 'auth-changed', signedIn: false });
       try {
         await wipeForSignOut();

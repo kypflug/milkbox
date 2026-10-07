@@ -97,15 +97,31 @@ let activeWrite: IDBTransaction | null = null;
  * sign-out does not wait for it for ever; a snapshot it could not delete
  * must still not be restored on the next boot, which would sign the user
  * straight back in. Kept in localStorage because that is synchronous: it is
- * in place before clearMsalCacheBackup's first await, whatever happens to
- * the page next.
+ * in place before sign-out's first await, whatever happens to the page next.
+ *
+ * It shares localStorage's fate, though. If iOS evicts localStorage before
+ * the next launch, the mark goes with the token cache, and a snapshot that
+ * could not be deleted is restored after all.
  */
 const REVOKED_KEY = 'milkbox:backup-revoked';
 
+/**
+ * Changed every time a sign-out starts clearing the backup, and never taken
+ * back. A restore that was waiting on IndexedDB meanwhile reads it before
+ * and after: the revoked mark alone would not tell it, because a delete
+ * that lands promptly lifts the mark again — after the restore has read the
+ * snapshot, and before it has written anything.
+ */
+const REVOCATION_STAMP_KEY = 'milkbox:backup-revocation';
+
 function setRevoked(revoked: boolean): void {
   try {
-    if (revoked) localStorage.setItem(REVOKED_KEY, '1');
-    else localStorage.removeItem(REVOKED_KEY);
+    if (revoked) {
+      localStorage.setItem(REVOKED_KEY, '1');
+      localStorage.setItem(REVOCATION_STAMP_KEY, `${Date.now()}-${Math.random()}`);
+    } else {
+      localStorage.removeItem(REVOKED_KEY);
+    }
   } catch {
     // localStorage unavailable: the bounded delete below is all there is
   }
@@ -116,6 +132,14 @@ function isRevoked(): boolean {
     return localStorage.getItem(REVOKED_KEY) !== null;
   } catch {
     return false;
+  }
+}
+
+function revocationStamp(): string | null {
+  try {
+    return localStorage.getItem(REVOCATION_STAMP_KEY);
+  } catch {
+    return null;
   }
 }
 
@@ -233,6 +257,7 @@ export async function restoreMsalCacheIfNeeded(): Promise<boolean> {
     }
 
     // localStorage is empty — try to restore from IndexedDB
+    const stampBefore = revocationStamp();
     const db = await openBackupDB();
     const snapshot = await new Promise<Record<string, string> | undefined>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readonly');
@@ -242,6 +267,13 @@ export async function restoreMsalCacheIfNeeded(): Promise<boolean> {
     });
 
     if (!snapshot || Object.keys(snapshot).length === 0) return false;
+
+    // Opening and reading can take a while, and a sign-out may have started
+    // meanwhile — in another tab, or here on hearing of one. The snapshot
+    // just read is then the account being signed out: writing it back would
+    // undo that. The mark shows a sign-out still clearing the backup; the
+    // stamp, one whose delete has already landed and lifted the mark.
+    if (backupsDisabled || isRevoked() || revocationStamp() !== stampBefore) return false;
 
     // Restore each key to localStorage, skipping stale interaction state
     let restored = 0;
@@ -325,6 +357,18 @@ function deleteSnapshot(ms: number): Promise<boolean> {
 }
 
 /**
+ * Sign-out has begun: from this instant this page writes no more snapshots,
+ * and no page restores the one that is stored. Synchronous, for the caller
+ * to do before its first await — clearMsalCacheBackup, which finishes the
+ * job, can come seconds later (the local store is wiped first), and a page
+ * launched in between must not find the snapshot still good to restore.
+ */
+export function revokeMsalCacheBackup(): void {
+  backupsDisabled = true;
+  setRevoked(true);
+}
+
+/**
  * Clear the IndexedDB backup (call on explicit sign-out). Never rejects, and
  * never takes longer than WRITE_WAIT_MS + DELETE_WAIT_MS.
  *
@@ -342,8 +386,7 @@ function deleteSnapshot(ms: number): Promise<boolean> {
  * left behind from being restored.
  */
 export async function clearMsalCacheBackup(): Promise<void> {
-  backupsDisabled = true;
-  setRevoked(true);
+  revokeMsalCacheBackup();
   const writing = backupRunning;
   if (writing) {
     const finished = await Promise.race([
