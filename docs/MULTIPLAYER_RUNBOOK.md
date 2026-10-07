@@ -68,6 +68,7 @@ Messaging
 - [ ] GUEST can edit/delete only their own drops; HOST additionally sees delete on GUEST drops; GUEST sees no delete on HOST drops.
 - [ ] Moderation race: GUEST queues an edit offline, HOST deletes that drop, GUEST reconnects → edit is discarded with the conflict toast; the drop stays deleted (no resurrection).
 - [ ] Offline queue in a chat: SENDING/FAILED overlays, retry, discard.
+- [ ] Delete offline (a chat drop, and one in the private feed): cut the network, delete, let the undo toast pass and stay offline well past ten seconds. The drop stays hidden, also after a reload (a delete has no FAILED state). Reconnect: within moments it is gone from OneDrive and from the other device, with nothing tapped.
 - [ ] Unread badge increments on the other account (including from an author whose clock is skewed hours behind) and clears on opening the chat.
 - [ ] Unread on the chat that is on screen (desktop, notify on): with a chat open, minimise the window and send a drop from the other account. The notification fires and the badge counts it. Bring the window back and touch nothing: the badge clears within a second.
 - [ ] Notifications (iOS standalone, notify on): "<chat> · <author>" fires for a backgrounded app; tapping opens the right chat; joining a chat with history does **not** replay the backlog.
