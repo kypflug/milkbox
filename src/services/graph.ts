@@ -429,6 +429,8 @@ export function itemByPathUrl(ref: DriveRef, path: string): string {
 const APPROOT: DriveRef = { kind: 'approot' };
 
 const dropJsonPath = (id: string) => `${DROPS_FOLDER}/${id}.json`;
+/** A drop's JSON as it is written to the drive, so that two can be compared as text. */
+const dropBody = (meta: unknown): string => JSON.stringify(meta, null, 2);
 const deviceJsonPath = (id: string) => `${DEVICES_FOLDER}/${id}.json`;
 
 // ─── drop JSON CRUD ───
@@ -446,8 +448,8 @@ export class DropConflictError extends Error {
 }
 
 /**
- * A chat edit was answered 412: is the version that refused it this very
- * write, landed on an earlier attempt?
+ * A chat edit was answered 412: is the version that refused it one of this
+ * device's own writes, landed without the device hearing of it?
  *
  * A PUT can be applied and its response never arrive — the connection
  * drops, iOS suspends the app, the request's time limit fires. The retry
@@ -456,14 +458,17 @@ export class DropConflictError extends Error {
  * exactly what they wrote, and leaves the local copy at the replaced eTag,
  * where their next edit of it is refused as well. (Two tabs sending the same
  * queued edit at once come to the same thing: the drive takes one and
- * refuses the other.)
+ * refuses the other.) An edit queued over that one before its retry fares
+ * no better: it names the same replaced eTag, and what refuses it is the
+ * earlier edit, which nobody else wrote either.
  *
- * Resolves the eTag the drop is held at when its JSON is exactly the `body`
- * that was sent: the edit is on the drive, whichever request put it there.
- * Resolves null when the drive holds anything else, or nothing — that is
- * the conflict. It only reads, so it cannot bring back a drop another member
- * deleted. A read that fails throws like any request; the caller's next
- * attempt is refused again and asks again.
+ * `bodies` are the candidates: the body being sent, and those of the edits
+ * it was queued over. Resolves the eTag the drop is held at, and which of
+ * them its JSON is exactly: that edit is on the drive, whichever request put
+ * it there. Resolves null when the drive holds anything else, or nothing —
+ * that is the conflict. It only reads, so it cannot bring back a drop
+ * another member deleted. A read that fails throws like any request; the
+ * caller's next attempt is refused again and asks again.
  *
  * The eTag is read first, the body second. The other way round, a change
  * landing between the two would pair this device's text with the eTag of
@@ -472,7 +477,11 @@ export class DropConflictError extends Error {
  * body, as the conflict it is, and one landing just after the body leaves
  * the local copy at an eTag already replaced, which the next pass corrects.
  */
-async function landedWrite(scope: Scope, id: string, body: string): Promise<{ eTag: string } | null> {
+async function landedWrite(
+  scope: Scope,
+  id: string,
+  bodies: readonly string[],
+): Promise<{ eTag: string; body: string } | null> {
   const ref = scopeRef(scope);
   const tier = scopeTier(scope);
   const path = dropJsonPath(id);
@@ -491,8 +500,8 @@ async function landedWrite(scope: Scope, id: string, body: string): Promise<{ eT
   // follows brings the drive's version, which is this one.
   const eTag = item.eTag;
   if (typeof eTag !== 'string' || !eTag) return null;
-  const held = await downloadItemJson(item, contentUrl(ref, path), tier);
-  return JSON.stringify(held, null, 2) === body ? { eTag } : null;
+  const held = dropBody(await downloadItemJson(item, contentUrl(ref, path), tier));
+  return bodies.includes(held) ? { eTag, body: held } : null;
 }
 
 /**
@@ -523,21 +532,25 @@ export class DropGoneError extends Error {
  *   none the write is a create, so performOp sends no private edit that
  *   way, and reads a version for one that has none (currentDropETag);
  * - chat: strictly conditional — 412/404 becomes DropConflictError so a
- * - chat: strictly conditional — 412/404 becomes DropConflictError so a
  *   queued edit can never recreate a drop another member deleted. Only with
  *   an eTag, though: without one this is a create, so the caller sends no
  *   chat edit that has none. And a 412 for a write that turns out to have
  *   landed already (landedWrite) is that write's success, not a conflict.
+ *   So is one for a write refused by an edit of this device's own, one of
+ *   those this was queued over (`queuedOver`), once it has been written
+ *   again over that edit: conditional as before, on the version just read
+ *   to hold it, and after `beforeRetry`, as in the private feed.
  */
 export async function putDropJson(
   scope: Scope,
   meta: DropMeta,
   eTag?: string,
   beforeRetry?: () => Promise<void>,
+  queuedOver: readonly DropMeta[] = [],
 ): Promise<string | undefined> {
   const ref = scopeRef(scope);
   const tier = scopeTier(scope);
-  const body = JSON.stringify(meta, null, 2);
+  const body = dropBody(meta);
   const doPut = (ifMatch?: string) =>
     graphFetch(contentUrl(ref, dropJsonPath(meta.id)), {
       method: 'PUT',
@@ -557,9 +570,33 @@ export async function putDropJson(
       if (scope.kind === 'chat') {
         // Only a 412 is looked into. A 404 says the drop is gone, which
         // nothing this device sent can account for.
-        const landed = err.status === 412 ? await landedWrite(scope, meta.id, body) : null;
-        if (landed) return landed.eTag;
-        throw new DropConflictError(meta.id);
+        const landed =
+          err.status === 412 ? await landedWrite(scope, meta.id, [body, ...queuedOver.map(dropBody)]) : null;
+        if (!landed) throw new DropConflictError(meta.id);
+        if (landed.body === body) return landed.eTag;
+        // What refused this edit is one it was queued over: applied with
+        // its response lost, so the copy held never moved to its eTag, and
+        // this one was sent naming the eTag before it. Nobody else has
+        // touched the drop, and the user's later text is the one to keep.
+        // It is written over that edit, on the condition that the drive
+        // still holds the version just read: the eTag was read before the
+        // body, so a write that passes replaces exactly what was compared.
+        // Not for a record that has been queued over in its turn: the newer
+        // edit carries this one's body, and is sent the same way.
+        await beforeRetry?.();
+        try {
+          const res = await doPut(landed.eTag);
+          const item = await res.json();
+          return item.eTag as string | undefined;
+        } catch (again) {
+          // Removed since the read: a conflict, as a 404 always is here. The
+          // write carried a condition, so it cannot have brought the drop
+          // back. A 412 says the drop changed since the read, and not who
+          // by: that is the caller's ordinary failure, and its next attempt
+          // starts over from the first write and reads again.
+          if (again instanceof GraphHttpError && again.status === 404) throw new DropConflictError(meta.id);
+          throw again;
+        }
       }
       // A write sent with no condition (a create) has none to lose. Its
       // failure is an ordinary one, not a reason to look for a version to

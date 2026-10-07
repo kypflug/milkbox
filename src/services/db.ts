@@ -708,6 +708,14 @@ export type QueueEditOutcome = 'queued' | 'refused' | 'missing' | 'unversioned';
  * versions this edit replaces. In the private feed a drop that is not
  * stored gets no local copy, only the row.
  *
+ * A chat's edit also keeps the edit it replaces, and the ones that edit
+ * kept (OutboxRecord.queuedOver): any of them may have been sent, and may
+ * be on the drive without this device knowing. All of them, not only those
+ * whose row shows a try: Retry puts a failed row back to none, and an edit
+ * that was never sent costs nothing to keep, since the drive cannot hold
+ * it. The list lasts while edits of the drop go on being queued over one
+ * another, and goes with the row once one is sent, refused or discarded.
+ *
  * A chat's edit is sent only as a change to a version this device knows:
  * the eTag of the copy held, or failing that the one the row records (see
  * the coordinator's performOp). An edit with neither would never be sent,
@@ -750,6 +758,7 @@ export async function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<QueueEdi
             scopeId: ref.scopeId,
             prevMeta: earlier ? earlier.prevMeta : held?.meta,
             prevETag,
+            ...(conditional && earlier ? { queuedOver: [...(earlier.queuedOver ?? []), earlier.meta] } : {}),
           }),
         );
         if (held) drops.put({ ...held, meta } satisfies StoredDropRecord);
