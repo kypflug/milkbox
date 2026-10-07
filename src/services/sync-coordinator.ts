@@ -379,8 +379,11 @@ export async function discardOutboxRecord(id: string): Promise<void> {
   // the feed in front of them.
   const scope = record ? await resolveScope(scopeId) : null;
   if (!record || !scope) {
-    // No such record, or one whose chat has left this device: nothing to undo.
-    await db.deleteOutboxRecord(id);
+    // No such record by now (sent, or withdrawn elsewhere), or its chat has
+    // left this device, which takes a chat's rows with it: there is nothing
+    // to discard. Not by id either. A row found under it now would be one
+    // queued since — in another tab, or in the chat joined again — and
+    // nobody asked for that one to go.
     emit({ type: 'feed-updated', scopeId });
     return;
   }
