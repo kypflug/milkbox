@@ -357,53 +357,71 @@ export async function retryOutboxRecord(id: string): Promise<void> {
   void drainOutbox(scopeId);
 }
 
-/** Discard a failed outbox record entirely. */
+/**
+ * Discard a failed outbox record entirely. For an edit that also means
+ * undoing the optimistic local copy — the edit never reached OneDrive, and
+ * the copy still carries the server's eTag, so no sync pass would ever
+ * correct it. Removing the record and undoing the copy are one transaction
+ * (db.discardOutboxRecord): a page closed in between must not be left with
+ * the unsent text and nothing to discard.
+ */
 export async function discardOutboxRecord(id: string): Promise<void> {
-  const records = await db.getOutbox();
-  const record = records.find(r => r.id === id);
-  await db.deleteOutboxRecord(id);
+  const record = (await db.getOutbox()).find(r => r.id === id);
   const scopeId = record?.scopeId ?? PRIVATE_SCOPE_ID;
-  // A discarded edit never reached OneDrive: put the server's version back
-  // over the optimistic local copy. Its eTag still matches the server's, so
-  // no sync pass would ever correct it. (The scope is resolved now: a
-  // discard is something the user does to the feed in front of them.)
-  const scope = record?.op === 'edit' ? await resolveScope(scopeId) : null;
-  const existing = scope ? await db.getDrop(scopeId, id) : undefined;
-  if (scope && existing && record?.prevMeta) {
-    // Only while the row is still the version the edit was made on. If a
-    // pass has since brought a newer one (another device edited the drop
-    // while this edit sat failed), that is the server's truth: leave it.
-    if (existing.eTag === record.prevETag) {
-      await db.putDrop(scopeRefOf(scope), { ...existing, meta: record.prevMeta });
-    }
-  } else if (scope && existing) {
-    // An edit queued by an older build kept no original to restore. Forget
-    // the row's eTag, so it stops matching the server's, and clear the delta
-    // token, so the next pass enumerates everything: that pass downloads the
-    // real version (or sweeps the drop if it is gone).
-    //
-    // A pass already running is stopped: its commit would put a token back,
-    // and if the app then closed before the full pass ran, the next launch
-    // would sync incrementally from that token and never revisit the row.
-    // The change is made at once as well as after that pass has gone — the
-    // outbox row is already deleted, so "eTag cleared, no token" has to be
-    // on disk before anything here waits. From then on this page writes no
-    // token until a full pass has finished. One written meanwhile by another
-    // tab is covered only by the flag, for as long as this page lives.
-    //
-    // The card goes now: the wait below can be a long one.
+  // The scope as it is held now: a discard is something the user does to
+  // the feed in front of them.
+  const scope = record ? await resolveScope(scopeId) : null;
+  if (!record || !scope) {
+    // No such record, or one whose chat has left this device: nothing to undo.
+    await db.deleteOutboxRecord(id);
     emit({ type: 'feed-updated', scopeId });
-    await withPassStopped(
-      scopeId,
-      async () => {
-        const held = await db.getDrop(scopeId, id);
-        if (held) await db.putDrop(scopeRefOf(scope), { ...held, eTag: undefined });
-        stateFor(scopeId).forceFull = true;
-        await graph.clearDeltaToken(scope);
-      },
-      true,
-    );
-    void requestSync(scope, { force: true });
+    return;
+  }
+  const ref = scopeRefOf(scope);
+  const discard = () => db.discardOutboxRecord(ref, id, graph.deltaTokenKey(scope));
+
+  if (record.op === 'edit' && !record.prevMeta) {
+    // An edit queued by an older build kept no original to restore. The
+    // discard forgets the row's eTag and the scope's delta token instead,
+    // so that the next pass enumerates everything and downloads the real
+    // version (or sweeps the drop if it is gone).
+    //
+    // A pass already running is stopped first: its commit would put a token
+    // back, and if the app then closed before the full pass ran, the next
+    // launch would sync incrementally from that token and never revisit the
+    // row. The discard itself is made at once, before waiting for that pass
+    // to wind down, so it is on disk whatever happens during the wait. From
+    // then on this page writes no token until a full pass has finished; one
+    // written meanwhile by another tab is covered only by the flag, for as
+    // long as this page lives.
+    let outcome: db.DiscardOutcome = 'gone';
+    try {
+      await withPassStopped(
+        scopeId,
+        async () => {
+          if (outcome !== 'invalidated') return;
+          // Once more, now that the pass has gone: its last commit may have
+          // been on its way already.
+          stateFor(scopeId).forceFull = true;
+          await graph.clearDeltaToken(scope);
+        },
+        async () => {
+          outcome = await discard();
+          if (outcome === 'invalidated') stateFor(scopeId).forceFull = true;
+          // The card goes now: the wait that follows can be a long one.
+          emit({ type: 'feed-updated', scopeId });
+        },
+      );
+    } finally {
+      // The pass that was stopped is owed either way, a failed discard
+      // included. After one of those it can still be winding down, and a
+      // request made meanwhile would end with it.
+      void (stateFor(scopeId).syncPromise ?? Promise.resolve())
+        .catch(() => {})
+        .then(() => requestSync(scope, { force: true }));
+    }
+  } else {
+    await discard();
   }
   emit({ type: 'feed-updated', scopeId });
 }
@@ -738,30 +756,44 @@ async function runDevicesPhase(signal: AbortSignal): Promise<{ ms: number; count
 }
 
 /**
- * Pick out the drops this install had never held, sent by someone else.
- *
- * Novelty is presence in IDB, not id order. ULIDs are minted when a drop is
- * composed but only published when the author's outbox drains — and in chats
- * other members' clocks can skew — so id order never decides novelty.
- *
- * `added` is what the commit itself found absent (db.commitDropChanges):
- * decided in the write transaction, so batches of one pass can't hide each
- * other's drops, and a second tab syncing the same scope can't count a drop
- * the first tab already wrote.
+ * Sent by someone else: another device of this account (the private feed),
+ * or another member (a chat). Whether a drop is NEW here is decided by the
+ * commit that stores it (db.commitDropChanges reports what it found absent):
+ * novelty is presence in IDB, not id order. ULIDs are minted when a drop is
+ * composed but only published when the author's outbox drains — and in
+ * chats other members' clocks can skew — so id order never decides it.
  */
-function pickArrivals(
-  scope: Scope,
-  records: DropRecord[],
-  added: ReadonlySet<string>,
-  selfId: string | undefined,
-): DropMeta[] {
-  return records
-    .filter(record => added.has(record.meta.id))
-    .filter(record =>
-      scope.kind === 'private' ? record.meta.device.id !== selfId : record.meta.author?.id !== selfId,
-    )
-    .map(record => record.meta)
-    .sort((a, b) => (a.id < b.id ? -1 : 1));
+function isFromSomeoneElse(scope: Scope, meta: DropMeta, selfId: string | undefined): boolean {
+  return scope.kind === 'private' ? meta.device.id !== selfId : meta.author?.id !== selfId;
+}
+
+/**
+ * Count and announce the drops that arrived from someone else.
+ *
+ * What arrived is not this pass's memory of it but the list stored with the
+ * commits that brought the drops in (DropCommit.arrivalCandidates). So it
+ * also covers what an earlier pass committed and never got to settle — a
+ * page iOS killed mid-pass, a pass that was stopped — and two tabs syncing
+ * the same scope settle each drop once between them. Taking the list and
+ * counting it unread are one transaction; the announcement follows, so a
+ * page killed in that last instant loses the notification, not the count.
+ *
+ * Arrivals a chat's feed has drawn meanwhile (markScopeRead) are not
+ * counted: drawn in a focused window they are no longer in the list at all,
+ * drawn in one that was not focused they are announced here with the rest.
+ *
+ * Called at the end of a pass that completed, of one that failed after
+ * storing something, and by a poll that finds the scope clean (pollScope:
+ * no pass will run to do it).
+ */
+async function settleArrivals(scope: Scope, mayPrime: boolean): Promise<void> {
+  const scopeId = scopeIdOf(scope);
+  // Unread unless the user is looking at the chat right now.
+  const countUnread =
+    scope.kind === 'chat' && !(scopeId === (await getActiveScopeId()) && document.visibilityState === 'visible');
+  const ids = await db.takeArrivals(scopeRefOf(scope), countUnread);
+  if (countUnread && ids.length) emit({ type: 'chats-changed' });
+  await announceArrivals(scope, ids, mayPrime);
 }
 
 /**
@@ -777,14 +809,21 @@ function pickArrivals(
  * it announces into an already-primed scope, but never primes one — or an
  * interrupted first sync would announce the rest of the history as new.
  */
-async function announceArrivals(scope: Scope, arrivals: DropMeta[], mayPrime: boolean): Promise<void> {
+async function announceArrivals(scope: Scope, ids: string[], mayPrime: boolean): Promise<void> {
   const scopeId = scopeIdOf(scope);
   const primed = await db.getSetting<boolean>(notifyPrimedKey(scopeId));
   if (!primed) {
     if (mayPrime) await db.putScopeSetting(scopeRefOf(scope), notifyPrimedKey(scopeId), true);
     return;
   }
-  if (!arrivals.length || !notify.isNotifyEnabled()) return;
+  if (!ids.length || !notify.isNotifyEnabled()) return;
+  // As stored now: a drop removed since it arrived is not announced.
+  const wanted = new Set(ids);
+  const arrivals = (await db.getScopeDrops(scopeId))
+    .map(record => record.meta)
+    .filter(meta => wanted.has(meta.id))
+    .sort((a, b) => (a.id < b.id ? -1 : 1));
+  if (!arrivals.length) return;
 
   if (scope.kind === 'private') {
     const profiles = await db.getAllDeviceProfiles();
@@ -805,31 +844,33 @@ async function announceArrivals(scope: Scope, arrivals: DropMeta[], mayPrime: bo
   }
 }
 
-/** Bump a chat's unread count unless the user is looking at it right now. */
-async function trackUnread(scope: Scope, arrivals: DropMeta[]): Promise<void> {
-  if (scope.kind !== 'chat' || !arrivals.length) return;
-  const scopeId = scopeIdOf(scope);
-  const activeScopeId = await getActiveScopeId();
-  if (scopeId === activeScopeId && document.visibilityState === 'visible') return;
-  const record = await db.getChat(scope.chatId);
-  if (!record) return;
-  const counted = await db.patchChat(
-    scope.chatId,
-    { unreadCount: (record.unreadCount ?? 0) + arrivals.length },
-    { generation: scope.generation },
-  );
-  if (counted) emit({ type: 'chats-changed' });
-}
-
-/** The scope's feed was rendered while visible — clear its badge. */
-export async function markScopeRead(scopeId: ScopeId, lastDropId?: string): Promise<void> {
+/**
+ * The scope's feed was rendered while visible — clear its badge. `drawn`
+ * is what that rendering held.
+ *
+ * Arrivals still waiting to be settled that were drawn have been read:
+ * left as they are, the pass or poll that settles them would count them
+ * unread if the user had moved on to another feed by then. With the window
+ * focused they are dropped from the list, as the worker would say nothing
+ * about them now. In a window that is visible but not focused they stay, to
+ * be announced once with the rest when the list is settled.
+ */
+export async function markScopeRead(scopeId: ScopeId, lastDropId?: string, drawn?: ReadonlySet<string>): Promise<void> {
   if (!scopeId.startsWith('chat:')) return;
   const chatId = scopeId.slice(5);
   const record = await db.getChat(chatId);
   if (!record) return;
-  if ((record.unreadCount ?? 0) === 0 && record.lastReadDropId === lastDropId) return;
-  await db.patchChat(chatId, { unreadCount: 0, ...(lastDropId ? { lastReadDropId: lastDropId } : {}) });
-  emit({ type: 'chats-changed' });
+  if ((record.unreadCount ?? 0) !== 0 || record.lastReadDropId !== lastDropId) {
+    await db.patchChat(chatId, { unreadCount: 0, ...(lastDropId ? { lastReadDropId: lastDropId } : {}) });
+    emit({ type: 'chats-changed' });
+  }
+  if (!drawn?.size) return;
+  try {
+    if (!(await db.getSetting<string[]>(db.arrivalsKey(scopeId)))?.length) return;
+    await db.markArrivalsShown(scopeRefOf(chatScopeOf(record)), drawn, document.hasFocus());
+  } catch (err) {
+    console.debug('[Sync] Could not note the arrivals that were shown:', err);
+  }
 }
 
 /** `scope` is the chat as the failing work knew it: a chat joined again since is not touched. */
@@ -979,8 +1020,6 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
       let stopped = false;
 
       const devicesTask = scope.kind === 'private' ? runDevicesPhase(controller.signal) : undefined;
-      /** Drops that arrived in batches this pass committed — announced even if it fails later. */
-      const arrivals: DropMeta[] = [];
       let received = 0;
       // Someone asked for a full enumeration (see discardOutboxRecord).
       // Taken before the snapshot below; handed back if this pass fails.
@@ -1033,6 +1072,11 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           mode = 'full';
         }
 
+        // The drops in a commit that someone else sent: the ones it finds new
+        // are recorded with it as arrivals, to be settled when the pass ends.
+        const fromSomeoneElse = (records: DropRecord[]) =>
+          new Set(records.filter(r => isFromSomeoneElse(scope, r.meta, selfId)).map(r => r.meta.id));
+
         let total = 0;
         let lastBroadcast = 0;
         const deltaOpts: graph.DeltaOptions = {
@@ -1046,9 +1090,11 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           },
           // Each batch is committed and shown as it arrives, newest first.
           onBatch: async records => {
-            const { written, added } = await db.commitDropChanges(ref, { puts: records });
+            const { written } = await db.commitDropChanges(ref, {
+              puts: records,
+              arrivalCandidates: fromSomeoneElse(records),
+            });
             if (!written) stopForRemovedScope(controller);
-            arrivals.push(...pickArrivals(scope, records, added, selfId));
             firstCommitMs ??= performance.now() - t0;
             received += records.length;
             emit({ type: 'sync-progress', scopeId, received, total });
@@ -1096,14 +1142,14 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         // stopped it may have just cleared one (see withPassStopped).
         throwIfAborted(controller.signal);
         // The last drops, the removals, the token and the cTag land together.
-        const { written, added } = await db.commitDropChanges(ref, {
+        const { written } = await db.commitDropChanges(ref, {
           puts: result.upserts,
           deletes: [...deletes],
           settingsPut,
           settingsDelete,
+          arrivalCandidates: fromSomeoneElse(result.upserts),
         });
         if (!written) stopForRemovedScope(controller);
-        arrivals.push(...pickArrivals(scope, result.upserts, added, selfId));
         // "First drops" only when this commit carried some: an empty account,
         // or a pass that skipped every body, shows no such moment.
         if (result.upserts.length) firstCommitMs ??= performance.now() - t0;
@@ -1135,15 +1181,19 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           } catch (err) {
             console.debug('[Sync] Descriptor refresh failed; name may be stale:', err);
           }
-          await trackUnread(scope, arrivals);
         }
 
-        // Announcements name the sending device, so let its profile land first.
+        // Announcements name the sending device, so let its profile land
+        // first. For a chat, the roster refresh above is normally long
+        // enough for an open feed to have drawn what arrived, and what it
+        // drew is not counted unread (markScopeRead).
+        // (A page closed before this point leaves the arrivals recorded
+        // beside a folder that reads as clean: pollScope settles those.)
         await devicesTask;
         try {
-          await announceArrivals(scope, arrivals, true);
+          await settleArrivals(scope, true);
         } catch (err) {
-          console.warn('[Sync] Announcing arrivals failed; drops are synced:', err);
+          console.warn('[Sync] Settling arrivals failed; drops are synced:', err);
         }
 
         if (passChanged) {
@@ -1170,14 +1220,16 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           } else if (scope.kind === 'chat' && err instanceof ConsentRequiredError) {
             await handleChatConsentLost(scope);
           }
-          // Batches that did commit are real arrivals.
-          if (arrivals.length) {
+          // Batches that did commit are real arrivals: settle them now.
+          // (Anything not settled here stays recorded, for the next pass
+          // that completes or fails after storing something, or the poll
+          // that finds the scope clean.)
+          if (received > 0) {
             try {
-              await trackUnread(scope, arrivals);
               await devicesTask;
-              await announceArrivals(scope, arrivals, false);
-            } catch (announceErr) {
-              console.debug('[Sync] Announcing partial arrivals failed:', announceErr);
+              await settleArrivals(scope, false);
+            } catch (settleErr) {
+              console.debug('[Sync] Settling partial arrivals failed:', settleErr);
             }
           }
           if (received > 0) postBroadcast({ type: 'sync-complete', scopeId });
@@ -1308,19 +1360,21 @@ const passHolds = new Map<ScopeId, number>();
  * was already open lands ahead of anything `change` writes.
  *
  * Winding down can take as long as a file upload: a pass waiting on its
- * outbox drain cannot be interrupted. With `alsoAtOnce`, `change` is made
- * straight away as well, before that wait, so that it is on disk even if
- * the app closes meanwhile — and made again once the pass has gone, as a
- * second line of defence (a batch the stopped pass committed late may have
- * rewritten a row). It has to be safe to make twice.
+ * outbox drain cannot be interrupted. What has to be on disk even if the
+ * app closes meanwhile goes in `atOnce`, which runs straight after the pass
+ * is told to stop, before that wait.
  */
-async function withPassStopped(scopeId: ScopeId, change: () => Promise<void>, alsoAtOnce = false): Promise<void> {
+async function withPassStopped(
+  scopeId: ScopeId,
+  change: () => Promise<void>,
+  atOnce?: () => Promise<void>,
+): Promise<void> {
   const st = stateFor(scopeId);
   passHolds.set(scopeId, (passHolds.get(scopeId) ?? 0) + 1);
   try {
     clearTimeout(st.retryTimer);
     st.controller?.abort();
-    if (alsoAtOnce) await change();
+    if (atOnce) await atOnce();
     while (st.syncPromise) await st.syncPromise.catch(() => {});
     await change();
   } finally {
@@ -1348,7 +1402,12 @@ export async function resetScope(scope: Scope): Promise<void> {
     // One transaction, and a new store epoch with it: a pass still running
     // in another tab can no longer commit (it would put back a delta token
     // for drops that are no longer here). Those tabs are told to reload.
-    await db.resetScopeStore(scopeId, [...graph.syncStateKeys(scope), notifyPrimedKey(scopeId)]);
+    await db.resetScopeStore(scopeId, [
+      ...graph.syncStateKeys(scope),
+      notifyPrimedKey(scopeId),
+      db.arrivalsKey(scopeId),
+      db.shownArrivalsKey(scopeId),
+    ]);
     postBroadcast({ type: 'store-reset' });
     // The pass below enumerates everything whatever token it finds. The
     // epoch keeps other tabs from writing theirs back, but a re-sync that
@@ -1362,6 +1421,24 @@ export async function resetScope(scope: Scope): Promise<void> {
 // ─── polling ───
 
 let rotationIndex = 0;
+
+/**
+ * Settle arrivals that a pass stored and never got to settle, for a scope
+ * the poll found clean. No pass will run to do it: the commit that recorded
+ * them is the one that stored the folder's cTag, so a page closed just after
+ * it leaves a scope that looks up to date.
+ *
+ * Never priming. Only the end of a pass does that: a reset waits for a
+ * pass to be gone before it clears the primer, and does not wait for this.
+ */
+async function settleLeftOverArrivals(scope: Scope): Promise<void> {
+  try {
+    if (!(await db.getSetting<string[]>(db.arrivalsKey(scopeIdOf(scope))))?.length) return;
+    await settleArrivals(scope, false);
+  } catch (err) {
+    console.debug('[Sync] Settling left-over arrivals failed:', err);
+  }
+}
 
 async function pollScope(scopeId: ScopeId): Promise<void> {
   const st = scopeStates.get(scopeId);
@@ -1377,7 +1454,11 @@ async function pollScope(scopeId: ScopeId): Promise<void> {
       graph.isFeedDirty(scope),
       scope.kind === 'private' ? graph.isDeviceRegistryDirty() : Promise.resolve(false),
     ]);
-    if (feed.dirty || devicesDirty) await requestSync(scope, { force: true, knownCTag: feed.cTag });
+    if (feed.dirty || devicesDirty) {
+      await requestSync(scope, { force: true, knownCTag: feed.cTag });
+    } else if (!scopeStates.get(scopeId)?.syncing) {
+      await settleLeftOverArrivals(scope);
+    }
   } catch (err) {
     noteThrottle(err);
     if (scope.kind === 'chat' && graph.isAccessLostError(err)) {
@@ -1694,6 +1775,8 @@ export async function catchUpRegistry(eager = false): Promise<void> {
   // Signed out (here or in another tab): nothing more to ask OneDrive for.
   if (shuttingDown) return;
   await drainRegistryOutbox();
+  // The drain waits on requests: the sign-out may have come during it.
+  if (shuttingDown) return;
   await hydrateChatRegistry(eager);
 }
 
@@ -1799,22 +1882,26 @@ const REGISTRY_CTAG_KEY = 'milkbox:registry-ctags';
  * queued. A listing that fails aborts the pass without touching anything.
  */
 export async function hydrateChatRegistry(eager = false): Promise<void> {
-  if (hydrating || Date.now() < throttledUntil) return;
+  if (shuttingDown || hydrating || Date.now() < throttledUntil) return;
   const now = Date.now();
   if (eager && now - lastCheckedAt < REGISTRY_CHECK_FLOOR_MS) return;
   hydrating = true;
   try {
     const me = await ensureMe();
-    if (!me) return;
+    // A sign-out heard during one of the waits here or in the reconcile:
+    // start nothing further. (A listing already under way still finishes.)
+    if (!me || shuttingDown) return;
 
     const ctags = await chatsApi.getRegistryCTags();
     lastCheckedAt = Date.now();
     const known = await db.getSetting<chatsApi.RegistryCTags>(REGISTRY_CTAG_KEY);
     const dirty = !known || known.hosted !== ctags.hosted || known.joined !== ctags.joined;
     const overdue = now - lastReconciledAt >= REGISTRY_FULL_INTERVAL_MS;
-    if (!dirty && !overdue) return;
+    if (shuttingDown || (!dirty && !overdue)) return;
 
     await reconcileChatRegistry(me);
+    // Cut short by a sign-out: not a reconcile to record.
+    if (shuttingDown) return;
     lastReconciledAt = Date.now();
     // Stored from before the listings: anything that changed while they ran
     // moves the cTag past this value and the next tick lists again.
@@ -1835,7 +1922,9 @@ async function reconcileChatRegistry(me: AuthorAttribution): Promise<void> {
   const queue = await getRegistryOutbox();
 
   const hosted = await chatsApi.listHostChats(me, localIds);
+  if (shuttingDown) return;
   const joined = await chatsApi.listJoinedPointers(localIds);
+  if (shuttingDown) return;
 
   const now = Date.now();
   let changed = false;

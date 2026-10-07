@@ -246,9 +246,14 @@ export async function renderFeed(
     // asked for the bottom (a send, the first paint).
     if (rebuilt ? stick : opts.stick === true) scrollToBottom();
 
-    if (isChat && document.visibilityState === 'visible') {
+    // Not for a list the user has already left: this refresh was under way
+    // when they went to another feed, and nothing it drew was shown.
+    if (isChat && document.visibilityState === 'visible' && listEl.isConnected) {
       const lastId = feed.length ? feed[feed.length - 1].meta.id : undefined;
-      void coordinator.markScopeRead(scopeId, lastId);
+      // What was drawn: the page of the feed that is in the list, not all of it.
+      void coordinator
+        .markScopeRead(scopeId, lastId, new Set(visible.map(record => record.meta.id)))
+        .catch(err => console.debug('[Chats] Mark read failed:', err));
     }
   }
 
@@ -572,10 +577,14 @@ export async function renderFeed(
         if (perms.canDelete) scheduleDelete(record);
         break;
       case 'retry':
-        await coordinator.retryOutboxRecord(id);
-        break;
       case 'discard':
-        await coordinator.discardOutboxRecord(id);
+        // A refused or failed write leaves the row and its card as they were.
+        try {
+          if (action === 'retry') await coordinator.retryOutboxRecord(id);
+          else await coordinator.discardOutboxRecord(id);
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : `Could not ${action} the drop`, 'error');
+        }
         break;
     }
   });

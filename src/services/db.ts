@@ -319,6 +319,15 @@ export interface DropCommit {
   /** Settings written alongside — a pass's delta token and cTag. */
   settingsPut?: Array<[string, unknown]>;
   settingsDelete?: string[];
+  /**
+   * The ids among `puts` that someone else sent. Those this device turns out
+   * not to have held are added, in this same transaction, to the scope's
+   * list of unsettled arrivals (arrivalsKey): the drops still to be counted
+   * unread and announced. Kept with the commit because the pass that brings
+   * them in may never reach its end (a page iOS kills mid-pass), and the
+   * next pass skips them by eTag — nothing else would ever count them.
+   */
+  arrivalCandidates?: ReadonlySet<string>;
 }
 
 export interface DropCommitResult {
@@ -363,8 +372,115 @@ export async function commitDropChanges(ref: ScopeRef, commit: DropCommit): Prom
     const settings = t.objectStore('settings');
     for (const [key, value] of commit.settingsPut ?? []) settings.put(value, key);
     for (const key of commit.settingsDelete ?? []) settings.delete(key);
+    const candidates = commit.arrivalCandidates;
+    if (candidates?.size) {
+      const key = arrivalsKey(scopeId);
+      // Asked for last: requests are answered in order, so by the time this
+      // one is, `added` is complete.
+      const unsettled = settings.get(key) as IDBRequest<string[] | undefined>;
+      unsettled.onsuccess = () => {
+        const arrived = [...added].filter(id => candidates.has(id));
+        if (arrived.length) settings.put([...(unsettled.result ?? []), ...arrived], key);
+      };
+    }
   });
   return { written, added };
+}
+
+/** Where a scope keeps its unsettled arrivals (see DropCommit.arrivalCandidates). */
+export function arrivalsKey(scopeId: ScopeId): string {
+  return `milkbox:arrivals:${scopeId}`;
+}
+
+/** Those of a scope's unsettled arrivals that its feed has shown (see markArrivalsShown). */
+export function shownArrivalsKey(scopeId: ScopeId): string {
+  return `milkbox:arrivals-shown:${scopeId}`;
+}
+
+/**
+ * Take a scope's unsettled arrivals for counting and announcing. The list is
+ * emptied and — for a chat, when `countUnread` is set — the number of them
+ * that are still stored and that its feed has not shown is added to the
+ * chat's unread count, all in one transaction: a page killed here neither
+ * loses the count nor applies it twice. Resolves the ids taken, shown ones
+ * included; none when `ref` is not the stay held.
+ */
+export async function takeArrivals(ref: ScopeRef, countUnread: boolean): Promise<string[]> {
+  const chatId = ref.scopeId.startsWith('chat:') ? ref.scopeId.slice(5) : null;
+  const key = arrivalsKey(ref.scopeId);
+  const shownKey = shownArrivalsKey(ref.scopeId);
+  let taken: string[] = [];
+  await writeForScope(ref, ['settings', 'drops'], t => {
+    const settings = t.objectStore('settings');
+    const unsettled = settings.get(key) as IDBRequest<string[] | undefined>;
+    unsettled.onsuccess = () => {
+      const ids = unsettled.result ?? [];
+      if (!ids.length) return;
+      settings.delete(key);
+      taken = ids;
+      const shown = settings.get(shownKey) as IDBRequest<string[] | undefined>;
+      shown.onsuccess = () => {
+        settings.delete(shownKey);
+        if (!chatId || !countUnread) return;
+        const seen = new Set(shown.result ?? []);
+        // A set: an id that came to be listed twice counts once.
+        const notShown = new Set(ids.filter(id => !seen.has(id)));
+        if (!notShown.size) return;
+        // As stored now, like the announcement: an arrival that has been
+        // removed since (a later commit deleted it) is not unread.
+        const stored = t.objectStore('drops').getAllKeys(scopeRange(ref.scopeId)) as IDBRequest<IDBValidKey[]>;
+        stored.onsuccess = () => {
+          const unread = (stored.result as Array<[ScopeId, string]>).filter(([, id]) => notShown.has(id)).length;
+          if (!unread) return;
+          const chats = t.objectStore('chats');
+          const held = chats.get(chatId) as IDBRequest<ChatRecord | undefined>;
+          held.onsuccess = () => {
+            const chat = held.result;
+            if (chat) chats.put({ ...chat, unreadCount: (chat.unreadCount ?? 0) + unread });
+          };
+        };
+      };
+    };
+  });
+  return taken;
+}
+
+/**
+ * The scope's feed drew these drops while it was visible. Unsettled arrivals
+ * among them are no longer unread, whenever they come to be settled.
+ *
+ * With `forget` they leave the list outright: the user was looking, and
+ * there is nothing left to announce either. Without it they stay listed, to
+ * be announced with the rest when the list is settled, and are only
+ * remembered as shown. Arrivals the feed did not draw are untouched.
+ */
+export async function markArrivalsShown(ref: ScopeRef, drawn: ReadonlySet<string>, forget: boolean): Promise<void> {
+  const key = arrivalsKey(ref.scopeId);
+  const shownKey = shownArrivalsKey(ref.scopeId);
+  await writeForScope(ref, ['settings'], t => {
+    const settings = t.objectStore('settings');
+    const unsettled = settings.get(key) as IDBRequest<string[] | undefined>;
+    unsettled.onsuccess = () => {
+      const ids = unsettled.result ?? [];
+      if (!ids.some(id => drawn.has(id))) return;
+      if (forget) {
+        const rest = ids.filter(id => !drawn.has(id));
+        if (rest.length) {
+          settings.put(rest, key);
+        } else {
+          settings.delete(key);
+          settings.delete(shownKey);
+        }
+        return;
+      }
+      const shown = settings.get(shownKey) as IDBRequest<string[] | undefined>;
+      shown.onsuccess = () => {
+        const seen = new Set(shown.result ?? []);
+        const fresh = ids.filter(id => drawn.has(id) && !seen.has(id));
+        if (fresh.length) settings.put([...seen, ...fresh], shownKey);
+      };
+    };
+  });
 }
 
 // ─── thumbs (scoped keys) ───
@@ -473,6 +589,60 @@ export async function updateOutboxRecord(ref: ScopeRef, record: OutboxRecord): P
     };
   });
   return updated;
+}
+
+export type DiscardOutcome = 'gone' | 'removed' | 'restored' | 'kept' | 'invalidated';
+
+/**
+ * Discard a queued record and, if it was an edit, undo what the edit left on
+ * the local copy — one transaction, because the two must not come apart:
+ * with the record gone and the optimistic text still stored under the
+ * server's eTag, no sync pass would ever correct the drop.
+ *
+ * - 'restored' / 'kept': the edit kept the version it was made on
+ *   (prevMeta). That version is put back — unless a pass has since stored a
+ *   newer one (the eTag moved on), which is the server's truth and stays.
+ * - 'invalidated': it kept none (it was queued by an older build). The
+ *   drop's eTag is cleared, so it stops matching the server's, and the
+ *   setting under `invalidateKey` — the scope's delta token — is deleted,
+ *   so that the next pass enumerates everything and downloads the real
+ *   version.
+ * - 'removed': there was nothing to undo (not an edit, or no local copy).
+ * - 'gone': no such record in this scope, or `ref` is not the stay held;
+ *   nothing was touched.
+ */
+export async function discardOutboxRecord(ref: ScopeRef, id: string, invalidateKey: string): Promise<DiscardOutcome> {
+  let outcome: DiscardOutcome = 'gone';
+  await writeForScope(ref, ['outbox', 'drops', 'settings'], t => {
+    const outbox = t.objectStore('outbox');
+    const queued = outbox.get(id) as IDBRequest<OutboxRecord | undefined>;
+    queued.onsuccess = () => {
+      const record = queued.result;
+      if (!record || (record.scopeId ?? 'private') !== ref.scopeId) return;
+      outbox.delete(id);
+      outcome = 'removed';
+      if (record.op !== 'edit') return;
+      const drops = t.objectStore('drops');
+      const stored = drops.get([ref.scopeId, id]) as IDBRequest<StoredDropRecord | undefined>;
+      stored.onsuccess = () => {
+        const drop = stored.result;
+        if (!drop) return;
+        if (record.prevMeta) {
+          if (drop.eTag !== record.prevETag) {
+            outcome = 'kept';
+            return;
+          }
+          drops.put({ ...drop, meta: record.prevMeta });
+          outcome = 'restored';
+        } else {
+          drops.put({ ...drop, eTag: undefined });
+          t.objectStore('settings').delete(invalidateKey);
+          outcome = 'invalidated';
+        }
+      };
+    };
+  });
+  return outcome;
 }
 
 export async function hasOutboxRecord(id: string): Promise<boolean> {
@@ -670,6 +840,8 @@ function scopeSettingsKeys(scopeId: ScopeId): string[] {
     `milkbox:ctag:${scopeId}`,
     `milkbox:notify-primed:${scopeId}`,
     `milkbox:members:${scopeId}`,
+    arrivalsKey(scopeId),
+    shownArrivalsKey(scopeId),
   ];
 }
 
