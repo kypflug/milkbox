@@ -597,6 +597,8 @@ interface ScopeSyncState {
   /** Quick retries spent since the last completed pass. */
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Passes in a row that stored no position because a commit left something out. */
+  leftOutRounds: number;
 }
 
 const scopeStates = new Map<ScopeId, ScopeSyncState>();
@@ -607,6 +609,17 @@ const GONE_THRESHOLD = 3;
 const RETRY_DELAYS_MS = [2_000, 5_000, 15_000];
 /** Other tabs re-read the feed at most this often while a pass commits batches. */
 const BROADCAST_EVERY_MS = 2_000;
+/**
+ * A pass whose commits left something out goes round again at once, this
+ * many times in a row at most. Each round needs something to have changed
+ * here while it ran, so one more is the rule; the limit is for whatever
+ * this has not thought of. Past it, a pass that leaves something out no
+ * longer asks for another by itself: a timer does, after a while. (One
+ * asked for by something else still runs.) A pass that leaves nothing out
+ * ends the run.
+ */
+const MAX_LEFT_OUT_ROUNDS = 3;
+const LEFT_OUT_RETRY_MS = 15_000;
 
 /** Sign-out has begun: no new passes. */
 let shuttingDown = false;
@@ -668,6 +681,7 @@ function stateFor(scopeId: ScopeId): ScopeSyncState {
       lastPassFailed: false,
       retryCount: 0,
       retryTimer: undefined,
+      leftOutRounds: 0,
     };
     scopeStates.set(scopeId, st);
   }
@@ -1060,7 +1074,9 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         knownCTag = undefined;
 
         // What this device holds as the pass starts: the eTags let it skip
-        // bodies it already has, the ids are what a full pass may sweep.
+        // bodies it already has, and tell a commit whether the copy held
+        // then is still the one held when it lands (see
+        // DropCommit.snapshot); the ids are what a full pass may sweep.
         // Taken before any batch below is written.
         const known = await db.getScopeDropETags(scopeId);
         const heldBefore = new Set(known.keys());
@@ -1080,6 +1096,8 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
 
         let total = 0;
         let lastBroadcast = 0;
+        /** Bodies this pass downloaded and did not store (see DropCommit.snapshot). */
+        let leftOut = 0;
         const deltaOpts: graph.DeltaOptions = {
           stats: counts,
           known,
@@ -1091,11 +1109,13 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           },
           // Each batch is committed and shown as it arrives, newest first.
           onBatch: async records => {
-            const { written } = await db.commitDropChanges(ref, {
+            const batch = await db.commitDropChanges(ref, {
               puts: records,
+              snapshot: known,
               arrivalCandidates: fromSomeoneElse(records),
             });
-            if (!written) stopForRemovedScope(controller);
+            if (!batch.written) stopForRemovedScope(controller);
+            leftOut += batch.leftOut.size;
             firstCommitMs ??= performance.now() - t0;
             received += records.length;
             emit({ type: 'sync-progress', scopeId, received, total });
@@ -1143,14 +1163,19 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         // stopped it may have just cleared one (see withPassStopped).
         throwIfAborted(controller.signal);
         // The last drops, the removals, the token and the cTag land together.
-        const { written } = await db.commitDropChanges(ref, {
+        // No token and no cTag from a pass that left a body out, in a batch
+        // or here (the commit withholds them itself in that case): it has
+        // not stored everything it listed.
+        const last = await db.commitDropChanges(ref, {
           puts: result.upserts,
+          snapshot: known,
           deletes: [...deletes],
-          settingsPut,
-          settingsDelete,
+          settingsPut: leftOut ? [] : settingsPut,
+          settingsDelete: leftOut ? [] : settingsDelete,
           arrivalCandidates: fromSomeoneElse(result.upserts),
         });
-        if (!written) stopForRemovedScope(controller);
+        if (!last.written) stopForRemovedScope(controller);
+        leftOut += last.leftOut.size;
         // "First drops" only when this commit carried some: an empty account,
         // or a pass that skipped every body, shows no such moment.
         if (result.upserts.length) firstCommitMs ??= performance.now() - t0;
@@ -1161,6 +1186,24 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         st.completedOnce = true;
         st.retryCount = 0;
         st.lastPassFailed = false;
+        if (leftOut) {
+          // A drop was deleted or changed here while this pass held its
+          // body, so that body was not stored, and neither was the pass's
+          // position. Go round again: the same changes are listed anew,
+          // against what is held now. A full pass is owed in full.
+          if (fromScratch) st.forceFull = true;
+          if (++st.leftOutRounds <= MAX_LEFT_OUT_ROUNDS) {
+            st.syncAgain = true;
+          } else if (!shuttingDown && !controller.signal.aborted) {
+            clearTimeout(st.retryTimer);
+            st.retryTimer = setTimeout(() => {
+              st.retryTimer = undefined;
+              if (document.visibilityState === 'visible') void requestSync(scope, { force: true });
+            }, LEFT_OUT_RETRY_MS);
+          }
+        } else {
+          st.leftOutRounds = 0;
+        }
 
         const passChanged = received > 0 || deletes.size > 0 || result.fullResync;
         if (scope.kind === 'chat') {

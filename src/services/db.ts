@@ -314,6 +314,32 @@ export async function getScopeDropETags(scopeId: ScopeId): Promise<Map<string, s
 
 export interface DropCommit {
   puts?: DropRecord[];
+  /**
+   * What this device held when the pass that downloaded `puts` took its
+   * snapshot: drop id → eTag. With it, a put is made only where the stored
+   * copy is still as the snapshot had it (the same eTag, or absent in both).
+   *
+   * Anything else means something happened to the drop here while the pass
+   * was holding its body: the user deleted or edited it and OneDrive has
+   * answered (the outbox drain stores the outcome at once), or another tab
+   * stored it. The body in hand was listed before that, or after it, and
+   * eTags do not say which. So it is not stored — it is left out — unless
+   * the copy held is that very version already.
+   *
+   * A commit that leaves anything out also withholds `settingsPut` and
+   * `settingsDelete`, the pass's position. Stored, the position would rule
+   * the drop out of every later incremental pass, whichever version was the
+   * later one. Withheld, the pass goes round again (see runScopeSync): the
+   * same changes are listed anew against what is held by then, and what
+   * OneDrive has at that point is what ends up stored.
+   *
+   * What this does not see: a drop the snapshot did not have, stored and
+   * then deleted here while the pass ran. It reads as absent in both, so
+   * the body in hand is stored, as it always was, until the next pass lists
+   * the removal. And only puts are decided this way: `deletes` are applied
+   * as they are.
+   */
+  snapshot?: ReadonlyMap<string, string | undefined>;
   /** Drop ids to remove, with their cached thumbnails and image bytes. */
   deletes?: string[];
   /** Settings written alongside — a pass's delta token and cTag. */
@@ -339,6 +365,12 @@ export interface DropCommitResult {
    * count the same drop as new.
    */
   added: Set<string>;
+  /**
+   * Ids among `puts` that were not stored, because the copy held had changed
+   * since the pass's snapshot (see DropCommit.snapshot). When there are any,
+   * the commit's settings were not written either.
+   */
+  leftOut: Set<string>;
 }
 
 /**
@@ -347,7 +379,8 @@ export interface DropCommitResult {
  * they describe (a killed app would otherwise resume past drops it never
  * wrote), or the local half of a delete that has just been sent.
  *
- * Puts land before deletes. For a chat scope the write is skipped entirely
+ * Puts land before deletes; a put may be left out, and the settings with it
+ * (see DropCommit.snapshot). For a chat scope the write is skipped entirely
  * unless the chat is still held in the stay `ref` names (see writeForScope):
  * work that outlived a leave must neither write drops back under the
  * cleared scope nor remove them from the chat joined again since.
@@ -355,36 +388,56 @@ export interface DropCommitResult {
 export async function commitDropChanges(ref: ScopeRef, commit: DropCommit): Promise<DropCommitResult> {
   const { scopeId } = ref;
   const added = new Set<string>();
+  const leftOut = new Set<string>();
+  const { snapshot } = commit;
   const written = await writeForScope(ref, ['drops', 'thumbs', 'blobs', 'settings'], t => {
     const drops = t.objectStore('drops');
-    for (const r of commit.puts ?? []) {
-      const held = drops.getKey([scopeId, r.meta.id]);
+    // Everything but the puts. Issued once every put has been decided: it is
+    // requested after them, as it always was, and by then it is known
+    // whether the settings go in at all.
+    const theRest = () => {
+      for (const id of commit.deletes ?? []) {
+        drops.delete([scopeId, id]);
+        t.objectStore('thumbs').delete(mediaKey(scopeId, id));
+        t.objectStore('blobs').delete(mediaKey(scopeId, id));
+      }
+      const settings = t.objectStore('settings');
+      if (!leftOut.size) {
+        for (const [key, value] of commit.settingsPut ?? []) settings.put(value, key);
+        for (const key of commit.settingsDelete ?? []) settings.delete(key);
+      }
+      const candidates = commit.arrivalCandidates;
+      if (candidates?.size) {
+        const key = arrivalsKey(scopeId);
+        const unsettled = settings.get(key) as IDBRequest<string[] | undefined>;
+        unsettled.onsuccess = () => {
+          const arrived = [...added].filter(id => candidates.has(id));
+          if (arrived.length) settings.put([...(unsettled.result ?? []), ...arrived], key);
+        };
+      }
+    };
+    const puts = commit.puts ?? [];
+    let undecided = puts.length;
+    if (!undecided) theRest();
+    for (const r of puts) {
+      const id = r.meta.id;
+      const held = drops.get([scopeId, id]) as IDBRequest<StoredDropRecord | undefined>;
       held.onsuccess = () => {
-        if (held.result === undefined) added.add(r.meta.id);
-      };
-      drops.put({ ...r, scopeId } satisfies StoredDropRecord);
-    }
-    for (const id of commit.deletes ?? []) {
-      drops.delete([scopeId, id]);
-      t.objectStore('thumbs').delete(mediaKey(scopeId, id));
-      t.objectStore('blobs').delete(mediaKey(scopeId, id));
-    }
-    const settings = t.objectStore('settings');
-    for (const [key, value] of commit.settingsPut ?? []) settings.put(value, key);
-    for (const key of commit.settingsDelete ?? []) settings.delete(key);
-    const candidates = commit.arrivalCandidates;
-    if (candidates?.size) {
-      const key = arrivalsKey(scopeId);
-      // Asked for last: requests are answered in order, so by the time this
-      // one is, `added` is complete.
-      const unsettled = settings.get(key) as IDBRequest<string[] | undefined>;
-      unsettled.onsuccess = () => {
-        const arrived = [...added].filter(id => candidates.has(id));
-        if (arrived.length) settings.put([...(unsettled.result ?? []), ...arrived], key);
+        const stored = held.result;
+        const asSnapshot =
+          !snapshot || (stored ? snapshot.has(id) && snapshot.get(id) === stored.eTag : !snapshot.has(id));
+        if (asSnapshot) {
+          if (!stored) added.add(id);
+          drops.put({ ...r, scopeId } satisfies StoredDropRecord);
+        } else if (!(stored && stored.eTag !== undefined && stored.eTag === r.eTag)) {
+          // Changed here since the snapshot, and not to this very version.
+          leftOut.add(id);
+        }
+        if (--undecided === 0) theRest();
       };
     }
   });
-  return { written, added };
+  return { written, added, leftOut };
 }
 
 /** Where a scope keeps its unsettled arrivals (see DropCommit.arrivalCandidates). */
