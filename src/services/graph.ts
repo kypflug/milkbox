@@ -523,9 +523,11 @@ export class DropGoneError extends Error {
  *   none the write is a create, so performOp sends no private edit that
  *   way, and reads a version for one that has none (currentDropETag);
  * - chat: strictly conditional — 412/404 becomes DropConflictError so a
- *   queued edit can never recreate a drop another member deleted. Except a
- *   412 for a write that turns out to have landed already (landedWrite),
- *   which is that write's success.
+ * - chat: strictly conditional — 412/404 becomes DropConflictError so a
+ *   queued edit can never recreate a drop another member deleted. Only with
+ *   an eTag, though: without one this is a create, so the caller sends no
+ *   chat edit that has none. And a 412 for a write that turns out to have
+ *   landed already (landedWrite) is that write's success, not a conflict.
  */
 export async function putDropJson(
   scope: Scope,

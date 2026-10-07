@@ -37,9 +37,11 @@ import { errorLabel, newPassCounts, recordPass, requestCount, type PassStats } f
 import { PENDING_ACTION_KEY, type PendingAction } from './pending-actions';
 import {
   deferRegistryOp,
+  dueRegistryOp,
   enqueueRegistryOp,
   getRegistryOutbox,
   hasPendingRegistryOp,
+  holdRegistryOp,
   registryOpWrites,
   removeRegistryOp,
   type NewRegistryOp,
@@ -319,8 +321,14 @@ export async function enqueueEdit(scope: Scope, meta: DropMeta): Promise<void> {
   // The row that sends the edit and the local copy that shows it at once
   // are written together or not at all (db.queueEdit): the editor is told
   // "not saved" only when nothing was queued.
-  if (!(await db.queueEdit(scopeRefOf(scope), meta))) {
-    throw await chatRefusal(scope, 'your edit was not saved');
+  const outcome = await db.queueEdit(scopeRefOf(scope), meta);
+  if (outcome === 'refused') throw await chatRefusal(scope, 'your edit was not saved');
+  // A chat's edit that could only go out with no condition is never sent
+  // (performOp), so it is not queued: said here, the editor still holds
+  // what was typed.
+  if (outcome === 'missing') throw new Error('This drop has been removed — your edit was not saved.');
+  if (outcome === 'unversioned') {
+    throw new Error('This drop hasn’t finished syncing — your edit was not saved. Try again in a moment.');
   }
   emit({ type: 'feed-updated', scopeId });
   void drainOutbox(scopeId);
@@ -824,6 +832,15 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
   const stillCurrent = async () => {
     if (!(await db.hasOutboxRecord(record))) throw new SendWithdrawnError();
   };
+  // A chat's edit can have neither. Its row records no version — it was
+  // queued by a build that kept none, or with no copy held (db.queueEdit
+  // turns those away now) — and the copy is gone, removed by a pass, or is
+  // held with no eTag. Such an edit is not sent. The PUT is by path, and
+  // with no condition it creates the file when there is none: a drop
+  // another member deleted would be back for everyone, with the edited
+  // text. It ends as the conflict the server would have answered with
+  // (processOutboxRecord): the row goes, and nothing is tried again.
+  if (record.op === 'edit' && scope.kind === 'chat' && !ifMatch) throw new graph.DropConflictError(meta.id);
   // A private edit can have neither. Its row records no version — it was
   // queued with no copy held (the editor was open while a pass removed the
   // drop), or by a build that kept none — and the copy is gone, or is held
@@ -2071,11 +2088,29 @@ export async function joinChat(shareToken: string): Promise<ChatRecord> {
   };
 
   if (!isOwnChat) {
+    // An earlier leave of this chat may still have its member-file removal
+    // queued: the device was offline, OneDrive refused, or the share grant
+    // had lapsed, which parks the op until the grant is back — as it now
+    // is. The file it removes is the one written next, and nothing writes
+    // that file a second time: sent after this, it would leave the account
+    // in the chat and off everyone's roster. The put-pointer below cancels
+    // it for good. Until then it is held back, so that no drain reading the
+    // queue from here on, in this tab or another, sends it behind the
+    // write. Held and not yet cancelled, because the write can fail, and
+    // then the leave stands and its removal is still owed.
+    await holdRegistryOp('delete-member', joining.id, Date.now() + MEMBER_WRITE_HOLD_MS);
+    // A drain already under way here may have read the queue before that,
+    // and have the removal on the wire: its requests end first, whichever
+    // way, so the write cannot overtake one. Waited for whether or not a
+    // removal was found queued. Another tab sending the same one can have
+    // finished first and taken the row, with this tab's request still out.
+    await registryDrain;
     await chatsApi.putMemberSelf(joining, { v: 1, id: me.id, name: me.name, joinedAt, updatedAt: joinedAt });
     // Roaming pointer in our own approot, so the chat follows the account
     // to its other devices. Queued before the local record exists: the
     // registry reconcile never removes a chat whose pointer is still on its
-    // way, and the drain below retries until OneDrive has it.
+    // way, and the drain below retries until OneDrive has it. Recording it
+    // takes back what an earlier leave left queued (see registryOpWrites).
     await enqueueRegistryOp({
       op: 'put-pointer',
       chatId: joining.id,
@@ -2194,10 +2229,19 @@ export async function removeChatLocally(chatId: string, only?: { generation: str
 
 // ─── registry outbox drain ───
 
-let drainingRegistry = false;
+/** The drain under way, if one is — for a write that has to come after its requests (see joinChat). Never rejects. */
+let registryDrain: Promise<void> | null = null;
 let drainRegistryAgain = false;
 const REGISTRY_BACKOFF_BASE_MS = 5_000;
 const REGISTRY_BACKOFF_CAP_MS = 30 * 60_000;
+/**
+ * How long a join keeps an earlier leave's member-file removal from being
+ * sent while it writes that file (see joinChat). Well past what the wait
+ * for a drain under way and the write itself can take, each request of
+ * which is cut off at 20 s. It is also how much longer that removal waits
+ * when the join fails.
+ */
+const MEMBER_WRITE_HOLD_MS = 5 * 60_000;
 
 /**
  * Drain the registry outbox, then reconcile the registry — the pair every
@@ -2244,29 +2288,46 @@ async function performRegistryOp(entry: RegistryOp): Promise<void> {
  * being dropped, so a fresh intent never waits for the next poll tick.
  * Never rejects — a storage failure is logged and the caller carries on.
  */
-export async function drainRegistryOutbox(): Promise<void> {
-  if (drainingRegistry) {
+export function drainRegistryOutbox(): Promise<void> {
+  if (registryDrain) {
     drainRegistryAgain = true;
-    return;
+    return Promise.resolve();
   }
-  drainingRegistry = true;
-  try {
-    do {
-      drainRegistryAgain = false;
-      await drainRegistryOnce();
-    } while (drainRegistryAgain);
-  } catch (err) {
-    console.warn('[Chats] Registry outbox drain failed:', err);
-  } finally {
-    drainingRegistry = false;
-  }
+  registryDrain = (async () => {
+    try {
+      do {
+        drainRegistryAgain = false;
+        await drainRegistryOnce();
+      } while (drainRegistryAgain);
+    } catch (err) {
+      console.warn('[Chats] Registry outbox drain failed:', err);
+    } finally {
+      registryDrain = null;
+    }
+  })();
+  return registryDrain;
 }
 
 async function drainRegistryOnce(): Promise<void> {
   const now = Date.now();
   if (now < throttledUntil) return;
-  for (const entry of await getRegistryOutbox()) {
-    if (entry.nextAt > now) continue;
+  for (const listed of await getRegistryOutbox()) {
+    if (listed.nextAt > now) continue;
+    // The queue was listed before the requests this loop has made since.
+    // An op cancelled meanwhile (a join takes back a leave's ops, a leave a
+    // join's), landed by another tab, or held back is not sent from that
+    // earlier reading: what is queued now is what is sent.
+    const entry = await dueRegistryOp(listed.op, listed.chatId, now);
+    if (!entry) continue;
+    // A member file is not removed for a chat this device holds. The
+    // removal was queued by a leave, and the chat is here again without a
+    // join made here having cancelled it: joined again on another device,
+    // and found by the registry pass. The account has one member file per
+    // chat, whichever device wrote it, so sending this now would take a
+    // member off the roster. Skipped, not dropped: should the chat turn
+    // out not to be the account's after all and go again, the removal is
+    // still owed.
+    if (entry.op === 'delete-member' && (await db.getChat(entry.chatId))) continue;
     try {
       await performRegistryOp(entry);
       await removeRegistryOp(entry.op, entry.chatId);

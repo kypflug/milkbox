@@ -684,9 +684,12 @@ export function putOutboxRecord(ref: ScopeRef, record: Omit<OutboxRecord, 'token
   });
 }
 
+/** What queueEdit did with an edit. Anything but 'queued' wrote nothing. */
+export type QueueEditOutcome = 'queued' | 'refused' | 'missing' | 'unversioned';
+
 /**
  * Queue an edit and show it at once: the outbox row that sends it and the
- * edited local copy, in one transaction. Resolves false, writing neither,
+ * edited local copy, in one transaction. Resolves 'refused', writing neither,
  * when `ref` is not the stay held; rejects, writing neither, when this
  * page's store has been superseded.
  *
@@ -702,11 +705,26 @@ export function putOutboxRecord(ref: ScopeRef, record: Omit<OutboxRecord, 'token
  * discard to restore. A second edit before the first lands inherits the
  * first one's original exactly — including none at all, if an older build
  * queued it. Both are read here, inside the transaction, so they are the
- * versions this edit replaces. A drop that is not stored gets no local
- * copy, only the row.
+ * versions this edit replaces. In the private feed a drop that is not
+ * stored gets no local copy, only the row.
+ *
+ * A chat's edit is sent only as a change to a version this device knows:
+ * the eTag of the copy held, or failing that the one the row records (see
+ * the coordinator's performOp). An edit with neither would never be sent,
+ * so it is not queued either, and the editor hears of it while what was
+ * typed is still in it. Neither means no eTag on the copy and none
+ * inherited from an edit already queued, and then:
+ * - 'missing': the drop is not stored. It was removed while its editor was
+ *   open — a pass found it deleted, or its own delete went through in
+ *   another tab — and the card was still on screen.
+ * - 'unversioned': it is stored, with no eTag. That is how a discard leaves
+ *   it when it has no original to restore (discardOutboxRecord's
+ *   'invalidated'), until a pass has stored the server's version again.
  */
-export function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<boolean> {
-  return writeForScope(ref, ['outbox', 'drops'], t => {
+export async function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<QueueEditOutcome> {
+  const conditional = ref.scopeId.startsWith('chat:');
+  let outcome: QueueEditOutcome = 'refused';
+  await writeForScope(ref, ['outbox', 'drops'], t => {
     const outbox = t.objectStore('outbox');
     const drops = t.objectStore('drops');
     const queued = outbox.get(meta.id) as IDBRequest<OutboxRecord | undefined>;
@@ -715,6 +733,11 @@ export function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<boolean> {
       stored.onsuccess = () => {
         const earlier = queued.result?.op === 'edit' ? queued.result : undefined;
         const held = stored.result;
+        const prevETag = earlier ? earlier.prevETag : held?.eTag;
+        if (conditional && !(held?.eTag ?? prevETag)) {
+          outcome = held ? 'unversioned' : 'missing';
+          return;
+        }
         // Its own token, not the earlier edit's: a drain still holding that
         // one must find the row is no longer its to update or remove.
         outbox.put(
@@ -726,13 +749,15 @@ export function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<boolean> {
             state: 'queued',
             scopeId: ref.scopeId,
             prevMeta: earlier ? earlier.prevMeta : held?.meta,
-            prevETag: earlier ? earlier.prevETag : held?.eTag,
+            prevETag,
           }),
         );
         if (held) drops.put({ ...held, meta } satisfies StoredDropRecord);
+        outcome = 'queued';
       };
     };
   });
+  return outcome;
 }
 
 /**
