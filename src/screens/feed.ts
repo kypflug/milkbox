@@ -1001,6 +1001,9 @@ export async function renderFeed(
       case 'drop-conflict':
         showToast('A drop you changed was edited or removed by someone else', 'error');
         break;
+      case 'drop-gone':
+        showToast('A drop you edited was deleted on another device', 'error');
+        break;
       case 'drop-progress': {
         const bar = listEl.querySelector<HTMLElement>(
           `[data-drop-id="${CSS.escape(event.dropId)}"] .drop-image-progress`,

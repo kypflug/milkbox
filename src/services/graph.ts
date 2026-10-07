@@ -446,14 +446,30 @@ export class DropConflictError extends Error {
 }
 
 /**
+ * Thrown when a private-feed edit finds its drop gone — deleted on another
+ * device while the edit waited to be sent. Terminal, like a chat's conflict:
+ * the delete stands, and the caller drops the queued edit.
+ */
+export class DropGoneError extends Error {
+  constructor(public dropId: string) {
+    super(`Drop ${dropId} was deleted`);
+  }
+}
+
+/**
  * Upload a drop's JSON. Path-based PUT auto-creates the drops/ folder (and
  * the approot itself) on first write. Pass eTag for a conditional write on
  * edits. Conflict handling differs by scope:
- * - private: retry once unconditionally — the data is single-user, conflicts
- *   are self-races, last write wins. `beforeRetry` is awaited first, and
- *   calls the retry off by throwing: the write that lost can have been out
- *   for a long time, and what it lost to may be the caller's own newer write
- *   (see performOp), which last-write-wins would undo;
+ * - private: write once more, last write wins — the data is single-user,
+ *   conflicts are self-races — but only over a drop that is still there.
+ *   The second write is conditional too, on the version OneDrive holds by
+ *   then, read for the purpose: sent with no condition it would create the
+ *   file, and an edit must not bring back a drop that has been deleted.
+ *   With no version to write over, the edit ends in DropGoneError.
+ *   `beforeRetry` is awaited before that second write, and calls it off by
+ *   throwing: the write that lost can have been out for a long time, and
+ *   what it lost to may be the caller's own newer write (see performOp),
+ *   which last-write-wins would undo;
  * - chat: strictly conditional — 412/404 becomes DropConflictError so a
  *   queued edit can never recreate a drop another member deleted.
  */
@@ -466,26 +482,39 @@ export async function putDropJson(
   const ref = scopeRef(scope);
   const tier = scopeTier(scope);
   const body = JSON.stringify(meta, null, 2);
-  const doPut = (conditional: boolean) =>
+  const doPut = (ifMatch?: string) =>
     graphFetch(contentUrl(ref, dropJsonPath(meta.id)), {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
-        ...(conditional && eTag ? { 'If-Match': eTag } : {}),
+        ...(ifMatch ? { 'If-Match': ifMatch } : {}),
       },
       body,
     }, tier);
 
   try {
-    const res = await doPut(true);
+    const res = await doPut(eTag);
     const item = await res.json();
     return item.eTag as string | undefined;
   } catch (err) {
     if (err instanceof GraphHttpError && (err.status === 412 || (eTag !== undefined && err.status === 404))) {
       if (scope.kind === 'chat') throw new DropConflictError(meta.id);
+      // A write sent with no condition (a create) has none to lose. Its
+      // failure is an ordinary one, not a reason to look for a version to
+      // write over — or to conclude, finding none, that the drop was deleted.
+      if (eTag === undefined) throw err;
+      const current = await currentDropETag(scope, meta.id);
+      // Asked after the read, not before: the read is a request too, and can
+      // be out as long as the first write was. Whatever the caller sends
+      // from here on lands after the read. If it lands before this write,
+      // the drop has moved on from the version the condition names, and
+      // this write fails rather than replace it.
       await beforeRetry?.();
+      if (current === null) throw new DropGoneError(meta.id);
       console.debug('[Graph] eTag conflict on %s — retrying last-write-wins', meta.id);
-      const res = await doPut(false);
+      // If this one loses as well, that is the caller's ordinary failure:
+      // its next attempt starts over from the first write.
+      const res = await doPut(current);
       const item = await res.json();
       return item.eTag as string | undefined;
     }
@@ -504,6 +533,24 @@ export async function hasDropJson(scope: Scope, id: string): Promise<boolean> {
     return true;
   } catch (err) {
     if (isGoneError(err)) return false;
+    throw err;
+  }
+}
+
+/**
+ * The eTag a drop's JSON is at now, or null when the scope holds none. As
+ * with hasDropJson, only a 404 says that: every other failure throws.
+ */
+async function currentDropETag(scope: Scope, id: string): Promise<string | null> {
+  try {
+    const res = await graphFetch(`${itemByPathUrl(scopeRef(scope), dropJsonPath(id))}?$select=eTag`, undefined, scopeTier(scope));
+    const item = await res.json();
+    // An answer without one must not pass for a condition: sent with none,
+    // the write this is read for would create the file.
+    if (typeof item.eTag !== 'string' || !item.eTag) throw new Error(`No eTag for drop ${id}`);
+    return item.eTag;
+  } catch (err) {
+    if (isGoneError(err)) return null;
     throw err;
   }
 }
