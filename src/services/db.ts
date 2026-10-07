@@ -631,13 +631,29 @@ export function getOutbox(): Promise<OutboxRecord[]> {
 }
 
 /**
- * Queue a record for the scope `ref` names. Resolves false, writing nothing,
- * for a chat that has left this device (or is no longer the stay `ref` was
- * resolved from).
+ * A record as it is queued: under a token of its own. Rows are keyed by drop
+ * id, so queueing replaces whatever is queued for the same drop, and the
+ * token is all that tells this record from the one it replaced.
  */
-export function putOutboxRecord(ref: ScopeRef, record: OutboxRecord): Promise<boolean> {
+function asQueued(record: Omit<OutboxRecord, 'token'>): OutboxRecord {
+  return { ...record, token: crypto.randomUUID() };
+}
+
+/** Whether the row stored under a record's id is still that record's own. */
+function isSameQueueing(held: OutboxRecord | undefined, record: Pick<OutboxRecord, 'token'>): held is OutboxRecord {
+  // Rows from before tokens carry none, and so match each other as they did.
+  return held !== undefined && held.token === record.token;
+}
+
+/**
+ * Queue a record for the scope `ref` names, replacing whatever is queued for
+ * the same drop (see asQueued). Resolves false, writing nothing, for a chat
+ * that has left this device (or is no longer the stay `ref` was resolved
+ * from).
+ */
+export function putOutboxRecord(ref: ScopeRef, record: Omit<OutboxRecord, 'token'>): Promise<boolean> {
   return writeForScope(ref, ['outbox'], t => {
-    t.objectStore('outbox').put(record);
+    t.objectStore('outbox').put(asQueued(record));
   });
 }
 
@@ -672,16 +688,20 @@ export function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<boolean> {
       stored.onsuccess = () => {
         const earlier = queued.result?.op === 'edit' ? queued.result : undefined;
         const held = stored.result;
-        outbox.put({
-          id: meta.id,
-          meta,
-          op: 'edit',
-          attempts: 0,
-          state: 'queued',
-          scopeId: ref.scopeId,
-          prevMeta: earlier ? earlier.prevMeta : held?.meta,
-          prevETag: earlier ? earlier.prevETag : held?.eTag,
-        } satisfies OutboxRecord);
+        // Its own token, not the earlier edit's: a drain still holding that
+        // one must find the row is no longer its to update or remove.
+        outbox.put(
+          asQueued({
+            id: meta.id,
+            meta,
+            op: 'edit',
+            attempts: 0,
+            state: 'queued',
+            scopeId: ref.scopeId,
+            prevMeta: earlier ? earlier.prevMeta : held?.meta,
+            prevETag: earlier ? earlier.prevETag : held?.eTag,
+          }),
+        );
         if (held) drops.put({ ...held, meta } satisfies StoredDropRecord);
       };
     };
@@ -693,15 +713,18 @@ export function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<boolean> {
  * when it no longer is. A drain can sit in a retry backoff for seconds: if
  * the send was cancelled meanwhile, or its chat removed (which deletes its
  * rows), the drain must find that out here — in any tab, and even if the
- * chat has been joined again since — and not put the row back.
+ * chat has been joined again since — and not put the row back. Nor may it
+ * write over a newer edit or delete queued for the same drop in that time:
+ * the row has to be the one this record was read from, not just one with
+ * its id.
  */
 export async function updateOutboxRecord(ref: ScopeRef, record: OutboxRecord): Promise<boolean> {
   let updated = false;
   await writeForScope(ref, ['outbox'], t => {
     const store = t.objectStore('outbox');
-    const held = store.getKey(record.id);
+    const held = store.get(record.id) as IDBRequest<OutboxRecord | undefined>;
     held.onsuccess = () => {
-      if (held.result === undefined) return;
+      if (!isSameQueueing(held.result, record)) return;
       store.put(record);
       updated = true;
     };
@@ -718,25 +741,34 @@ export type DiscardOutcome = 'gone' | 'removed' | 'restored' | 'kept' | 'invalid
  * server's eTag, no sync pass would ever correct the drop.
  *
  * - 'restored' / 'kept': the edit kept the version it was made on
- *   (prevMeta). That version is put back — unless a pass has since stored a
- *   newer one (the eTag moved on), which is the server's truth and stays.
+ *   (prevMeta). That version is put back — unless a newer one has been
+ *   stored since (a pass brought it, or an edit this one was queued over
+ *   landed after all): the eTag moved on, and that is the server's truth
+ *   and stays.
  * - 'invalidated': it kept none (it was queued by an older build). The
  *   drop's eTag is cleared, so it stops matching the server's, and the
  *   setting under `invalidateKey` — the scope's delta token — is deleted,
  *   so that the next pass enumerates everything and downloads the real
  *   version.
  * - 'removed': there was nothing to undo (not an edit, or no local copy).
- * - 'gone': no such record in this scope, or `ref` is not the stay held;
- *   nothing was touched.
+ * - 'gone': the record is no longer queued in this scope, or `ref` is not
+ *   the stay held; nothing was touched. That includes a row under the same
+ *   drop id that is another queueing by now (see updateOutboxRecord): only
+ *   the record `discarded` names goes, the one its card was showing.
  */
-export async function discardOutboxRecord(ref: ScopeRef, id: string, invalidateKey: string): Promise<DiscardOutcome> {
+export async function discardOutboxRecord(
+  ref: ScopeRef,
+  discarded: OutboxRecord,
+  invalidateKey: string,
+): Promise<DiscardOutcome> {
+  const { id } = discarded;
   let outcome: DiscardOutcome = 'gone';
   await writeForScope(ref, ['outbox', 'drops', 'settings'], t => {
     const outbox = t.objectStore('outbox');
     const queued = outbox.get(id) as IDBRequest<OutboxRecord | undefined>;
     queued.onsuccess = () => {
       const record = queued.result;
-      if (!record || (record.scopeId ?? 'private') !== ref.scopeId) return;
+      if (!isSameQueueing(record, discarded) || (record.scopeId ?? 'private') !== ref.scopeId) return;
       outbox.delete(id);
       outcome = 'removed';
       if (record.op !== 'edit') return;
@@ -763,25 +795,39 @@ export async function discardOutboxRecord(ref: ScopeRef, id: string, invalidateK
   return outcome;
 }
 
-export async function hasOutboxRecord(id: string): Promise<boolean> {
-  return (await tx('outbox', 'readonly', s => s.getKey(id))) !== undefined;
+/** Whether this record is still queued, as itself (see updateOutboxRecord). */
+export async function hasOutboxRecord(record: OutboxRecord): Promise<boolean> {
+  const held = await tx('outbox', 'readonly', s => s.get(record.id) as IDBRequest<OutboxRecord | undefined>);
+  return isSameQueueing(held, record);
 }
 
+/** Remove whatever is queued for a drop: a send cancelled before it landed. */
 export function deleteOutboxRecord(id: string): Promise<void> {
   return tx('outbox', 'readwrite', s => { s.delete(id); });
 }
 
 /**
- * Remove a record whose send has ended — from the stay the send was made
- * in, and no other. Rows are keyed by drop id: after a chat has been left
- * and joined again, the row under that id can be one the new stay queued
- * for the same drop, which an earlier stay's send must not take with it.
- * Resolves false when `ref` is not the stay held.
+ * Remove a record whose send has ended — its own row, from the stay the
+ * send was made in, and no other. Rows are keyed by drop id, so the row
+ * under that id can by now be someone else's: a newer edit or delete queued
+ * for the same drop, which has not been sent and would be lost without a
+ * trace; or, after a chat has been left and joined again, one the new stay
+ * queued, which an earlier stay's send must not take with it. Checked and
+ * removed in one transaction. Resolves false, removing nothing, when the
+ * row is no longer this record's or `ref` is not the stay held.
  */
-export function removeOutboxRecord(ref: ScopeRef, id: string): Promise<boolean> {
-  return writeForScope(ref, ['outbox'], t => {
-    t.objectStore('outbox').delete(id);
+export async function removeOutboxRecord(ref: ScopeRef, record: OutboxRecord): Promise<boolean> {
+  let removed = false;
+  await writeForScope(ref, ['outbox'], t => {
+    const store = t.objectStore('outbox');
+    const held = store.get(record.id) as IDBRequest<OutboxRecord | undefined>;
+    held.onsuccess = () => {
+      if (!isSameQueueing(held.result, record)) return;
+      store.delete(record.id);
+      removed = true;
+    };
   });
+  return removed;
 }
 
 // ─── device profiles ───

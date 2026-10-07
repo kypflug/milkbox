@@ -72,6 +72,14 @@ export interface DropRecord {
 /** A queued outgoing drop, persisted so uploads survive reloads. */
 export interface OutboxRecord {
   id: string;
+  /**
+   * Which queueing of this drop the row is, minted as it is queued. Rows are
+   * keyed by drop id, so an edit or delete queued over an unfinished send
+   * takes its place under the same key — and a drain still holding the
+   * earlier record must not write that back, or remove the newer row as
+   * sent. Absent on rows from older builds, which match only each other.
+   */
+  token?: string;
   meta: DropMeta;
   /** File payload for file/image drops. */
   blob?: Blob;

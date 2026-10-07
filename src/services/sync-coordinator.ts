@@ -340,6 +340,7 @@ export async function retryOutboxRecord(id: string): Promise<void> {
   const scopeId = record.scopeId ?? PRIVATE_SCOPE_ID;
   const scope = await resolveScope(scopeId);
   if (!scope) return;
+  // The same send, tried again: it keeps its token.
   await db.updateOutboxRecord(scopeRefOf(scope), { ...record, attempts: 0, state: 'queued' });
   emit({ type: 'feed-updated', scopeId });
   void drainOutbox(scopeId);
@@ -366,7 +367,9 @@ export async function discardOutboxRecord(id: string): Promise<void> {
     return;
   }
   const ref = scopeRefOf(scope);
-  const discard = () => db.discardOutboxRecord(ref, id, graph.deltaTokenKey(scope));
+  // Only the send the card was showing. One queued over it since (from
+  // another tab) was never offered for discarding, and stays.
+  const discard = () => db.discardOutboxRecord(ref, record, graph.deltaTokenKey(scope));
 
   if (record.op === 'edit' && !record.prevMeta) {
     // An edit queued by an older build kept no original to restore. The
@@ -418,7 +421,10 @@ const drainingScopes = new Set<ScopeId>();
 /** Asked to drain while a drain was running — go round once more. */
 const drainAgainScopes = new Set<ScopeId>();
 
-/** The outbox row vanished mid-send: cancelled, or its chat left this device. */
+/**
+ * The outbox row stopped being this send's mid-send: cancelled, its chat
+ * left this device, or a later edit or delete was queued in its place.
+ */
 class SendWithdrawnError extends Error {}
 
 /**
@@ -455,16 +461,23 @@ export async function drainOutbox(scopeId: ScopeId): Promise<void> {
 }
 
 /**
- * Send one record, retrying with backoff. The record's row in the outbox
- * (matched by drop id) is what keeps the send alive: it is only ever updated
- * here, never re-created. Once the row is gone — the send was cancelled, or
- * its chat left this device, in this tab or another — no further attempt is
- * made and no state is written back for it. A request or file upload already
- * under way is left to finish; see performOp for what happens after one.
+ * Send one record, retrying with backoff. The record's row in the outbox is
+ * what keeps the send alive: it is only ever updated here, never re-created.
+ * The row is this record's while it carries the same token, not merely the
+ * same drop id — an edit or delete queued for the drop meanwhile replaces it
+ * under that id. Once the row is no longer this record's — the send was
+ * cancelled, its chat left this device, or it was queued over, in this tab
+ * or another — no further attempt is made, no state is written back for it,
+ * and the row now there is neither overwritten nor removed. A request or
+ * file upload already under way is left to finish; see performOp for what
+ * happens after one.
  */
 async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<void> {
   const scopeId = scopeIdOf(scope);
   const ref = scopeRefOf(scope);
+  // The row is no longer this record's — withdrawn or queued over, perhaps
+  // from another tab, so this one's feed may still show the card as sending.
+  const stop = () => emit({ type: 'feed-updated', scopeId });
   let attempts = record.attempts;
   while (attempts < MAX_ATTEMPTS) {
     try {
@@ -473,14 +486,14 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       // would revert the row's attempts/state mid-flight.
       record.attempts = attempts;
       record.state = 'sending';
-      if (!(await db.updateOutboxRecord(ref, { ...record }))) {
-        // Withdrawn, perhaps from another tab: this one's feed may still
-        // show the card as sending.
-        emit({ type: 'feed-updated', scopeId });
-        return;
-      }
+      if (!(await db.updateOutboxRecord(ref, { ...record }))) return stop();
       await performOp(scope, record);
-      await db.removeOutboxRecord(ref, record.id);
+      // Sent — and the row goes only if it is still this send's. A request
+      // can outlast its record: an edit that stalls, then lands after the
+      // drop's delete was queued in its place. That newer row stays: whoever
+      // queued it asked for a drain too — this one, which then goes round
+      // again, or the other tab's own.
+      await db.removeOutboxRecord(ref, record);
       emit({ type: 'feed-updated', scopeId });
       postBroadcast({
         type: 'drop-mutated',
@@ -490,16 +503,15 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       });
       return;
     } catch (err) {
-      if (err instanceof SendWithdrawnError) {
-        emit({ type: 'feed-updated', scopeId });
-        return;
-      }
+      if (err instanceof SendWithdrawnError) return stop();
       if (err instanceof graph.DropConflictError) {
         // The drop changed or was removed remotely — never retry (a retry
         // would resurrect what another member deleted). Remote wins; the
         // next sync pass reconciles the local record. (Nothing to report if
-        // the chat has been left since: the conflict was an earlier stay's.)
-        const ended = await db.removeOutboxRecord(ref, record.id);
+        // the chat has been left since: the conflict was an earlier stay's.
+        // Nor if the edit has been queued over: the newer record gets its
+        // own answer from the server.)
+        const ended = await db.removeOutboxRecord(ref, record);
         if (ended) emit({ type: 'drop-conflict', scopeId, dropId: record.id });
         emit({ type: 'feed-updated', scopeId });
         return;
@@ -515,7 +527,7 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       if (attempts >= MAX_ATTEMPTS) {
         record.attempts = attempts;
         record.state = 'failed';
-        await db.updateOutboxRecord(ref, { ...record });
+        if (!(await db.updateOutboxRecord(ref, { ...record }))) return stop();
         emit({ type: 'feed-updated', scopeId });
         return;
       }
@@ -559,7 +571,7 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
     // visible to everyone else: it is not written for a send that has since
     // been withdrawn. The uploaded file is left where it is — the row is
     // also gone when another tab has just finished sending this same drop.
-    if (!(await db.hasOutboxRecord(record.id))) throw new SendWithdrawnError();
+    if (!(await db.hasOutboxRecord(record))) throw new SendWithdrawnError();
   }
 
   // An edit is conditional on the version it replaces: the eTag the local
