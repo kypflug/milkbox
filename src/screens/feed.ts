@@ -40,14 +40,20 @@ let teardownFns: Array<() => void> = [];
 let composerApi: ComposerApi | null = null;
 let settingsFlyoutApi: SettingsFlyoutApi | null = null;
 
-/** Object URLs for thumbnails, keyed by `${scopeId}/${dropId}` — survive re-renders. */
+/**
+ * Object URLs for thumbnails — survive re-renders. Keyed, like the two maps
+ * below, by the drop within the scope and, for a chat, within the stay the
+ * screen was opened on (see `mkey` in renderFeed): these outlive the screen
+ * that filled them, and a chat left and joined again is a later stay, whose
+ * screen must not be handed what an earlier one fetched or is still fetching.
+ */
 const thumbUrls = new Map<string, string>();
 /** Preview downloads in flight, keyed like thumbUrls — a re-render mid-download
  *  waits on the same request instead of starting another. */
 const thumbInFlight = new Map<string, Promise<Blob | undefined>>();
 /** Previews compete with sync for the connection, so only a few at a time. */
 const thumbLimiter = createLimiter(3);
-/** Drops whose delete is pending the undo window, keyed by `${scopeId}/${dropId}`. */
+/** Drops whose delete is pending the undo window, keyed like thumbUrls. */
 const pendingDeletes = new Map<string, ReturnType<typeof setTimeout>>();
 /**
  * An unconfirmed share-target payload. Scope switches re-mount the composer,
@@ -135,7 +141,23 @@ export async function renderFeed(
   /** The list markup on screen. A refresh that would rebuild the same list
    *  (older drops landing below the visible window) leaves it alone. */
   let renderedHtml = '';
-  const mkey = (id: string) => `${scopeId}/${id}`;
+  // The key of a drop in the maps that outlive this screen (thumbUrls and
+  // the two beside it). For a chat it names the stay as well as the scope:
+  // a preview request still running for an earlier stay was made with that
+  // stay's scope and its cache write is refused, so the screen of a later
+  // one asks for its own instead of waiting on it.
+  const stayKey = scope.kind === 'chat' ? `${scopeId}@${scope.generation ?? ''}` : scopeId;
+  const mkey = (id: string) => `${stayKey}/${id}`;
+  if (scope.kind === 'chat') {
+    // Previews drawn on an earlier stay of this chat: no screen will ask for
+    // them again, and the screen that showed them is gone. Let them go.
+    for (const [key, url] of thumbUrls) {
+      if (key.startsWith(`${scopeId}@`) && !key.startsWith(`${stayKey}/`)) {
+        URL.revokeObjectURL(url);
+        thumbUrls.delete(key);
+      }
+    }
+  }
 
   // Author identity for chat attribution. Resolved from IDB after the first
   // ever fetch; for the private feed it's never awaited on the render path.
@@ -390,7 +412,9 @@ export async function renderFeed(
           scheduleThumbRetry();
         }
       }
-      if (blob) {
+      // Not for a screen that has gone meanwhile: nothing would show the
+      // URL, and it would sit in the map under this screen's key.
+      if (blob && listEl.isConnected) {
         // Two cards waiting on one download share one object URL.
         let url = thumbUrls.get(mkey(id));
         if (!url) {
@@ -613,7 +637,10 @@ export async function renderFeed(
       onClick: () => {
         clearTimeout(timer);
         pendingDeletes.delete(mkey(id));
-        void refresh();
+        // The toast outlives this screen: if the scope has been drawn again
+        // since, that screen is the one hiding the drop, and is told.
+        if (listEl.isConnected) void refresh();
+        else coordinator.refreshFromCache(scopeId);
       },
     });
   }
