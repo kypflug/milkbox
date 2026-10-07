@@ -446,13 +446,59 @@ export class DropConflictError extends Error {
 }
 
 /**
+ * A chat edit was answered 412: is the version that refused it this very
+ * write, landed on an earlier attempt?
+ *
+ * A PUT can be applied and its response never arrive — the connection
+ * drops, iOS suspends the app, the request's time limit fires. The retry
+ * then names the eTag its own first attempt replaced, and is refused. Taken
+ * for a conflict, that tells the user someone else changed a drop that holds
+ * exactly what they wrote, and leaves the local copy at the replaced eTag,
+ * where their next edit of it is refused as well. (Two tabs sending the same
+ * queued edit at once come to the same thing: the drive takes one and
+ * refuses the other.)
+ *
+ * Resolves the eTag the drop is held at when its JSON is exactly the `body`
+ * that was sent: the edit is on the drive, whichever request put it there.
+ * Resolves null when the drive holds anything else, or nothing — that is
+ * the conflict. It only reads, so it cannot bring back a drop another member
+ * deleted. A read that fails throws like any request; the caller's next
+ * attempt is refused again and asks again.
+ *
+ * The eTag is read first, the body second. The other way round, a change
+ * landing between the two would pair this device's text with the eTag of
+ * somebody else's version, and no pass would ever download that version: it
+ * skips what it holds by eTag. This way round the same change shows in the
+ * body, as the conflict it is, and one landing just after the body leaves
+ * the local copy at an eTag already replaced, which the next pass corrects.
+ */
+async function landedWrite(scope: Scope, id: string, body: string): Promise<{ eTag?: string } | null> {
+  const ref = scopeRef(scope);
+  const tier = scopeTier(scope);
+  const path = dropJsonPath(id);
+  let item: JsonItem & { eTag?: string };
+  try {
+    const res = await graphFetch(`${itemByPathUrl(ref, path)}?$select=id,eTag,@microsoft.graph.downloadUrl`, undefined, tier);
+    item = await res.json();
+  } catch (err) {
+    // Removed since the 412.
+    if (isGoneError(err)) return null;
+    throw err;
+  }
+  const held = await downloadItemJson(item, contentUrl(ref, path), tier);
+  return JSON.stringify(held, null, 2) === body ? { eTag: item.eTag } : null;
+}
+
+/**
  * Upload a drop's JSON. Path-based PUT auto-creates the drops/ folder (and
  * the approot itself) on first write. Pass eTag for a conditional write on
  * edits. Conflict handling differs by scope:
  * - private: retry once unconditionally — the data is single-user, conflicts
  *   are self-races, last write wins;
  * - chat: strictly conditional — 412/404 becomes DropConflictError so a
- *   queued edit can never recreate a drop another member deleted.
+ *   queued edit can never recreate a drop another member deleted. Except a
+ *   412 for a write that turns out to have landed already (landedWrite),
+ *   which is that write's success.
  */
 export async function putDropJson(scope: Scope, meta: DropMeta, eTag?: string): Promise<string | undefined> {
   const ref = scopeRef(scope);
@@ -474,7 +520,13 @@ export async function putDropJson(scope: Scope, meta: DropMeta, eTag?: string): 
     return item.eTag as string | undefined;
   } catch (err) {
     if (err instanceof GraphHttpError && (err.status === 412 || (eTag !== undefined && err.status === 404))) {
-      if (scope.kind === 'chat') throw new DropConflictError(meta.id);
+      if (scope.kind === 'chat') {
+        // Only a 412 is looked into. A 404 says the drop is gone, which
+        // nothing this device sent can account for.
+        const landed = err.status === 412 ? await landedWrite(scope, meta.id, body) : null;
+        if (landed) return landed.eTag;
+        throw new DropConflictError(meta.id);
+      }
       console.debug('[Graph] eTag conflict on %s — retrying last-write-wins', meta.id);
       const res = await doPut(false);
       const item = await res.json();
