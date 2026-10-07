@@ -50,6 +50,10 @@ let settingsFlyoutApi: SettingsFlyoutApi | null = null;
  * screen was opened on (see `mkey` in renderFeed): these outlive the screen
  * that filled them, and a chat left and joined again is a later stay, whose
  * screen must not be handed what an earlier one fetched or is still fetching.
+ * This one and thumbInFlight also name how many times the scope has been
+ * re-synced from scratch on this page (`pkey`): that empties the scope's
+ * stored media under a screen that stays up, and what the screen held or
+ * was fetching is from before it.
  */
 const thumbUrls = new Map<string, string>();
 /** Preview downloads in flight, keyed like thumbUrls — a re-render mid-download
@@ -225,18 +229,34 @@ export async function renderFeed(
   // a preview request still running for an earlier stay was made with that
   // stay's scope and its cache write is refused, so the screen of a later
   // one asks for its own instead of waiting on it.
-  const stayKey = scope.kind === 'chat' ? `${scopeId}@${scope.generation ?? ''}` : scopeId;
+  const stayKey = `${scopeId}@${scope.kind === 'chat' ? scope.generation ?? '' : ''}`;
   const mkey = (id: string) => `${stayKey}/${id}`;
-  if (scope.kind === 'chat') {
-    // Previews drawn on an earlier stay of this chat: no screen will ask for
-    // them again, and the screen that showed them is gone. Let them go.
+  // A preview's key also names how many times this scope has been re-synced
+  // from scratch on this page, read as the key is used: "Re-sync from
+  // scratch" empties the scope's stored media and leaves this screen up.
+  // Previews loaded before it are not shown after it, and one still
+  // downloading across it is neither shown nor stored (its cache write
+  // carries the count it was asked for under). Another scope's re-sync
+  // leaves this one's media, and this count, as they are.
+  const previewPrefix = () => `${stayKey}#${db.mediaResetCount(scopeId)}/`;
+  const pkey = (id: string) => `${previewPrefix()}${id}`;
+  /** The prefix the list on screen was drawn under; none before the first draw. */
+  let previewsDrawnFor = '';
+  /**
+   * Let go of this scope's previews held under any other stay or re-sync
+   * than `current`. Only when nothing on screen can still be using them:
+   * as this screen opens (the one that drew them is gone), and as the list
+   * is replaced after a re-sync.
+   */
+  const releasePreviewsExcept = (current: string): void => {
     for (const [key, url] of thumbUrls) {
-      if (key.startsWith(`${scopeId}@`) && !key.startsWith(`${stayKey}/`)) {
+      if (key.startsWith(`${scopeId}@`) && !key.startsWith(current)) {
         URL.revokeObjectURL(url);
         thumbUrls.delete(key);
       }
     }
-  }
+  };
+  releasePreviewsExcept(previewPrefix());
 
   // Author identity for chat attribution. Resolved from IDB after the first
   // ever fetch; for the private feed it's never awaited on the render path.
@@ -336,10 +356,21 @@ export async function renderFeed(
     // Read now, not before the awaits above — the user may have started
     // scrolling up in the meantime.
     const stick = opts.stick ?? nearBottom();
-    const rebuilt = html !== renderedHtml;
+    // The same list is drawn again all the same after a re-sync from
+    // scratch: a quick one has every drop back before this runs, and the
+    // previews on screen would be the ones from before it.
+    const prefix = previewPrefix();
+    const rebuilt = html !== renderedHtml || prefix !== previewsDrawnFor;
     if (rebuilt) {
       listEl.innerHTML = html;
       renderedHtml = html;
+      if (prefix !== previewsDrawnFor) {
+        // The list just replaced was the last to use the earlier previews.
+        // They go, and each preview has its one retry again.
+        previewsDrawnFor = prefix;
+        releasePreviewsExcept(prefix);
+        thumbRetried.clear();
+      }
       hydrateImages();
       hydrateFavicons();
     }
@@ -427,16 +458,17 @@ export async function renderFeed(
   }
 
   function loadPreview(id: string): Promise<Blob | undefined> {
-    const key = mkey(id);
+    const key = pkey(id);
     let pending = thumbInFlight.get(key);
     if (!pending) {
-      pending = fetchPreview(id).finally(() => thumbInFlight.delete(key));
+      pending = fetchPreview(id, db.mediaResetCount(scopeId)).finally(() => thumbInFlight.delete(key));
       thumbInFlight.set(key, pending);
     }
     return pending;
   }
 
-  async function fetchPreview(id: string): Promise<Blob | undefined> {
+  /** `asOf` is the scope's re-sync count as the preview is asked for: what comes back is cached only while it stands. */
+  async function fetchPreview(id: string, asOf: number): Promise<Blob | undefined> {
     const file = feed.find(r => r.meta.id === id)?.meta.file;
     const itemId = file?.itemId;
     if (!file || !itemId || coordinator.isThrottled()) return undefined;
@@ -448,14 +480,14 @@ export async function renderFeed(
         if (coordinator.isThrottled()) return undefined;
         const fetched = await fetchThumbnail(scope, itemId);
         if (fetched) {
-          await db.putThumb(scopeRef, id, fetched).catch(() => {});
+          await db.putThumb(scopeRef, id, fetched, asOf).catch(() => {});
           return fetched;
         }
         // No thumbnail (not generated yet, or unsupported format) — the
         // image itself is small enough to be its own preview.
         if (file.size > FULL_IMAGE_PREVIEW_LIMIT) return undefined;
         const blob = await downloadDropFile(scope, itemId, { timeoutMs: FULL_IMAGE_PREVIEW_TIMEOUT_MS });
-        await db.putCachedBlob(scopeRef, id, blob).catch(() => {});
+        await db.putCachedBlob(scopeRef, id, blob, asOf).catch(() => {});
         return blob;
       }, previewsAbort.signal);
     } catch (err) {
@@ -471,7 +503,8 @@ export async function renderFeed(
     const pending = [...listEl.querySelectorAll<HTMLImageElement>('img[data-thumb-id]:not(.loaded)')].reverse();
     pending.forEach(async img => {
       const id = img.dataset.thumbId!;
-      const cached = thumbUrls.get(mkey(id));
+      const key = pkey(id);
+      const cached = thumbUrls.get(key);
       if (cached) {
         img.src = cached;
         img.classList.add('loaded');
@@ -492,13 +525,16 @@ export async function renderFeed(
         }
       }
       // Not for a screen that has gone meanwhile: nothing would show the
-      // URL, and it would sit in the map under this screen's key.
-      if (blob && listEl.isConnected) {
+      // URL, and it would sit in the map under this screen's key. Nor when
+      // this scope was re-synced from scratch meanwhile: these bytes were
+      // read or asked for before it, and the list drawn after it (refresh
+      // draws one, whatever the list holds) asks again.
+      if (blob && listEl.isConnected && pkey(id) === key) {
         // Two cards waiting on one download share one object URL.
-        let url = thumbUrls.get(mkey(id));
+        let url = thumbUrls.get(key);
         if (!url) {
           url = URL.createObjectURL(blob);
-          thumbUrls.set(mkey(id), url);
+          thumbUrls.set(key, url);
         }
         img.src = url;
         img.classList.add('loaded');
@@ -770,6 +806,7 @@ export async function renderFeed(
   async function downloadFile(record: DropRecord): Promise<void> {
     const f = record.meta.file;
     if (!f) return;
+    const asOf = db.mediaResetCount(scopeId);
     try {
       let blob = await db.getCachedBlob(scopeId, record.meta.id).catch(() => undefined);
       if (!blob) {
@@ -780,7 +817,7 @@ export async function renderFeed(
         infoToast('Downloading…');
         blob = await downloadDropFile(scope, f.itemId);
         if (record.meta.kind === 'image') {
-          await db.putCachedBlob(scopeRef, record.meta.id, blob).catch(() => {});
+          await db.putCachedBlob(scopeRef, record.meta.id, blob, asOf).catch(() => {});
         }
       }
       const url = URL.createObjectURL(blob);
@@ -825,13 +862,14 @@ export async function renderFeed(
 
     const img = overlay.querySelector<HTMLImageElement>('.lightbox-img')!;
     // Show the thumb instantly, then swap in the full-res image
-    const thumbUrl = thumbUrls.get(mkey(record.meta.id));
+    const thumbUrl = thumbUrls.get(pkey(record.meta.id));
     if (thumbUrl) img.src = thumbUrl;
+    const asOf = db.mediaResetCount(scopeId);
     try {
       let blob = await db.getCachedBlob(scopeId, record.meta.id).catch(() => undefined);
       if (!blob && f.itemId) {
         blob = await downloadDropFile(scope, f.itemId);
-        await db.putCachedBlob(scopeRef, record.meta.id, blob).catch(() => {});
+        await db.putCachedBlob(scopeRef, record.meta.id, blob, asOf).catch(() => {});
       }
       if (blob) img.src = URL.createObjectURL(blob);
     } catch { /* keep the thumb */ }
