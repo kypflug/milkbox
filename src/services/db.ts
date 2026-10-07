@@ -58,6 +58,23 @@ const EPOCH_KEY = 'milkbox:epoch';
  */
 let pageEpoch: string | null | undefined;
 
+/**
+ * How many times this page has emptied a scope's stored drops and media in
+ * a re-sync from scratch (resetScopeStore). The page adopts the epoch such
+ * a re-sync starts, so the epoch check does not stop what it was doing
+ * before: a cache kept in memory beside that media, or a write of something
+ * fetched for it, notes the count it began under and is dropped once the
+ * count has moved (see writeForScope's `asOf`). Per scope, since a re-sync
+ * empties one scope and leaves the others' media where it is. This page
+ * only: a page that another one's re-sync leaves behind is stale, and its
+ * writes are refused outright.
+ */
+const mediaResets = new Map<ScopeId, number>();
+
+export function mediaResetCount(scopeId: ScopeId): number {
+  return mediaResets.get(scopeId) ?? 0;
+}
+
 /** A write from a page whose view of local storage has been superseded. */
 export class StaleStoreError extends Error {
   constructor() {
@@ -253,16 +270,24 @@ function tx<T>(
  * cleared, nor into the same chat joined again since. Presence alone would
  * not tell those two stays apart; the record's generation does. Resolves
  * false when the write was skipped.
+ *
+ * With `asOf` (a mediaResetCount of the scope) it also happens only while
+ * that count stands: what this page began fetching before it re-synced the
+ * scope from scratch (a preview) is not stored in what was just emptied.
  */
 async function writeForScope(
   ref: ScopeRef,
   stores: string[],
   body: (t: IDBTransaction) => void,
+  asOf?: number,
 ): Promise<boolean> {
   const db = await openDb();
   const chatId = ref.scopeId.startsWith('chat:') ? ref.scopeId.slice(5) : null;
   let written = false;
   await write(db, chatId ? [...stores, 'chats'] : stores, t => {
+    // A re-sync is counted as its transaction completes (resetScopeStore),
+    // and this one runs wholly before that transaction or wholly after it.
+    if (asOf !== undefined && asOf !== mediaResetCount(ref.scopeId)) return;
     const apply = () => {
       body(t);
       written = true;
@@ -566,10 +591,11 @@ export function getThumb(scopeId: ScopeId, dropId: string): Promise<Blob | undef
   return tx('thumbs', 'readonly', s => s.get(mediaKey(scopeId, dropId)) as IDBRequest<Blob | undefined>);
 }
 
-export async function putThumb(ref: ScopeRef, dropId: string, blob: Blob): Promise<void> {
+/** `asOf`: the scope's mediaResetCount when the preview was asked for (see writeForScope). */
+export async function putThumb(ref: ScopeRef, dropId: string, blob: Blob, asOf?: number): Promise<void> {
   await writeForScope(ref, ['thumbs'], t => {
     t.objectStore('thumbs').put(blob, mediaKey(ref.scopeId, dropId));
-  });
+  }, asOf);
 }
 
 // ─── blobs (full images, LRU capped, scoped keys) ───
@@ -602,12 +628,13 @@ export async function getCachedBlob(scopeId: ScopeId, dropId: string): Promise<B
   return undefined;
 }
 
-export async function putCachedBlob(ref: ScopeRef, dropId: string, blob: Blob): Promise<void> {
+/** `asOf`: the scope's mediaResetCount when the image was asked for (see writeForScope). */
+export async function putCachedBlob(ref: ScopeRef, dropId: string, blob: Blob, asOf?: number): Promise<void> {
   await writeForScope(ref, ['blobs'], t => {
     t.objectStore('blobs').put(
       { id: mediaKey(ref.scopeId, dropId), blob, size: blob.size, lastAccess: Date.now() } satisfies BlobEntry,
     );
-  });
+  }, asOf);
   sweepBlobCache().catch(() => {});
 }
 
@@ -1031,6 +1058,12 @@ export async function resetScopeStore(scopeId: ScopeId, settingsKeys: string[]):
     for (const key of settingsKeys) t.objectStore('settings').delete(key);
     renewEpoch(t, true);
   });
+  // Counted once the transaction has committed, and not before: a re-sync
+  // that fails has emptied nothing. Its `complete` is what resolved the
+  // line above, and this runs before anything else does: a transaction that
+  // was waiting behind it has not had its first answer yet, so it finds the
+  // count already moved (see mediaResetCount).
+  mediaResets.set(scopeId, mediaResetCount(scopeId) + 1);
 }
 
 /** Every store, for the two operations that empty the database. */
