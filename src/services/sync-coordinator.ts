@@ -295,29 +295,10 @@ export async function enqueueCreate(scope: Scope, meta: DropMeta, blob?: Blob): 
 /** Queue an edit to an existing text drop. */
 export async function enqueueEdit(scope: Scope, meta: DropMeta): Promise<void> {
   const scopeId = scopeIdOf(scope);
-  const existing = await db.getDrop(scopeId, meta.id);
-  // Keep the server's version, and the eTag it was held at, for a discard to
-  // restore. A second edit before the first lands inherits the first one's
-  // original exactly — including none at all, if an older build queued it.
-  const queued = (await db.getOutbox()).find(r => r.id === meta.id && r.op === 'edit');
-  const prevMeta = queued ? queued.prevMeta : existing?.meta;
-  const prevETag = queued ? queued.prevETag : existing?.eTag;
-  const written = await db.putOutboxRecord(scopeRefOf(scope), {
-    id: meta.id,
-    meta,
-    op: 'edit',
-    attempts: 0,
-    state: 'queued',
-    scopeId,
-    prevMeta,
-    prevETag,
-  });
-  if (!written) throw await chatRefusal(scope, 'your edit was not saved');
-  // Optimistically update the local record so the edit shows immediately.
-  // Refused when the chat has been left since the row above was queued —
-  // which took that row with it — so the edit is not on its way anywhere:
-  // the editor is told, as when the row itself was refused.
-  if (existing && !(await db.putDrop(scopeRefOf(scope), { ...existing, meta }))) {
+  // The row that sends the edit and the local copy that shows it at once
+  // are written together or not at all (db.queueEdit): the editor is told
+  // "not saved" only when nothing was queued.
+  if (!(await db.queueEdit(scopeRefOf(scope), meta))) {
     throw await chatRefusal(scope, 'your edit was not saved');
   }
   emit({ type: 'feed-updated', scopeId });

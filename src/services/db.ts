@@ -13,7 +13,7 @@
  * - settings: small key/value pairs (per-scope delta tokens / cTags, etc.)
  */
 
-import type { ChatRecord, DeviceProfile, DropRecord, OutboxRecord, ScopeId, ScopeRef } from '../types';
+import type { ChatRecord, DeviceProfile, DropMeta, DropRecord, OutboxRecord, ScopeId, ScopeRef } from '../types';
 
 const DB_NAME = 'milkbox-db';
 /**
@@ -567,6 +567,53 @@ export function getOutbox(): Promise<OutboxRecord[]> {
 export function putOutboxRecord(ref: ScopeRef, record: OutboxRecord): Promise<boolean> {
   return writeForScope(ref, ['outbox'], t => {
     t.objectStore('outbox').put(record);
+  });
+}
+
+/**
+ * Queue an edit and show it at once: the outbox row that sends it and the
+ * edited local copy, in one transaction. Resolves false, writing neither,
+ * when `ref` is not the stay held; rejects, writing neither, when this
+ * page's store has been superseded.
+ *
+ * One transaction because what the caller is told has to be what was
+ * queued. As two writes, a re-sync in another tab between them (which
+ * keeps the outbox and starts a new epoch) refused the second one after
+ * the first had landed: the editor reported the edit as not saved, and
+ * the row it had queued was sent all the same. (A chat left between them
+ * was never that case: a leave takes the chat's outbox rows with it, so
+ * that refusal was true. Here it is simply one answer.)
+ *
+ * The row keeps the server's version, and the eTag it was held at, for a
+ * discard to restore. A second edit before the first lands inherits the
+ * first one's original exactly — including none at all, if an older build
+ * queued it. Both are read here, inside the transaction, so they are the
+ * versions this edit replaces. A drop that is not stored gets no local
+ * copy, only the row.
+ */
+export function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<boolean> {
+  return writeForScope(ref, ['outbox', 'drops'], t => {
+    const outbox = t.objectStore('outbox');
+    const drops = t.objectStore('drops');
+    const queued = outbox.get(meta.id) as IDBRequest<OutboxRecord | undefined>;
+    queued.onsuccess = () => {
+      const stored = drops.get([ref.scopeId, meta.id]) as IDBRequest<StoredDropRecord | undefined>;
+      stored.onsuccess = () => {
+        const earlier = queued.result?.op === 'edit' ? queued.result : undefined;
+        const held = stored.result;
+        outbox.put({
+          id: meta.id,
+          meta,
+          op: 'edit',
+          attempts: 0,
+          state: 'queued',
+          scopeId: ref.scopeId,
+          prevMeta: earlier ? earlier.prevMeta : held?.meta,
+          prevETag: earlier ? earlier.prevETag : held?.eTag,
+        } satisfies OutboxRecord);
+        if (held) drops.put({ ...held, meta } satisfies StoredDropRecord);
+      };
+    };
   });
 }
 
