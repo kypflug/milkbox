@@ -120,10 +120,14 @@ export function renderDropCard(
   record: DropRecord,
   presentation: DropCardPresentation,
 ): string {
-  const { meta, state } = record;
+  const { meta, state, sendToken } = record;
   const stateClass = state ? ` drop-card--${state}` : '';
+  // The send this card shows, for its Retry and Discard (see
+  // DropRecord.sendToken). On the card itself, so that a click acts on what
+  // was drawn and not on whatever the feed describes by then.
+  const tokenAttr = state && sendToken ? ` data-send-token="${escapeAttr(sendToken)}"` : '';
   return `
-    <article class="drop-card drop-card--${meta.kind} drop-card--${presentation.side}${stateClass}" data-drop-id="${escapeAttr(meta.id)}">
+    <article class="drop-card drop-card--${meta.kind} drop-card--${presentation.side}${stateClass}" data-drop-id="${escapeAttr(meta.id)}"${tokenAttr}>
       ${bodyFor(record)}
       ${metaLine(record, presentation.attributionLabel)}
       ${actionsRow(record, presentation)}
