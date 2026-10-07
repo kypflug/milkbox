@@ -97,10 +97,18 @@ let redirectHandled = false;
  * localStorage), we clean up the stale state and re-create the MSAL instance
  * so the second initialisation loads accounts cleanly.
  */
-export async function initAuth(force = false): Promise<AuthenticationResult | null> {
+export async function initAuth(
+  force = false,
+  stopped: () => boolean = () => false,
+): Promise<AuthenticationResult | null> {
   if (!msalInstance) {
     msalInstance = new PublicClientApplication(msalConfig);
     await msalInstance.initialize();
+    // Told to stop while MSAL was starting (a sign-out in another tab, see
+    // main.ts): take in no redirect response and no account for a page that
+    // is already signed out. The response, if there is one, stays in the
+    // address bar for the next load, and isAuthReady() stays false.
+    if (stopped()) return null;
   } else if (redirectHandled && !force) {
     // Already initialised and redirect was processed — nothing to do
     return null;
@@ -205,6 +213,16 @@ function hasRedirectResponse(): boolean {
   return search.includes('code=');
 }
 
+/**
+ * MSAL has started on this page and has dealt with any sign-in redirect the
+ * page was loaded with. Until then signIn() cannot work here: there is no
+ * MSAL at all (start-up stopped before it), or a redirect is still pending
+ * that MSAL will not start another over. The way forward is a reload.
+ */
+export function isAuthReady(): boolean {
+  return msalInstance !== null && redirectHandled;
+}
+
 /** Get the MSAL instance, assuming initAuth() has been called. */
 function getMsal(): PublicClientApplication {
   if (!msalInstance) throw new Error('MSAL not initialised — call initAuth() first');
@@ -247,21 +265,35 @@ export async function signIn(opts: { preConsentShare?: boolean } = {}): Promise<
 }
 
 /**
- * Sign the user out via redirect.
+ * Sign the user out via redirect. Resolves true once the redirect is under
+ * way (the page is navigating away), false when there was no account to
+ * sign out — the caller decides what to do with a page that is staying.
  */
-export async function signOut(): Promise<void> {
+export async function signOut(): Promise<boolean> {
   const msal = getMsal();
-  const account = getAccount();
-  if (!account) return;
 
+  // Both cleared even when MSAL reports no account — iOS can drop the live
+  // cache while the backup survives. The caller reloads a page that isn't
+  // redirecting, and a backup left behind would be restored on that load and
+  // sign the user straight back in.
   clearAccountHint();
-  clearMsalCacheBackup().catch(() => {});
+  // Awaited: the delete has to be committed before the redirect unloads the
+  // page, or the next boot would restore the snapshot it was meant to remove.
+  await clearMsalCacheBackup();
+  // Looked up only now. A page launching in another tab can restore the
+  // token cache a moment before the backup is revoked; an account that
+  // turned up that way is signed out like any other, not left for the
+  // caller's reload to find. (The lookup saves the hint again: clear it.)
+  const account = getAccount();
+  clearAccountHint();
+  if (!account) return false;
 
   await msal.logoutRedirect({
     account,
     postLogoutRedirectUri: REDIRECT_URI,
   });
   // Page navigates away
+  return true;
 }
 
 export async function getAccessToken(tier: TokenTier = 'base'): Promise<string> {
@@ -287,8 +319,9 @@ export async function getAccessToken(tier: TokenTier = 'base'): Promise<string> 
     if (!result.accessToken) {
       throw new InteractionRequiredAuthError('empty_token', 'Silent token acquisition returned empty access token');
     }
-    // Keep IndexedDB backup fresh after every successful token acquisition
-    backupMsalCache().catch(() => {});
+    // Keep the IndexedDB backup fresh — but only when MSAL actually minted a
+    // token. A cache hit (nearly every Graph call) changed nothing to back up.
+    if (!result.fromCache) backupMsalCache().catch(() => {});
     return result.accessToken;
   } catch (err) {
     // In PWA standalone/WCO mode, iframe-based silent renewal often fails
@@ -349,6 +382,11 @@ export function isSignedIn(): boolean {
   return getAccount() !== null;
 }
 
+/** A stable id for the signed-in account — what local data is bound to. */
+export function getAccountId(): string | null {
+  return getAccount()?.homeAccountId ?? null;
+}
+
 export function getUserDisplayName(): string {
   const account = getAccount();
   return account?.name || account?.username || '';
@@ -360,14 +398,20 @@ export function getUserEmail(): string {
 
 // ─── Account hint (iOS process-kill recovery) ───
 
+/** The hint this page last wrote — getAccount() runs on every Graph call. */
+let savedHint = '';
+
 /** Persist a lightweight marker so we know a user was previously signed in. */
 function saveAccountHint(account: AccountInfo): void {
+  const hint = JSON.stringify({
+    username: account.username,
+    name: account.name,
+    homeAccountId: account.homeAccountId,
+  });
+  if (hint === savedHint) return;
   try {
-    localStorage.setItem(ACCOUNT_HINT_KEY, JSON.stringify({
-      username: account.username,
-      name: account.name,
-      homeAccountId: account.homeAccountId,
-    }));
+    localStorage.setItem(ACCOUNT_HINT_KEY, hint);
+    savedHint = hint;
   } catch { /* localStorage may be unavailable */ }
 }
 
@@ -382,6 +426,7 @@ export function hasAccountHint(): boolean {
 
 /** Clear the account hint (on explicit sign-out). */
 function clearAccountHint(): void {
+  savedHint = '';
   try {
     localStorage.removeItem(ACCOUNT_HINT_KEY);
   } catch { /* */ }

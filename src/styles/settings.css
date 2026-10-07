@@ -119,6 +119,32 @@
   transition: border-color var(--ease), color var(--ease);
 }
 .settings-button-danger:hover { color: var(--danger); border-color: var(--danger); }
+.settings-button:disabled { opacity: 0.5; cursor: default; }
+
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Sync diagnostics: label over value, one pair per row. */
+.settings-stats {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.settings-stats dt {
+  font: var(--type-meta);
+  letter-spacing: var(--track-meta);
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.settings-stats dd {
+  margin: 2px 0 0;
+  font: var(--type-mono-sm);
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
 
 .settings-input {
   width: 100%;

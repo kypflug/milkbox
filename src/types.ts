@@ -85,6 +85,18 @@ export interface OutboxRecord {
    * stamps 'private' and the coordinator treats absence as 'private'.
    */
   scopeId?: ScopeId;
+  /**
+   * Edits only: the drop as OneDrive held it before this edit, so discarding
+   * a failed edit can restore it over the optimistic local copy. Absent on
+   * records from older builds.
+   */
+  prevMeta?: DropMeta;
+  /**
+   * Edits only: the eTag `prevMeta` was held at. A discard restores
+   * `prevMeta` only while the local row is still at this eTag — if a sync
+   * pass has since brought a newer version, that one stays.
+   */
+  prevETag?: string;
 }
 
 // ─── Shared chats ───
@@ -112,12 +124,34 @@ export interface ChatScope {
   /** driveItem id of the drops/ subfolder — the delta target. */
   dropsItemId: string;
   host: AuthorAttribution;
+  /**
+   * The stay of this chat on this device the scope was resolved from (see
+   * ChatRecord.generation). Work that carries the scope — a sync pass, a
+   * queued send, a preview download — is refused by local storage once that
+   * stay has ended, even if the chat has been joined again since.
+   */
+  generation?: string;
 }
 
 export type Scope = PrivateScope | ChatScope;
 
 export function scopeIdOf(scope: Scope): ScopeId {
   return scope.kind === 'private' ? 'private' : `chat:${scope.chatId}`;
+}
+
+/**
+ * What a write to local storage is made for: the scope and, for a chat, the
+ * stay of it on this device that the writer started under.
+ */
+export interface ScopeRef {
+  scopeId: ScopeId;
+  generation?: string;
+}
+
+export function scopeRefOf(scope: Scope): ScopeRef {
+  return scope.kind === 'private'
+    ? { scopeId: 'private' }
+    : { scopeId: `chat:${scope.chatId}`, generation: scope.generation };
 }
 
 /** Local chat registry record — IDB `chats` store, keyed by chat ULID. */
@@ -146,6 +180,13 @@ export interface ChatRecord {
    * between a local create/join and its OneDrive write landing.
    */
   registeredAt?: number;
+  /**
+   * Names this stay of the chat on this device: minted when the record is
+   * stored (db.addChat) and never changed, so a chat removed and joined
+   * again gets a new one. Local only — never written to OneDrive. Absent on
+   * records stored by builds from before it existed.
+   */
+  generation?: string;
 }
 
 /** OneDrive-side descriptor: chats/<id>/chat.json in the host's approot. */
@@ -188,4 +229,11 @@ export interface SharePayload {
   url?: string;
   files: File[];
   receivedAt: number;
+  /**
+   * Not a share: a composer draft a page left for itself across a reload
+   * (see reloadKeepingDraft in feed.ts), with the account that typed it
+   * and the scope it was typed in. It is put back once, only for that
+   * account, and only into that scope's composer.
+   */
+  draft?: { accountId: string | null; scopeId: ScopeId };
 }

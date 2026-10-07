@@ -14,6 +14,8 @@
 import { getAccessToken, type TokenTier } from './auth';
 import { getSetting, putSetting, deleteSetting } from './db';
 import { validateDropMeta } from './validate-drop';
+import { counters, type PassCounts } from './sync-stats';
+import { createLimiter, mapLimited } from '../utils/limit';
 import { scopeIdOf, type DeviceProfile, type DropMeta, type DropRecord, type Scope } from '../types';
 
 export const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
@@ -21,8 +23,95 @@ const DROPS_FOLDER = 'drops';
 const DEVICES_FOLDER = 'devices';
 const DEVICES_CTAG_KEY = 'milkbox:devices-ctag';
 
-const deltaTokenKey = (scope: Scope) => `milkbox:delta-token:${scopeIdOf(scope)}`;
-const folderCtagKey = (scope: Scope) => `milkbox:ctag:${scopeIdOf(scope)}`;
+/** Settings keys a sync pass commits together with the drops they describe. */
+export const deltaTokenKey = (scope: Scope) => `milkbox:delta-token:${scopeIdOf(scope)}`;
+export const folderCtagKey = (scope: Scope) => `milkbox:ctag:${scopeIdOf(scope)}`;
+
+/**
+ * How long a JSON request (a listing, a delta page, a drop body) may take.
+ * iOS can leave a request hanging when it suspends a backgrounded app; without
+ * a limit that one request would hold its scope's sync until a relaunch.
+ * Byte transfers (uploads, file downloads) are exempt — they can legitimately
+ * run longer on a slow connection.
+ */
+const JSON_TIMEOUT_MS = 20_000;
+/**
+ * Delta and listing pages carry hundreds of items each, and the limit covers
+ * the whole response, body included. They run one at a time and are already
+ * abortable, so a budget a slow cellular link can meet costs nothing — a
+ * page that keeps timing out would restart the enumeration every time.
+ */
+export const PAGE_TIMEOUT_MS = 60_000;
+/**
+ * Thumbnail bytes are a file transfer too, but a bounded one (a preview
+ * image), and a hung one would hold one of the few preview slots until a
+ * relaunch — so they get a limit of their own, generous for a slow link.
+ */
+const THUMBNAIL_TIMEOUT_MS = 60_000;
+
+/**
+ * A time limit for one request, response body included.
+ *
+ * fetch() resolves as soon as the headers arrive, so the limit has to cover
+ * reading the body too — and a read cut short by it does not reliably say
+ * so: it can reject with a bare AbortError rather than the TimeoutError the
+ * signal was aborted with. `fail` settles that in one place.
+ *
+ * The limit starts when the request is sent. Getting an access token first
+ * (MSAL, in graphFetch) is outside it.
+ */
+interface Deadline {
+  signal: AbortSignal;
+  /**
+   * Rethrow `err`, classified by what actually happened:
+   * - this deadline ended the request: a TimeoutError, counted for diagnostics;
+   * - an AbortError nobody asked for (some engines report a connection lost
+   *   mid-body that way): a network error, like any other dropped connection;
+   * - anything else, a deliberate abort included: unchanged.
+   * The retry logic treats timeouts and network errors as transient; an
+   * unexplained abort it would not.
+   */
+  fail(err: unknown): never;
+}
+
+/** A deadline of `ms` (the JSON timeout by default) that `outer` can also end early. */
+function deadline(outer?: AbortSignal | null, ms = JSON_TIMEOUT_MS): Deadline {
+  if (import.meta.env.DEV && devFaults.timeoutMs > 0) ms = devFaults.timeoutMs;
+  let timeout: AbortSignal;
+  if (typeof AbortSignal.timeout === 'function') {
+    timeout = AbortSignal.timeout(ms);
+  } else {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')), ms);
+    timeout = controller.signal;
+  }
+  let signal = timeout;
+  if (outer) {
+    if (typeof AbortSignal.any === 'function') {
+      signal = AbortSignal.any([outer, timeout]);
+    } else {
+      const combined = new AbortController();
+      const forward = (from: AbortSignal) => () => combined.abort(from.reason);
+      if (outer.aborted) combined.abort(outer.reason);
+      outer.addEventListener('abort', forward(outer), { once: true });
+      timeout.addEventListener('abort', forward(timeout), { once: true });
+      signal = combined.signal;
+    }
+  }
+  return {
+    signal,
+    fail(err) {
+      if (timeout.aborted && !outer?.aborted) {
+        counters.timeouts++;
+        throw new DOMException('The operation timed out.', 'TimeoutError');
+      }
+      if (err instanceof DOMException && err.name === 'AbortError' && !outer?.aborted) {
+        throw new TypeError('Network error while reading the response');
+      }
+      throw err;
+    },
+  };
+}
 
 /** Simple PUT limit — Graph requires upload sessions above 4 MB. */
 export const SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024;
@@ -53,22 +142,253 @@ async function authHeaders(tier: TokenTier): Promise<Record<string, string>> {
   return { Authorization: `Bearer ${token}` };
 }
 
-export async function graphFetch(url: string, init?: RequestInit, tier: TokenTier = 'base'): Promise<Response> {
+export interface GraphInit extends RequestInit {
+  /** Moves file bytes — skip the JSON timeout. */
+  noTimeout?: boolean;
+  /** A limit other than the JSON one (a paged listing, a preview image). */
+  timeoutMs?: number;
+}
+
+/** Statuses whose responses carry no body (and may not be rebuilt with one). */
+const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
+
+/**
+ * One authenticated Graph request. `read` consumes the response inside the
+ * request's deadline (when it has one), so the limit covers the body and a
+ * stall there is counted and classified like any other timeout.
+ */
+async function graphRequest<T>(
+  url: string,
+  init: GraphInit | undefined,
+  tier: TokenTier,
+  read: (res: Response, limited: boolean) => Promise<T>,
+): Promise<T> {
+  // Before the token is asked for: a request for a pass that has been
+  // stopped (a sign-out, a reset) starts no auth work.
+  if (init?.signal?.aborted) throw init.signal.reason;
   const headers = await authHeaders(tier);
-  const res = await fetch(url, {
-    ...init,
-    headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
-  });
-  if (!res.ok) {
-    const retryAfter = res.headers.get('Retry-After');
-    throw new GraphHttpError(
-      res.status,
-      url,
-      undefined,
-      retryAfter ? parseInt(retryAfter, 10) : undefined,
-    );
+  counters.graph++;
+  const { noTimeout, timeoutMs, ...request } = init ?? {};
+  const limit: Deadline | null = noTimeout ? null : deadline(request.signal, timeoutMs);
+  try {
+    const res = await fetch(url, {
+      ...request,
+      signal: limit ? limit.signal : request.signal,
+      headers: { ...headers, ...(request.headers as Record<string, string> | undefined) },
+    });
+    if (!res.ok) {
+      if (res.status === 429 || res.status === 503) counters.throttles++;
+      const retryAfter = res.headers.get('Retry-After');
+      throw new GraphHttpError(
+        res.status,
+        url,
+        undefined,
+        retryAfter ? parseInt(retryAfter, 10) : undefined,
+      );
+    }
+    return await read(res, limit !== null);
+  } catch (err) {
+    // An HTTP error is an answer, not a failed request: never reclassified.
+    if (limit && !(err instanceof GraphHttpError)) return limit.fail(err);
+    throw err;
   }
-  return res;
+}
+
+export function graphFetch(url: string, init?: GraphInit, tier: TokenTier = 'base'): Promise<Response> {
+  return graphRequest(url, init, tier, async (res, limited) => {
+    if (!limited) return res;
+    // Read the body here, under the limit, and hand back a response that
+    // already holds it: callers go on to res.json() and the like, and a
+    // stall there would be outside anything that could time it or retry it.
+    // (For the small JSON these requests carry. A file goes through
+    // downloadDropFile, which reads its bytes straight into a Blob.)
+    const body = await res.arrayBuffer();
+    return new Response(NULL_BODY_STATUS.has(res.status) ? null : body, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: res.headers,
+    });
+  });
+}
+
+/**
+ * Fetch from OneDrive's content host — a pre-authenticated download or
+ * upload-session URL, so no token. Counted apart from Graph calls. Untimed:
+ * upload chunks use it as is, and reads that want a limit go through
+ * storageRead.
+ */
+export function storageFetch(url: string, init?: RequestInit): Promise<Response> {
+  counters.storage++;
+  return fetch(url, init);
+}
+
+/**
+ * Fetch from the content host and consume the response with `read`, all of
+ * it under one deadline — the body as much as the headers.
+ */
+async function storageRead<T>(url: string, limit: Deadline, read: (res: Response) => Promise<T>): Promise<T> {
+  try {
+    return await read(await storageFetch(url, { signal: limit.signal }));
+  } catch (err) {
+    limit.fail(err);
+  }
+}
+
+// ─── DEV fault injection ───
+
+/**
+ * Make drop-body downloads slow or flaky on purpose, to exercise interrupted
+ * and retried passes on a desktop. Driven from window.__milkboxChatDev; the
+ * hook below compiles to nothing in production builds.
+ */
+const devFaults = {
+  bodyFailRate: 0,
+  bodyDelayMs: 0,
+  /** Replaces every request time limit, so timeouts can be tested without waiting for them. */
+  timeoutMs: 0,
+};
+
+export function setDevFaults(faults: Partial<typeof devFaults>): void {
+  Object.assign(devFaults, faults);
+}
+
+async function injectBodyFault(): Promise<void> {
+  if (!import.meta.env.DEV) return;
+  if (devFaults.bodyDelayMs > 0) await new Promise(r => setTimeout(r, devFaults.bodyDelayMs));
+  if (Math.random() < devFaults.bodyFailRate) throw new TypeError('Injected network failure');
+}
+
+// ─── small JSON bodies ───
+
+/**
+ * A non-OK answer from OneDrive's content host to a pre-authenticated
+ * download. Kept apart from GraphHttpError on purpose: an expired download
+ * link (401/403/404) says nothing about access to a chat, so it must never
+ * count toward a chat being "gone" — the next pass simply mints fresh links.
+ * The link itself is never kept: it carries its own auth.
+ */
+export class DownloadError extends Error {
+  constructor(public status: number) {
+    super(`Download failed: ${status}`);
+  }
+}
+
+/** Every JSON body download, across all scopes, shares these slots. */
+const bodyLimiter = createLimiter(6);
+const BODY_RETRY_DELAYS_MS = [500, 2000];
+
+/**
+ * Wait out a retry's delay, or reject the moment `signal` aborts. A retry
+ * that has been called off must not sit the delay out and then start again:
+ * through Graph /content the next attempt asks for a token before it looks
+ * at the signal, which is work for a pass that a sign-out or a reset has
+ * already stopped, and keeps that pass alive meanwhile.
+ */
+function retryDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** A dropped connection, a timeout or a server hiccup — worth a quick retry. */
+function isRetryableBodyError(err: unknown): boolean {
+  if (err instanceof DownloadError || err instanceof GraphHttpError) {
+    return err.status >= 500 && err.status !== 503;
+  }
+  if (err instanceof DOMException) return err.name === 'TimeoutError';
+  return err instanceof TypeError; // fetch's network failure
+}
+
+export interface JsonItem {
+  id: string;
+  '@microsoft.graph.downloadUrl'?: string;
+}
+
+/**
+ * Download one small JSON file (a drop, a device profile, a member file):
+ * through the item's pre-authenticated link when its listing carried one,
+ * else through Graph /content — a redirect plus a token, counted as a
+ * fallback in diagnostics. Transient failures retry twice; 429/503 surface
+ * as GraphHttpError so the coordinator's throttle gate applies.
+ */
+export function downloadItemJson(
+  item: JsonItem,
+  fallbackUrl: string,
+  tier: TokenTier,
+  opts: { signal?: AbortSignal; stats?: PassCounts } = {},
+): Promise<unknown> {
+  return bodyLimiter(async () => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fetchJsonBody(item, fallbackUrl, tier, opts);
+      } catch (err) {
+        const delay = BODY_RETRY_DELAYS_MS[attempt];
+        if (delay === undefined || opts.signal?.aborted || !isRetryableBodyError(err)) throw err;
+        if (opts.stats) opts.stats.retries++;
+        await retryDelay(delay, opts.signal);
+      }
+    }
+  }, opts.signal);
+}
+
+async function fetchJsonBody(
+  item: JsonItem,
+  fallbackUrl: string,
+  tier: TokenTier,
+  opts: { signal?: AbortSignal; stats?: PassCounts },
+): Promise<unknown> {
+  await injectBodyFault();
+  const link = item['@microsoft.graph.downloadUrl'];
+  if (!link) {
+    if (opts.stats) opts.stats.fallbacks++;
+    const res = await graphFetch(fallbackUrl, { signal: opts.signal }, tier);
+    return parseJsonBody(await res.text());
+  }
+  const text = await storageRead(link, deadline(opts.signal), async res => {
+    if (!res.ok) {
+      if (res.status === 429 || res.status === 503) throw contentThrottleError(res);
+      throw new DownloadError(res.status);
+    }
+    return res.text();
+  });
+  return parseJsonBody(text);
+}
+
+/**
+ * A body that arrived whole but isn't JSON (an empty or truncated file) is
+ * that one file's problem: it comes back undefined, which every caller's
+ * validation discards. Thrown instead, it would fail the whole pass — and
+ * every pass after it, since each would meet the same file again. A body
+ * that failed to arrive still throws, from the read above.
+ */
+function parseJsonBody(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A 429/503 from the content host, as the error the coordinator's throttle
+ * gate understands. Retry-After is honoured when the host exposes it.
+ */
+function contentThrottleError(res: Response): GraphHttpError {
+  counters.throttles++;
+  const retryAfter = parseInt(res.headers.get('Retry-After') ?? '', 10);
+  return new GraphHttpError(res.status, 'content host', undefined, Number.isFinite(retryAfter) ? retryAfter : 30);
 }
 
 /**
@@ -186,11 +506,12 @@ export async function deleteDropFiles(scope: Scope, id: string): Promise<void> {
 
 // ─── device profiles ───
 
-export async function putDeviceProfile(profile: DeviceProfile): Promise<void> {
+export async function putDeviceProfile(profile: DeviceProfile, signal?: AbortSignal): Promise<void> {
   await graphFetch(contentUrl(APPROOT, deviceJsonPath(profile.id)), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(profile, null, 2),
+    signal,
   });
 }
 
@@ -202,60 +523,69 @@ interface GraphFileItem {
 }
 
 export interface DeviceProfileSnapshot {
-  profiles: DeviceProfile[];
+  /** Absent when the registry's cTag still matched `skipIfCTag` — nothing was listed. */
+  profiles?: DeviceProfile[];
+  /** Read before the listing, so a change landing mid-listing stays dirty. */
   cTag?: string;
 }
 
-export async function listDeviceProfiles(): Promise<DeviceProfileSnapshot> {
+/** The devices/ cTag recorded after the last completed listing. */
+export function getKnownDeviceRegistryCTag(): Promise<string | undefined> {
+  return getSetting<string>(DEVICES_CTAG_KEY);
+}
+
+/**
+ * List every device profile. Pass the cTag recorded after the last listing
+ * as `skipIfCTag` and an unchanged registry costs one tiny GET instead of a
+ * listing plus a download per profile — and every reinstall adds a profile.
+ * `signal` stops it between requests and ends the one in flight.
+ */
+export async function listDeviceProfiles(skipIfCTag?: string, signal?: AbortSignal): Promise<DeviceProfileSnapshot> {
   let cTag: string | undefined;
   try {
-    const folderRes = await graphFetch(`${itemByPathUrl(APPROOT, DEVICES_FOLDER)}?$select=cTag`);
+    const folderRes = await graphFetch(`${itemByPathUrl(APPROOT, DEVICES_FOLDER)}?$select=cTag`, { signal });
     const folder = await folderRes.json();
     cTag = folder.cTag as string | undefined;
   } catch (err) {
     if (isGoneError(err)) return { profiles: [] };
     throw err;
   }
+  if (skipIfCTag && cTag === skipIfCTag) return { cTag };
 
   let url = `${itemByPathUrl(APPROOT, DEVICES_FOLDER)}:/children?$select=id,name,file,@microsoft.graph.downloadUrl`;
-  const profiles: DeviceProfile[] = [];
+  const items: GraphFileItem[] = [];
 
   while (url) {
     let data: { value: GraphFileItem[]; '@odata.nextLink'?: string };
     try {
-      const res = await graphFetch(url);
+      const res = await graphFetch(url, { timeoutMs: PAGE_TIMEOUT_MS, signal });
       data = await res.json();
     } catch (err) {
       if (isGoneError(err)) return { profiles: [], cTag };
       throw err;
     }
-
-    for (const item of data.value) {
-      if (!item.file || !item.name?.endsWith('.json')) continue;
-      const downloadUrl =
-        item['@microsoft.graph.downloadUrl'] ||
-        `${GRAPH_BASE}/me/drive/items/${item.id}/content`;
-      const bodyRes = item['@microsoft.graph.downloadUrl']
-        ? await fetch(downloadUrl)
-        : await graphFetch(downloadUrl);
-      if (!bodyRes.ok) {
-        throw new GraphHttpError(bodyRes.status, downloadUrl, 'Device profile download failed');
-      }
-      const profile = (await bodyRes.json()) as DeviceProfile;
-      if (
-        profile?.v === 1 &&
-        profile.id &&
-        profile.name &&
-        Number.isFinite(profile.createdAt) &&
-        Number.isFinite(profile.updatedAt)
-      ) {
-        profiles.push(profile);
-      }
-    }
-
+    items.push(...data.value.filter(item => item.file && item.name?.endsWith('.json')));
     url = data['@odata.nextLink'] || '';
   }
 
+  const downloaded = await mapLimited(
+    items,
+    4,
+    async item =>
+      (await downloadItemJson(item, `${GRAPH_BASE}/me/drive/items/${item.id}/content`, 'base', {
+        signal,
+      })) as DeviceProfile,
+    signal,
+  );
+
+  const profiles = downloaded.filter(
+    profile =>
+      profile?.v === 1 &&
+      profile.id &&
+      profile.name &&
+      Number.isFinite(profile.createdAt) &&
+      Number.isFinite(profile.updatedAt),
+  );
   return { profiles, cTag };
 }
 
@@ -271,6 +601,7 @@ async function uploadSmallFile(scope: Scope, path: string, blob: Blob): Promise<
     method: 'PUT',
     headers: { 'Content-Type': blob.type || 'application/octet-stream' },
     body: blob,
+    noTimeout: true,
   }, scopeTier(scope));
   const item = await res.json();
   return { itemId: item.id };
@@ -305,7 +636,7 @@ export async function uploadToSession(
 ): Promise<UploadedItem> {
   // Ask the session where to resume (fresh sessions expect range 0-)
   let nextStart = 0;
-  const statusRes = await fetch(uploadUrl);
+  const statusRes = await storageFetch(uploadUrl);
   if (statusRes.ok) {
     const status = await statusRes.json();
     const ranges: string[] = status.nextExpectedRanges || ['0-'];
@@ -317,7 +648,7 @@ export async function uploadToSession(
   while (nextStart < blob.size) {
     const end = Math.min(nextStart + CHUNK_SIZE, blob.size);
     const chunk = blob.slice(nextStart, end);
-    const res = await fetch(uploadUrl, {
+    const res = await storageFetch(uploadUrl, {
       method: 'PUT',
       headers: {
         'Content-Range': `bytes ${nextStart}-${end - 1}/${blob.size}`,
@@ -382,10 +713,17 @@ function fileItemUrl(scope: Scope, itemId: string): string {
     : `${GRAPH_BASE}/drives/${scope.driveId}/items/${itemId}`;
 }
 
-/** Download a drop's file bytes. */
-export async function downloadDropFile(scope: Scope, itemId: string): Promise<Blob> {
-  const res = await graphFetch(`${fileItemUrl(scope, itemId)}/content`, undefined, scopeTier(scope));
-  return res.blob();
+/**
+ * Download a drop's file bytes. Untimed by default — a user waiting on a big
+ * file should get it however long it takes. A caller fetching one as a
+ * preview passes a limit, so a transfer left hanging can't hold a preview
+ * slot for the rest of the session.
+ */
+export function downloadDropFile(scope: Scope, itemId: string, opts: { timeoutMs?: number } = {}): Promise<Blob> {
+  const init: GraphInit = opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : { noTimeout: true };
+  // Straight into a Blob, inside the limit when there is one — not through
+  // graphFetch's buffering, which would hold a large image in memory twice.
+  return graphRequest(`${fileItemUrl(scope, itemId)}/content`, init, scopeTier(scope), res => res.blob());
 }
 
 /**
@@ -402,9 +740,13 @@ export async function fetchThumbnail(scope: Scope, itemId: string): Promise<Blob
     );
     const data = await res.json();
     if (!data.url) return null;
-    const imgRes = await fetch(data.url);
-    if (!imgRes.ok) return null;
-    return imgRes.blob();
+    return await storageRead(data.url, deadline(undefined, THUMBNAIL_TIMEOUT_MS), async imgRes => {
+      // Throttled is not "no thumbnail": reporting it as a miss would send
+      // the caller off to download the full image, the opposite of backing off.
+      if (imgRes.status === 429 || imgRes.status === 503) throw contentThrottleError(imgRes);
+      if (!imgRes.ok) return null;
+      return imgRes.blob();
+    });
   } catch (err) {
     if (isGoneError(err)) return null;
     throw err;
@@ -413,11 +755,49 @@ export async function fetchThumbnail(scope: Scope, itemId: string): Promise<Blob
 
 // ─── delta sync ───
 
+export interface DeltaOptions {
+  stats?: PassCounts;
+  /**
+   * Drop id → eTag this device already holds. An upsert at the same eTag is
+   * not downloaded again — own sends, a resync after an expired token, and
+   * whatever an interrupted earlier attempt already committed.
+   */
+  known?: ReadonlyMap<string, string | undefined>;
+  /**
+   * Receives downloaded drops in newest-first batches while the pass runs,
+   * so the feed fills in as they arrive. Called one batch at a time; a batch
+   * that fails fails the pass. Drops not yet handed over when the pass
+   * completes come back in `upserts`, for the caller's final commit.
+   */
+  onBatch?: (records: DropRecord[]) => Promise<void>;
+  /**
+   * How many drops the pass is about to download. Called again, with one
+   * fewer, each time a body turns out not to hold a drop: that one is never
+   * handed over, and a caller counting "N of M" would wait for it for good.
+   */
+  onEnumerated?: (toDownload: number) => void;
+  signal?: AbortSignal;
+  /**
+   * Ignore the saved token and enumerate everything: the restart after it
+   * expired, or a caller that needs every drop checked against the server.
+   */
+  fromScratch?: boolean;
+}
+
 export interface DeltaResult {
+  /** Downloaded drops not already handed to `onBatch`. */
   upserts: DropRecord[];
   removals: string[];
-  /** True when the pass replaced the whole feed (caller should reconcile). */
+  /** True when the pass enumerated the whole feed (caller should reconcile). */
   fullResync: boolean;
+  /** Every drop id the pass found present: downloaded, or held at the same eTag. */
+  seenIds: Set<string>;
+  /**
+   * The token for the next pass. Returned, not saved: the caller commits it
+   * in the same transaction as the drops it covers, so a token can never get
+   * ahead of the data on this device.
+   */
+  deltaLink?: string;
 }
 
 interface DeltaItem {
@@ -428,6 +808,19 @@ interface DeltaItem {
   eTag?: string;
   '@microsoft.graph.downloadUrl'?: string;
 }
+
+/** What the enumeration says should happen to one drop — its last word wins. */
+type DeltaOp =
+  | { kind: 'upsert'; itemId: string; eTag?: string; downloadUrl?: string }
+  | { kind: 'delete' };
+
+/** Bodies in flight per pass (the global body limiter also applies). */
+const DELTA_CONCURRENCY = 6;
+/** The first hand-over is small, so the screen fills quickly; later ones batch up. */
+const FIRST_BATCH = 10;
+const BATCH = 25;
+/** How long finished drops wait for an in-order batch before going out as they are. */
+const HAND_OVER_PATIENCE_MS = 1_000;
 
 function deltaStartUrl(scope: Scope): string {
   return scope.kind === 'private'
@@ -452,89 +845,252 @@ export function isAccessLostError(err: unknown): boolean {
 }
 
 /**
- * Run a delta pass over a scope's drops folder. Persists the delta token only
- * after every changed JSON body downloaded successfully, so a mid-pass failure
- * replays the page next time instead of losing changes.
+ * Run a delta pass over a scope's drops folder, in two phases:
+ *
+ * 1. Enumerate every page. Pages are small and few; walking them all first
+ *    means the whole change set is known before any body is fetched.
+ * 2. Download the bodies this device doesn't already hold, several at once
+ *    and newest first — drop ids are ULIDs, so the bottom of the feed (what
+ *    the user is looking at) fills in first — handing them to `onBatch` in
+ *    that same order as they complete.
+ *
+ * The next delta token comes back only when every body downloaded, so a
+ * failure replays the changes next time instead of losing them. Batches
+ * already handed over stay committed, and the eTag skip means the retry
+ * fetches only what is still missing.
  *
  * A missing folder is an empty private feed, but for a chat it means access
  * was revoked or the chat deleted — that propagates to the caller.
  */
-export async function runDelta(scope: Scope): Promise<DeltaResult> {
-  const tokenKey = deltaTokenKey(scope);
+export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<DeltaResult> {
+  const { stats, known, signal } = opts;
   const tier = scopeTier(scope);
   const isChat = scope.kind === 'chat';
-  const savedToken = await getSetting<string>(tokenKey);
-  let url = savedToken ?? deltaStartUrl(scope);
+  const savedToken = opts.fromScratch ? undefined : await getSetting<string>(deltaTokenKey(scope));
   const fullResync = !savedToken;
 
-  const upserts: DropRecord[] = [];
-  const removals: string[] = [];
-  let finalDeltaLink: string | undefined;
+  // ── 1. enumerate ──
+  // The same item can appear more than once across pages; the last
+  // occurrence is its current state.
+  const ops = new Map<string, DeltaOp>();
+  let url = savedToken ?? deltaStartUrl(scope);
+  let deltaLink: string | undefined;
 
   while (url) {
     let data: { value: DeltaItem[]; '@odata.nextLink'?: string; '@odata.deltaLink'?: string };
     try {
-      const res = await graphFetch(url, undefined, tier);
+      const res = await graphFetch(url, { signal, timeoutMs: PAGE_TIMEOUT_MS }, tier);
       data = await res.json();
+      if (stats) stats.pages++;
     } catch (err) {
       if (isGoneError(err)) {
         if (savedToken) {
-          // Token expired — clear it and restart as a full delta
+          // Token expired — restart as a full delta. The stale token stays
+          // stored until the caller commits the new one (or drops it).
           console.debug('[Sync] Delta token expired — full resync');
-          await deleteSetting(tokenKey);
-          return runDelta(scope);
+          return runDelta(scope, { ...opts, fromScratch: true });
         }
         if (isChat) throw err; // revoked / deleted — the caller decides
-        // Folder doesn't exist yet — empty feed, not an error
-        return { upserts: [], removals: [], fullResync };
+        // Only the opening request can say the folder doesn't exist yet (an
+        // empty feed, not an error). "Gone" on a later page is a broken
+        // enumeration: reported as an empty feed it would sweep every drop
+        // this device holds, so it fails the pass instead.
+        if (url !== deltaStartUrl(scope)) throw err;
+        return { upserts: [], removals: [], fullResync, seenIds: new Set() };
       }
       throw err;
     }
 
     for (const item of data.value) {
       const name = item.name || '';
+      if (!name.endsWith('.json')) continue;
+      const id = name.slice(0, -5);
       if (item.deleted) {
-        if (name.endsWith('.json')) removals.push(name.slice(0, -5));
-        continue;
+        ops.set(id, { kind: 'delete' });
+      } else if (item.file) {
+        ops.set(id, {
+          kind: 'upsert',
+          itemId: item.id,
+          eTag: item.eTag,
+          downloadUrl: item['@microsoft.graph.downloadUrl'],
+        });
       }
-      if (!item.file || !name.endsWith('.json')) continue;
-
-      // Prefer the pre-authenticated downloadUrl from the delta response —
-      // no extra token round-trip per item.
-      const fallbackUrl = scope.kind === 'private'
-        ? `${GRAPH_BASE}/me/drive/items/${item.id}/content`
-        : `${GRAPH_BASE}/drives/${scope.driveId}/items/${item.id}/content`;
-      const downloadUrl = item['@microsoft.graph.downloadUrl'] || fallbackUrl;
-      const bodyRes = item['@microsoft.graph.downloadUrl']
-        ? await fetch(downloadUrl)
-        : await graphFetch(downloadUrl, undefined, tier);
-      if (!bodyRes.ok) throw new GraphHttpError(bodyRes.status, downloadUrl, 'Drop JSON download failed');
-      const parsed: unknown = await bodyRes.json();
-      const meta = validateDropMeta(parsed, { expectedId: name.slice(0, -5), requireAuthor: isChat });
-      if (!meta) {
-        console.debug('[Sync] Discarding malformed drop JSON: %s', name);
-        continue;
-      }
-      upserts.push({ meta, eTag: item.eTag });
     }
 
     if (data['@odata.deltaLink']) {
-      finalDeltaLink = data['@odata.deltaLink'];
+      deltaLink = data['@odata.deltaLink'];
       url = '';
     } else {
       url = data['@odata.nextLink'] || '';
     }
   }
+  if (stats) stats.enumerated += ops.size;
 
-  if (finalDeltaLink) {
-    await putSetting(tokenKey, finalDeltaLink);
+  const removals: string[] = [];
+  const seenIds = new Set<string>();
+  const pending: Array<{ id: string; itemId: string; eTag?: string; downloadUrl?: string }> = [];
+  for (const [id, op] of ops) {
+    if (op.kind === 'delete') {
+      removals.push(id);
+    } else if (op.eTag !== undefined && known?.get(id) === op.eTag) {
+      seenIds.add(id);
+      if (stats) stats.skipped++;
+    } else {
+      pending.push({ id, itemId: op.itemId, eTag: op.eTag, downloadUrl: op.downloadUrl });
+    }
+  }
+  pending.sort((a, b) => (a.id < b.id ? 1 : -1));
+  /** Drops still expected out of `pending`: its length, less the bodies found malformed. */
+  let expected = pending.length;
+  opts.onEnumerated?.(expected);
+
+  // ── 2. download, newest first ──
+  // One slot per `pending` place: undefined while its body is downloading,
+  // the record once it has arrived, null once there is nothing (left) to
+  // hand over — a body that failed validation, or a record already handed.
+  //
+  // Downloads finish in any order, but drops are handed over in `pending`
+  // order, so the feed grows upward from the newest with no gaps to fill in
+  // later. A body that is merely slower than its neighbours delays the
+  // hand-over behind it, never the downloads. One that stays missing past
+  // HAND_OVER_PATIENCE_MS stops being waited for: a timer hands over what
+  // has arrived around it, and the straggler slots in when it lands.
+  const slots = new Array<DropRecord | null | undefined>(pending.length);
+  let cursor = 0; // first slot that still has something to hand over, or to wait for
+  let handedOver = 0;
+  let lastHandOverAt = performance.now();
+  let patienceTimer: ReturnType<typeof setTimeout> | undefined;
+  let handing: Promise<void> = Promise.resolve();
+  const failure: { failed: boolean; error?: unknown; commitFailed: boolean } = { failed: false, commitFailed: false };
+  const fail = (error: unknown) => {
+    if (failure.failed) return;
+    failure.failed = true;
+    failure.error = error;
+  };
+
+  /**
+   * Hand finished drops to the caller, one batch at a time. 'in-order'
+   * takes the run up to the first body still downloading, once it is a
+   * batch's worth; 'everything' takes whatever has arrived. After a batch
+   * fails to commit, nothing more is handed over.
+   */
+  const handOver = (mode: 'in-order' | 'everything'): boolean => {
+    if (!opts.onBatch) return false;
+    const take: number[] = [];
+    for (let i = cursor; i < slots.length; i++) {
+      const slot = slots[i];
+      if (slot === undefined) {
+        if (mode === 'in-order') break;
+      } else if (slot) {
+        take.push(i);
+      }
+    }
+    if (take.length === 0) return false;
+    if (mode === 'in-order' && take.length < (handedOver === 0 ? FIRST_BATCH : BATCH)) return false;
+    const batch = take.map(i => slots[i] as DropRecord);
+    for (const i of take) slots[i] = null;
+    while (cursor < slots.length && slots[cursor] === null) cursor++;
+    handedOver += batch.length;
+    lastHandOverAt = performance.now();
+    clearTimeout(patienceTimer);
+    patienceTimer = undefined;
+    const onBatch = opts.onBatch;
+    handing = handing
+      .then(() => (failure.commitFailed ? undefined : onBatch(batch)))
+      .catch(err => {
+        failure.commitFailed = true;
+        fail(err);
+      });
+    return true;
+  };
+
+  /**
+   * Patience runs on a clock, not on the next download finishing: if the
+   * only bodies still in flight are stuck, nothing else would come along to
+   * release the drops that have already arrived.
+   */
+  const armPatience = () => {
+    if (!opts.onBatch || patienceTimer !== undefined) return;
+    const wait = Math.max(0, lastHandOverAt + HAND_OVER_PATIENCE_MS - performance.now());
+    patienceTimer = setTimeout(() => {
+      patienceTimer = undefined;
+      handOver('everything');
+    }, wait);
+  };
+
+  try {
+    await mapLimited(
+      pending,
+      DELTA_CONCURRENCY,
+      async (op, index) => {
+        // A batch that failed to commit fails the pass — stop fetching.
+        if (failure.commitFailed) throw failure.error;
+        const fallbackUrl = scope.kind === 'private'
+          ? `${GRAPH_BASE}/me/drive/items/${op.itemId}/content`
+          : `${GRAPH_BASE}/drives/${scope.driveId}/items/${op.itemId}/content`;
+        const parsed = await downloadItemJson(
+          { id: op.itemId, '@microsoft.graph.downloadUrl': op.downloadUrl },
+          fallbackUrl,
+          tier,
+          { signal, stats },
+        );
+        if (stats) stats.downloaded++;
+        // The file is there, whatever it holds. Seen, so that a full pass
+        // does not sweep the copy already held as if the drop had been
+        // deleted: only the unreadable replacement is passed over.
+        seenIds.add(op.id);
+        const meta = validateDropMeta(parsed, { expectedId: op.id, requireAuthor: isChat });
+        if (meta) {
+          slots[index] = { meta, eTag: op.eTag };
+        } else {
+          console.debug('[Sync] Discarding malformed drop JSON: %s.json', op.id);
+          if (stats) stats.malformed++;
+          slots[index] = null;
+          opts.onEnumerated?.(--expected);
+        }
+        // In order while that keeps moving; around a straggler (or a slow
+        // connection that hasn't filled a batch) once patience runs out.
+        // Armed even after an in-order hand-over: drops that finished behind
+        // a body still downloading are waiting on the clock too.
+        handOver('in-order');
+        armPatience();
+      },
+      signal,
+    );
+  } catch (err) {
+    fail(err);
+  } finally {
+    // The pass is settling its own hand-overs from here: a timer firing
+    // later would hand the final drops over a second time.
+    clearTimeout(patienceTimer);
+    patienceTimer = undefined;
   }
 
-  return { upserts, removals, fullResync };
+  if (failure.failed) {
+    // Keep what did arrive: those drops are real server state, and the next
+    // attempt skips them by eTag instead of fetching them again.
+    handOver('everything');
+    await handing;
+    throw failure.error;
+  }
+  await handing;
+  if (failure.failed) throw failure.error;
+  const upserts = slots.filter((record): record is DropRecord => Boolean(record));
+  return { upserts, removals, fullResync, seenIds, deltaLink };
 }
 
 export function clearDeltaToken(scope: Scope): Promise<void> {
   return deleteSetting(deltaTokenKey(scope));
+}
+
+/**
+ * The settings that hold a scope's sync position: its delta token and change
+ * markers. Deleting them makes its next pass enumerate everything, as a
+ * fresh install would. For the private feed that includes the device
+ * registry's marker, so device profiles re-list too.
+ */
+export function syncStateKeys(scope: Scope): string[] {
+  return [deltaTokenKey(scope), folderCtagKey(scope), ...(scope.kind === 'private' ? [DEVICES_CTAG_KEY] : [])];
 }
 
 // ─── fast-path dirty check ───
@@ -551,38 +1107,38 @@ function dirtyCheckUrl(scope: Scope): string {
 }
 
 /**
- * One tiny GET that answers "did anything change?" — a folder's cTag changes
- * whenever any descendant changes. Keeps the 45s poll nearly free.
- * Returns true when a delta pass is warranted.
+ * The scope's folder cTag right now — it changes whenever any descendant
+ * changes. A sync pass reads it BEFORE its delta and commits that value with
+ * the drops: anything that lands while the delta runs moves the cTag past
+ * it, so the next poll syncs again rather than missing the change. Throws
+ * like any Graph call (404 when the folder does not exist yet).
+ */
+export async function readFeedCTag(scope: Scope): Promise<string | undefined> {
+  const res = await graphFetch(`${dirtyCheckUrl(scope)}?$select=cTag`, undefined, scopeTier(scope));
+  const data = await res.json();
+  return typeof data.cTag === 'string' && data.cTag ? data.cTag : undefined;
+}
+
+/**
+ * One tiny GET that answers "did anything change?". Keeps the 45s poll
+ * nearly free. Returns the cTag it read, so a pass it triggers can commit
+ * that value without asking again.
  *
  * A gone folder is "nothing to sync" for private, but for chats it must
  * surface — revoked access is a state change the coordinator tracks.
  */
-export async function isFeedDirty(scope: Scope): Promise<boolean> {
+export async function isFeedDirty(scope: Scope): Promise<{ dirty: boolean; cTag?: string }> {
   try {
-    const res = await graphFetch(`${dirtyCheckUrl(scope)}?$select=cTag`, undefined, scopeTier(scope));
-    const data = await res.json();
-    const cTag = data.cTag as string | undefined;
-    if (!cTag) return true;
+    const cTag = await readFeedCTag(scope);
+    if (!cTag) return { dirty: true };
     const known = await getSetting<string>(folderCtagKey(scope));
-    return known !== cTag;
+    return { dirty: known !== cTag, cTag };
   } catch (err) {
     if (isGoneError(err)) {
       if (scope.kind === 'chat') throw err;
-      return false; // folder not created yet — nothing to sync
+      return { dirty: false }; // folder not created yet — nothing to sync
     }
     throw err;
-  }
-}
-
-/** Record the folder cTag after a completed sync pass. */
-export async function markFeedClean(scope: Scope): Promise<void> {
-  try {
-    const res = await graphFetch(`${dirtyCheckUrl(scope)}?$select=cTag`, undefined, scopeTier(scope));
-    const data = await res.json();
-    if (data.cTag) await putSetting(folderCtagKey(scope), data.cTag);
-  } catch {
-    // Folder may not exist yet — fine
   }
 }
 

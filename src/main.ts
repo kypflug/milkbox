@@ -1,5 +1,5 @@
-import { initAuth, isSignedIn, tryRecoverAuth, refreshTokenOnResume, hasAccountHint, signInWithHint } from './services/auth';
-import { restoreMsalCacheIfNeeded, setupBackgroundBackup } from './services/msal-cache-backup';
+import { getAccountId, initAuth, isSignedIn, tryRecoverAuth, refreshTokenOnResume, hasAccountHint, signInWithHint } from './services/auth';
+import { clearMsalCacheBackup, restoreMsalCacheIfNeeded, setupBackgroundBackup } from './services/msal-cache-backup';
 import { initBroadcast, onBroadcast, postBroadcast } from './services/broadcast';
 import { drainShareInbox } from './services/share-inbox';
 import * as coordinator from './services/sync-coordinator';
@@ -7,8 +7,8 @@ import { resumePendingAction, startCreateChatFlow, startJoinFlow, startReconnect
 import { setPendingAction } from './services/pending-actions';
 import { isValidShareToken } from './services/chats';
 import { renderSignIn } from './screens/sign-in';
-import { renderFeed, applySharePayload, teardownScreenListeners } from './screens/feed';
-import { showManageSheet } from './screens/chat-sheets';
+import { renderFeed, applySharePayload, hasUnsentDraft, isReloadAsked, showReloadPrompt, teardownScreenListeners } from './screens/feed';
+import { closeAllModals, showManageSheet } from './screens/chat-sheets';
 import { mountChatMenu, type ChatSwitcherHandlers } from './components/chat-switcher';
 import { showToast } from './components/toast';
 import { applyTheme } from './theme';
@@ -51,7 +51,11 @@ boot(app).catch(err => {
 
   if (err instanceof Error) {
     const errMsg = err.message.toLowerCase();
-    if (errMsg.includes('localstorage') || errMsg.includes('quota') || errMsg.includes('storage')) {
+    if (errMsg.includes('upgrade is blocked')) {
+      // A window on the previous version still has the store open (db.ts).
+      errorMessage = 'Milkbox is open in another window';
+      errorDetails = 'This version needs to update its local storage first. Close other Milkbox windows, then reload.';
+    } else if (errMsg.includes('localstorage') || errMsg.includes('quota') || errMsg.includes('storage')) {
       errorMessage = 'Storage access blocked';
       errorDetails = 'Milkbox needs storage access to work. Please disable Private Browsing or use a different browser.';
     } else if (errMsg.includes('network') || errMsg.includes('fetch') || errMsg.includes('timeout')) {
@@ -76,19 +80,42 @@ boot(app).catch(err => {
   document.getElementById('bootErrorReload')?.addEventListener('click', () => window.location.reload());
 });
 
+/** The invite this page was opened with, if its link holds one that can be used. */
+function inviteInAddressBar(): string | null {
+  const raw = location.hash.startsWith('#join=') ? decodeInvite(location.hash.slice(6)) : null;
+  return raw && isValidShareToken(raw) ? raw : null;
+}
+
 async function boot(app: HTMLElement): Promise<void> {
   applyTheme();
   trackWindowControlsSide();
+  // Before the first await: a broadcast is not replayed, so a sign-out in
+  // another tab while this one restores its token cache or starts MSAL
+  // would be missed — and this page would enter the app as the account that
+  // was just signed out.
+  watchForSignOutElsewhere(app);
 
   // Restore MSAL cache from IndexedDB if iOS wiped localStorage
   const cacheRestored = await restoreMsalCacheIfNeeded();
   if (cacheRestored) {
     console.info('[Boot] MSAL cache restored from IndexedDB backup');
   }
+  // Told of a sign-out while that read was pending: this page is signed out
+  // before MSAL has started, so it is not started. It would read whatever
+  // account the other tab's logout has yet to clear, and take in a sign-in
+  // redirect, for a page that has already been told to stop. (A redirect
+  // left in the address bar is for the next load to deal with, and so is
+  // an invite link: the screen greets as invited, and its button reloads.)
+  if (signedOutElsewhere) {
+    invitedSignIn = inviteInAddressBar() !== null;
+    showSignedOutElsewhere(app);
+    return;
+  }
 
   // initAuth() returns a non-null AuthenticationResult when this page load
-  // is the result of a loginRedirect completing.
-  const redirectResponse = await initAuth();
+  // is the result of a loginRedirect completing. Told of a sign-out while
+  // MSAL is starting, it stops short of taking that redirect in.
+  const redirectResponse = await initAuth(false, () => signedOutElsewhere);
 
   // Auth redirect handling is done — safe to activate pending SW update
   authBootComplete = true;
@@ -99,15 +126,30 @@ async function boot(app: HTMLElement): Promise<void> {
 
   // An invite link opened while signed out: park the join (IDB — survives
   // the sign-in redirect and iOS storage wipes) and greet as invited.
-  const rawInvited = location.hash.startsWith('#join=')
-    ? decodeURIComponent(location.hash.slice(6))
-    : null;
-  const invitedToken = rawInvited && isValidShareToken(rawInvited) ? rawInvited : null;
-  const signedIn = Boolean(redirectResponse?.account) || isSignedIn();
+  const invitedToken = inviteInAddressBar();
+  // Signed out in another tab while this one was starting: whatever account
+  // MSAL has just loaded is on its way out, so this page is not signed in.
+  const signedIn = !signedOutElsewhere && (Boolean(redirectResponse?.account) || isSignedIn());
   if (invitedToken && !signedIn) {
     invitedSignIn = true;
-    await setPendingAction({ type: 'join', token: invitedToken, createdAt: Date.now() });
-    history.replaceState(null, '', '/');
+    // Not while another tab is signing out: its wipe would refuse this
+    // write, or take the parked invite with it a moment later. The link
+    // stays in the address bar instead, for the next load to pick up.
+    if (!signedOutElsewhere) {
+      try {
+        await setPendingAction({ type: 'join', token: invitedToken, createdAt: Date.now(), parkedSignedOut: true });
+      } catch (err) {
+        if (!signedOutElsewhere) throw err;
+      }
+      // Parked for sure only if no sign-out arrived while it was written.
+      if (!signedOutElsewhere) history.replaceState(null, '', '/');
+    }
+  }
+  if (signedOutElsewhere) {
+    // Its screen is up already; drawn again now that this is known to be an
+    // invite or not.
+    showSignedOutElsewhere(app);
+    return;
   }
 
   if (signedIn) {
@@ -119,6 +161,9 @@ async function boot(app: HTMLElement): Promise<void> {
     console.debug('[Boot] Account evidence exists (cacheRestored=%s, hint=%s) — attempting recovery',
       cacheRestored, hasAccountHint());
     const recovered = await tryRecoverAuth();
+    // The evidence was the account another tab has just signed out: neither
+    // enter the app as it nor send the user to sign in to it again.
+    if (signedOutElsewhere) return;
     if (recovered && isSignedIn()) {
       console.info('[Boot] Auth recovered without user interaction');
       clearAutoRedirectMark();
@@ -215,15 +260,97 @@ async function attemptAutoRedirect(app: HTMLElement): Promise<void> {
   }
 }
 
+/** Another tab signed this account out: this page shows the sign-in screen and does nothing more. */
+let signedOutElsewhere = false;
+
+/** Stop this page and put the sign-in screen up — whatever it was in the middle of drawing. */
+function showSignedOutElsewhere(app: HTMLElement): void {
+  teardownScreenListeners(); // the lightbox with it
+  chatUiTeardown?.();
+  chatUiTeardown = null;
+  // Sheets hang off <body>: left open they would keep showing the signed-out
+  // account's chat members or invite link over the sign-in screen.
+  closeAllModals();
+  renderSignIn(app, () => location.reload(), { invited: invitedSignIn });
+}
+
+/**
+ * Listen for a sign-out in another tab, from the first moment of boot to the
+ * end of the page. Once that tab's wipe lands, a page that had already
+ * opened the store is on a superseded epoch and its writes are refused (see
+ * db.ts); one that has not opened it yet would simply start on whatever the
+ * store then holds. Neither is something to lean on — the wipe is bounded
+ * and can be given up on — so either way this page must not carry on as it
+ * was, nor start up as if nothing had happened.
+ */
+function watchForSignOutElsewhere(app: HTMLElement): void {
+  initBroadcast();
+  onBroadcast(event => {
+    if (event.type !== 'auth-changed' || event.signedIn) return;
+    // Not a reload: the other tab's logout may not have cleared the token
+    // cache yet, and a reload would boot straight back into this account.
+    signedOutElsewhere = true;
+    coordinator.shutdown();
+    // This tab's backup hooks (pagehide, going hidden) may be armed and the
+    // token cache is still in localStorage until that logout finishes: a
+    // backup from here would recreate the snapshot sign-out just deleted.
+    void clearMsalCacheBackup({ told: true });
+    showSignedOutElsewhere(app);
+  });
+}
+
 /** Transition to the main app: routing, share target, and resume handler. */
 async function enterApp(app: HTMLElement): Promise<void> {
-  initBroadcast();
+  // Told of a sign-out since it loaded, this page is shut down for good (see
+  // watchForSignOutElsewhere) and must not claim the store. If it has been
+  // signed in again in place — the iOS sign-in sheet returns to the same
+  // page — it starts over.
+  if (signedOutElsewhere) {
+    location.reload();
+    return;
+  }
+  // Subscribed before any await here: another tab re-syncing from scratch
+  // must not be missed while this one is still starting up. This page's view
+  // of local storage is then superseded and its writes are refused (see the
+  // store epoch in db.ts).
+  onBroadcast(event => {
+    if (event.type !== 'store-reset') return;
+    // This page has to reload before it can write again — but not over
+    // something the user hasn't sent yet. Then it is their call.
+    if (hasUnsentDraft()) {
+      showReloadPrompt('Milkbox was re-synced in another window. Reload this one when you’re ready.');
+    } else {
+      location.reload();
+    }
+  });
   postBroadcast({ type: 'auth-changed', signedIn: true });
-  await route(app);
-  window.addEventListener('hashchange', () => void route(app));
-  // Anything a consent redirect / sign-in / iOS sheet interrupted.
-  await resumePendingAction();
-  await handleShareTarget();
+  try {
+    // Before anything reads the store: data left by a different account goes.
+    const accountId = getAccountId();
+    if (accountId) {
+      await coordinator.claimStoreFor(accountId);
+      // The sign-out landed while the claim was under way. If its wipe ran
+      // first, the claim has just replaced the "signed out" marker with this
+      // account's: put the wipe back, so that whatever is written behind it
+      // is still cleared, not adopted, when an account next signs in.
+      if (signedOutElsewhere) await coordinator.wipeForSignOut();
+    }
+    await route(app);
+    window.addEventListener('hashchange', () => void route(app));
+    // Anything a consent redirect / sign-in / iOS sheet interrupted — unless
+    // this launch's own invite link has just started a join: that flow has
+    // parked the same join itself, and resuming it here would run it twice.
+    if (!signedOutElsewhere && !joinStartedFromLink) await resumePendingAction();
+    if (!signedOutElsewhere) await handleShareTarget();
+  } catch (err) {
+    // Once another tab has signed out, storage refuses this page's writes.
+    // A start-up step failing on that is expected, not a failed boot.
+    if (!signedOutElsewhere) throw err;
+  }
+  if (signedOutElsewhere) {
+    showSignedOutElsewhere(app);
+    return;
+  }
   setupResumeHandler();
   setupBackgroundBackup();
   // Warm the author identity, land any registry write a previous session
@@ -249,21 +376,54 @@ async function enterApp(app: HTMLElement): Promise<void> {
   }
 }
 
+/** route() found an invite link in the address bar and started its join. */
+let joinStartedFromLink = false;
+
+/** The token of an invite link, or null when its escaping is broken. */
+function decodeInvite(encoded: string): string | null {
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return null;
+  }
+}
+
 /** Only the very first empty-hash route restores the remembered scope —
  *  after that, an empty hash means the user chose the private feed. */
 let restoredActiveScope = false;
 let chatUiTeardown: (() => void) | null = null;
 
 async function route(app: HTMLElement): Promise<void> {
+  if (signedOutElsewhere) return;
+  // Waiting to be reloaded after another window reset the store (the user
+  // has been asked, on the reset's broadcast or on a write it refused): no
+  // route can go through. Its first write would be refused, and by then
+  // the screen's listeners, the composer's among them, would have been
+  // taken down with nothing drawn in their place. The screen is left
+  // whole, its draft with it, and the user is asked again.
+  if (isReloadAsked()) {
+    // An invite link opened here is not started, since a join writes to the
+    // store, and it is not carried across the reload: the user is told.
+    showReloadPrompt(
+      inviteInAddressBar()
+        ? 'This window is out of date. Reload it, then open the invite link again.'
+        : 'This window is out of date. Reload it when you’re ready.',
+    );
+    return;
+  }
   const rawHash = location.hash.slice(1);
 
   if (rawHash.startsWith('join=')) {
     // Strip the hash first so a reload doesn't re-trigger the join, then
     // run the flow on top of whatever scope renders below.
     history.replaceState(null, '', '/');
-    const token = decodeURIComponent(rawHash.slice(5));
-    if (isValidShareToken(token)) void startJoinFlow(token);
-    else showToast('This invite link doesn’t work anymore. Ask the host for a new one.', 'error');
+    const token = decodeInvite(rawHash.slice(5));
+    if (token && isValidShareToken(token)) {
+      joinStartedFromLink = true;
+      void startJoinFlow(token);
+    } else {
+      showToast('This invite link doesn’t work anymore. Ask the host for a new one.', 'error');
+    }
   }
   const hash = rawHash.startsWith('join=') ? '' : rawHash;
 
@@ -288,8 +448,22 @@ async function route(app: HTMLElement): Promise<void> {
   }
   restoredActiveScope = true;
 
-  await coordinator.setActiveScopeId(scopeIdOf(scope));
-  await renderFeed(app, { openSettings: hash === 'settings', scope });
+  try {
+    await coordinator.setActiveScopeId(scopeIdOf(scope));
+    if (signedOutElsewhere) return;
+    await renderFeed(app, { openSettings: hash === 'settings', scope });
+  } catch (err) {
+    // Storage refuses this page's writes once another tab has signed out;
+    // a route that fails on that is handled just below, not an error.
+    if (!signedOutElsewhere) throw err;
+  }
+  // The sign-out arrived while the feed was being drawn: the feed may have
+  // been painted over the sign-in screen — and its listeners left running,
+  // if drawing then failed — so put the sign-in screen back.
+  if (signedOutElsewhere) {
+    showSignedOutElsewhere(app);
+    return;
+  }
   chatUiTeardown = mountChatUi(app, scopeIdOf(scope));
 }
 
@@ -393,7 +567,12 @@ async function handleShareTarget(): Promise<void> {
   const flagged = params.has('share');
   if (flagged) history.replaceState(null, '', '/');
 
-  const payloads = await drainShareInbox();
+  // A draft a page left for itself across a reload (see reloadKeepingDraft
+  // in feed.ts) is only for the account that typed it.
+  const accountId = getAccountId();
+  const payloads = (await drainShareInbox()).filter(
+    payload => !payload.draft || payload.draft.accountId === accountId,
+  );
   if (payloads.length === 0) return;
 
   // Hold SW updates while shared content sits unconfirmed in the composer

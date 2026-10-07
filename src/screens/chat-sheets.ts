@@ -21,6 +21,14 @@ export interface ModalHandle {
 
 /** The house sheet: portaled to body, scrim, Escape/backdrop/close-button
  *  dismissal. Also the shell for the chat switcher dialog. */
+/** Close functions of the sheets currently open. */
+const openModals = new Set<() => void>();
+
+/** Close every open sheet — the page is being taken over (signed out in another tab). */
+export function closeAllModals(): void {
+  for (const close of [...openModals]) close();
+}
+
 export function openModal(title: string, bodyHtml: string, opts: { onClose?: () => void } = {}): ModalHandle {
   const scrim = document.createElement('div');
   scrim.className = 'chat-modal-scrim';
@@ -34,10 +42,12 @@ export function openModal(title: string, bodyHtml: string, opts: { onClose?: () 
     </div>
   `;
   const close = () => {
+    openModals.delete(close);
     document.removeEventListener('keydown', onKey);
     scrim.remove();
     opts.onClose?.();
   };
+  openModals.add(close);
   const onKey = (e: KeyboardEvent) => {
     if (e.key === 'Escape') close();
   };
@@ -298,9 +308,19 @@ export async function showManageSheet(
     } else if (action === 'leave') {
       if (!confirm(`Leave ${chat.name}? You'll stop seeing it on your devices. To fully remove your access, ask the host to remove you.`)) return;
       modal.close();
-      await coordinator.leaveChat(chatId);
-      showToast(`You left ${chat.name}`);
-      opts.onGoneFromList?.();
+      try {
+        if (await coordinator.leaveChat(chatId, { generation: chat.generation })) {
+          showToast(`You left ${chat.name}`);
+          opts.onGoneFromList?.();
+        } else {
+          // Left and joined again in another tab since this sheet was drawn:
+          // the chat in the list is that later one, and it was not left.
+          showToast(`${chat.name} was joined again in another tab, so it is still here.`, 'error');
+        }
+      } catch (err) {
+        console.warn('[Chats] Leave failed:', err);
+        showToast('Couldn’t leave the chat. Try again.', 'error');
+      }
     }
   });
 }

@@ -15,8 +15,19 @@ export interface ComposerApi {
   setText(text: string): void;
   /** Add attachments (share target, drag-drop). */
   addFiles(files: File[]): void;
+  /** Text or attachments not sent yet. */
+  hasDraft(): boolean;
+  /** What is in the composer now. */
+  draft(): { text: string; files: File[] };
+  /**
+   * Put back a draft that could not be queued. The composer empties itself
+   * as it hands a draft over; if nothing came of it, the text and the
+   * attachments return, ahead of anything typed or attached since.
+   */
+  restore(text: string, files: File[]): void;
   focus(): void;
-  setSyncState(state: 'syncing' | 'synced' | 'error'): void;
+  /** `progress` labels a pass that is fetching drops: "Syncing — 120 of 312". */
+  setSyncState(state: 'syncing' | 'synced' | 'error', progress?: { received: number; total: number }): void;
   /** Grey out sending (a gone chat) — refresh/settings/chats stay usable. */
   setDisabled(disabled: boolean, placeholder?: string): void;
   /** Change the idle placeholder (a renamed chat) without touching disabled state. */
@@ -64,12 +75,16 @@ export function mountComposer(
 
   let pendingFiles: File[] = [];
 
-  function setSyncState(state: 'syncing' | 'synced' | 'error'): void {
+  function setSyncState(
+    state: 'syncing' | 'synced' | 'error',
+    progress?: { received: number; total: number },
+  ): void {
     refreshBtn.classList.toggle('syncing', state === 'syncing');
     refreshBtn.classList.toggle('sync-error', state === 'error');
     if (state === 'syncing') {
-      refreshBtn.title = 'Syncing';
-      refreshBtn.setAttribute('aria-label', 'Syncing');
+      const label = progress?.total ? `Syncing — ${progress.received} of ${progress.total}` : 'Syncing';
+      refreshBtn.title = label;
+      refreshBtn.setAttribute('aria-label', label);
       refreshBtn.setAttribute('aria-busy', 'true');
     } else if (state === 'error') {
       refreshBtn.title = 'Sync failed — refresh to retry';
@@ -208,6 +223,14 @@ export function mountComposer(
       autoGrow();
     },
     addFiles,
+    hasDraft: () => inputEl.value.trim() !== '' || pendingFiles.length > 0,
+    draft: () => ({ text: inputEl.value.trim(), files: [...pendingFiles] }),
+    restore(text: string, files: File[]) {
+      if (text) inputEl.value = inputEl.value.trim() ? `${text}\n${inputEl.value}` : text;
+      pendingFiles = [...files, ...pendingFiles];
+      renderChips();
+      autoGrow();
+    },
     focus: () => inputEl.focus(),
     setSyncState,
     setDisabled(disabled: boolean, placeholder?: string) {

@@ -22,6 +22,23 @@ function openShareDb(): Promise<IDBDatabase> {
   });
 }
 
+/**
+ * Leave a payload for the next start to find, as the service worker does
+ * for a share. Used to carry a draft across a reload the page needs: this
+ * database is not the app's store, so a page that store refuses can still
+ * write here.
+ */
+export async function putShareInbox(payload: SharePayload): Promise<void> {
+  const db = await openShareDb();
+  await new Promise<void>((resolve, reject) => {
+    const t = db.transaction(STORE, 'readwrite');
+    t.objectStore(STORE).add(payload);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
+
 /** Read and clear all pending share payloads. */
 export async function drainShareInbox(): Promise<SharePayload[]> {
   try {

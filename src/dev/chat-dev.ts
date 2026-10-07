@@ -14,15 +14,23 @@
  *   const found = await dev.resolveSharedChat('<token>')
  *   await dev.runDelta({ kind:'chat', chatId: found.descriptor.id, name: found.descriptor.name,
  *     role:'guest', host: found.descriptor.host, ...found })    // the delta answer
+ *
+ * Sync diagnostics:
+ *   await dev.syncStats()                                       // recorded passes + counters
+ *   dev.setDevFaults({ bodyFailRate: 0.05, bodyDelayMs: 200 })  // flaky, slow drop downloads
+ *   dev.setDevFaults({ bodyFailRate: 0, bodyDelayMs: 0 })       // back to normal
  */
 
 import * as chats from '../services/chats';
-import { runDelta } from '../services/graph';
+import { runDelta, setDevFaults } from '../services/graph';
+import { getDiagnostics } from '../services/sync-stats';
 
 export function installChatDevHarness(): void {
   (window as unknown as Record<string, unknown>).__milkboxChatDev = {
     ...chats,
     runDelta,
+    setDevFaults,
+    syncStats: getDiagnostics,
   };
   console.info('[Dev] window.__milkboxChatDev installed');
 }
