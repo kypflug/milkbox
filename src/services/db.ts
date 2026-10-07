@@ -289,14 +289,11 @@ export function getScopeDrops(scopeId: ScopeId): Promise<DropRecord[]> {
   return tx('drops', 'readonly', s => s.getAll(scopeRange(scopeId)) as IDBRequest<DropRecord[]>);
 }
 
-export async function putDrop(ref: ScopeRef, record: DropRecord): Promise<void> {
-  await writeForScope(ref, ['drops'], t => {
+/** Store one drop. Resolves false, writing nothing, when `ref` is not the stay held (see writeForScope). */
+export function putDrop(ref: ScopeRef, record: DropRecord): Promise<boolean> {
+  return writeForScope(ref, ['drops'], t => {
     t.objectStore('drops').put({ ...record, scopeId: ref.scopeId } satisfies StoredDropRecord);
   });
-}
-
-export function deleteDrop(scopeId: ScopeId, id: string): Promise<void> {
-  return tx('drops', 'readwrite', s => { s.delete([scopeId, id]); });
 }
 
 export function getDrop(scopeId: ScopeId, id: string): Promise<DropRecord | undefined> {
@@ -336,13 +333,15 @@ export interface DropCommitResult {
 }
 
 /**
- * Apply a sync pass's changes to one scope in a single transaction, so the
- * delta token and cTag can never be stored without the drops they describe
- * (a killed app would otherwise resume past drops it never wrote).
+ * Apply changes to one scope's drops in a single transaction — a sync
+ * pass's, so the delta token and cTag can never be stored without the drops
+ * they describe (a killed app would otherwise resume past drops it never
+ * wrote), or the local half of a delete that has just been sent.
  *
  * Puts land before deletes. For a chat scope the write is skipped entirely
- * when the chat record is gone — a pass that outlived a leave or delete must
- * not write drops back under the cleared scope.
+ * unless the chat is still held in the stay `ref` names (see writeForScope):
+ * work that outlived a leave must neither write drops back under the
+ * cleared scope nor remove them from the chat joined again since.
  */
 export async function commitDropChanges(ref: ScopeRef, commit: DropCommit): Promise<DropCommitResult> {
   const { scopeId } = ref;
@@ -386,10 +385,6 @@ export async function putThumb(ref: ScopeRef, dropId: string, blob: Blob): Promi
   });
 }
 
-export function deleteThumb(scopeId: ScopeId, dropId: string): Promise<void> {
-  return tx('thumbs', 'readwrite', s => { s.delete(mediaKey(scopeId, dropId)); });
-}
-
 // ─── blobs (full images, LRU capped, scoped keys) ───
 
 interface BlobEntry {
@@ -405,13 +400,14 @@ export async function getCachedBlob(scopeId: ScopeId, dropId: string): Promise<B
   const key = mediaKey(scopeId, dropId);
   const entry = await tx<BlobEntry | undefined>('blobs', 'readonly', s => s.get(key) as IDBRequest<BlobEntry | undefined>);
   if (entry) {
-    // Touch lastAccess (fire-and-forget) — only if the entry is still there:
-    // the scope may have been cleared since the read, and a plain put would
-    // bring the image back.
+    // Touch lastAccess (fire-and-forget) on the entry as it is now, if it is
+    // still there. Writing back the one read above would bring the image
+    // back after its scope was cleared — or, if the chat has been joined
+    // again and the image cached afresh, put the old bytes over the new.
     tx('blobs', 'readwrite', s => {
-      const held = s.getKey(key);
+      const held = s.get(key) as IDBRequest<BlobEntry | undefined>;
       held.onsuccess = () => {
-        if (held.result !== undefined) s.put({ ...entry, lastAccess: Date.now() });
+        if (held.result) s.put({ ...held.result, lastAccess: Date.now() });
       };
     }).catch(() => {});
     return entry.blob;
@@ -426,10 +422,6 @@ export async function putCachedBlob(ref: ScopeRef, dropId: string, blob: Blob): 
     );
   });
   sweepBlobCache().catch(() => {});
-}
-
-export function deleteCachedBlob(scopeId: ScopeId, dropId: string): Promise<void> {
-  return tx('blobs', 'readwrite', s => { s.delete(mediaKey(scopeId, dropId)); });
 }
 
 /** Evict least-recently-used blobs until the cache is under the cap. */
@@ -489,6 +481,19 @@ export async function hasOutboxRecord(id: string): Promise<boolean> {
 
 export function deleteOutboxRecord(id: string): Promise<void> {
   return tx('outbox', 'readwrite', s => { s.delete(id); });
+}
+
+/**
+ * Remove a record whose send has ended — from the stay the send was made
+ * in, and no other. Rows are keyed by drop id: after a chat has been left
+ * and joined again, the row under that id can be one the new stay queued
+ * for the same drop, which an earlier stay's send must not take with it.
+ * Resolves false when `ref` is not the stay held.
+ */
+export function removeOutboxRecord(ref: ScopeRef, id: string): Promise<boolean> {
+  return writeForScope(ref, ['outbox'], t => {
+    t.objectStore('outbox').delete(id);
+  });
 }
 
 // ─── device profiles ───

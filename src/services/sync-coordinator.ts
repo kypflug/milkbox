@@ -474,7 +474,7 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
         return;
       }
       await performOp(scope, record);
-      await db.deleteOutboxRecord(record.id);
+      await db.removeOutboxRecord(ref, record.id);
       emit({ type: 'feed-updated', scopeId });
       postBroadcast({
         type: 'drop-mutated',
@@ -491,9 +491,10 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       if (err instanceof graph.DropConflictError) {
         // The drop changed or was removed remotely — never retry (a retry
         // would resurrect what another member deleted). Remote wins; the
-        // next sync pass reconciles the local record.
-        await db.deleteOutboxRecord(record.id);
-        emit({ type: 'drop-conflict', scopeId, dropId: record.id });
+        // next sync pass reconciles the local record. (Nothing to report if
+        // the chat has been left since: the conflict was an earlier stay's.)
+        const ended = await db.removeOutboxRecord(ref, record.id);
+        if (ended) emit({ type: 'drop-conflict', scopeId, dropId: record.id });
         emit({ type: 'feed-updated', scopeId });
         return;
       }
@@ -523,9 +524,12 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
   if (record.op === 'delete') {
     await graph.deleteDropJson(scope, record.id);
     if (record.meta.file) await graph.deleteDropFiles(scope, record.id);
-    await db.deleteDrop(scopeId, record.id);
-    await db.deleteThumb(scopeId, record.id).catch(() => {});
-    await db.deleteCachedBlob(scopeId, record.id).catch(() => {});
+    // The local copy, its thumbnail and its cached image go together, and
+    // only from the stay this delete was queued in. If the chat has been
+    // left and joined again while the request was out, the rows there now
+    // are the new stay's: its own next pass removes the drop.
+    const { written } = await db.commitDropChanges(ref, { deletes: [record.id] });
+    if (!written) throw new SendWithdrawnError();
     return;
   }
 
@@ -554,7 +558,10 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
 
   const existing = record.op === 'edit' ? await db.getDrop(scopeId, meta.id) : undefined;
   const eTag = await graph.putDropJson(scope, meta, existing?.eTag);
-  await db.putDrop(ref, { meta, eTag });
+  // Stored in the stay the send was queued in. If the chat has been left
+  // (and perhaps joined again) while the request was out, the send ends
+  // here: what is stored now is not this send's to touch.
+  if (!(await db.putDrop(ref, { meta, eTag }))) throw new SendWithdrawnError();
 
   // Cache the local payload as the image blob so the sender gets an
   // instant render without a round-trip
