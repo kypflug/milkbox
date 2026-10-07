@@ -308,9 +308,19 @@ export async function showManageSheet(
     } else if (action === 'leave') {
       if (!confirm(`Leave ${chat.name}? You'll stop seeing it on your devices. To fully remove your access, ask the host to remove you.`)) return;
       modal.close();
-      await coordinator.leaveChat(chatId);
-      showToast(`You left ${chat.name}`);
-      opts.onGoneFromList?.();
+      try {
+        if (await coordinator.leaveChat(chatId)) {
+          showToast(`You left ${chat.name}`);
+          opts.onGoneFromList?.();
+        } else {
+          // Left and joined again in another tab while this was under way:
+          // the chat in the list is that later one, and it was not left.
+          showToast(`${chat.name} was joined again in another tab, so it is still here.`, 'error');
+        }
+      } catch (err) {
+        console.warn('[Chats] Leave failed:', err);
+        showToast('Couldn’t leave the chat. Try again.', 'error');
+      }
     }
   });
 }

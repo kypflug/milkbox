@@ -277,7 +277,7 @@ function watchForSignOutElsewhere(app: HTMLElement): void {
     // This tab's backup hooks (pagehide, going hidden) may be armed and the
     // token cache is still in localStorage until that logout finishes: a
     // backup from here would recreate the snapshot sign-out just deleted.
-    void clearMsalCacheBackup();
+    void clearMsalCacheBackup({ told: true });
     showSignedOutElsewhere(app);
   });
 }

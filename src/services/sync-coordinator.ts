@@ -40,7 +40,9 @@ import {
   enqueueRegistryOp,
   getRegistryOutbox,
   hasPendingRegistryOp,
+  registryOpWrites,
   removeRegistryOp,
+  type NewRegistryOp,
   type RegistryOp,
 } from './registry-outbox';
 
@@ -311,8 +313,13 @@ export async function enqueueEdit(scope: Scope, meta: DropMeta): Promise<void> {
     prevETag,
   });
   if (!written) throw await chatRefusal(scope, 'your edit was not saved');
-  // Optimistically update the local record so the edit shows immediately
-  if (existing) await db.putDrop(scopeRefOf(scope), { ...existing, meta });
+  // Optimistically update the local record so the edit shows immediately.
+  // Refused when the chat has been left since the row above was queued —
+  // which took that row with it — so the edit is not on its way anywhere:
+  // the editor is told, as when the row itself was refused.
+  if (existing && !(await db.putDrop(scopeRefOf(scope), { ...existing, meta }))) {
+    throw await chatRefusal(scope, 'your edit was not saved');
+  }
   emit({ type: 'feed-updated', scopeId });
   void drainOutbox(scopeId);
 }
@@ -845,8 +852,15 @@ async function announceArrivals(scope: Scope, ids: string[], mayPrime: boolean):
 }
 
 /**
- * The scope's feed was rendered while visible — clear its badge. `drawn`
- * is what that rendering held.
+ * The scope's feed was rendered while visible — clear its badge. `scope` is
+ * the feed's own, as it was when the feed opened, and `drawn` is what that
+ * rendering held.
+ *
+ * Only the stay the feed belongs to is marked read. A chat left and joined
+ * again in another tab is a later stay with its own unread count and its
+ * own last-read drop, and a feed still open on the earlier one is not the
+ * one to settle them: it opens again on the later stay when it learns of
+ * it (the feed's applyRename), and marks read from there.
  *
  * Arrivals still waiting to be settled that were drawn have been read:
  * left as they are, the pass or poll that settles them would count them
@@ -855,19 +869,25 @@ async function announceArrivals(scope: Scope, ids: string[], mayPrime: boolean):
  * about them now. In a window that is visible but not focused they stay, to
  * be announced once with the rest when the list is settled.
  */
-export async function markScopeRead(scopeId: ScopeId, lastDropId?: string, drawn?: ReadonlySet<string>): Promise<void> {
-  if (!scopeId.startsWith('chat:')) return;
-  const chatId = scopeId.slice(5);
-  const record = await db.getChat(chatId);
-  if (!record) return;
+export async function markScopeRead(scope: Scope, lastDropId?: string, drawn?: ReadonlySet<string>): Promise<void> {
+  if (scope.kind !== 'chat') return;
+  const record = await db.getChat(scope.chatId);
+  if (!record || record.generation !== scope.generation) return;
   if ((record.unreadCount ?? 0) !== 0 || record.lastReadDropId !== lastDropId) {
-    await db.patchChat(chatId, { unreadCount: 0, ...(lastDropId ? { lastReadDropId: lastDropId } : {}) });
+    // Checked again inside the write: the chat can be left and joined
+    // again between the read above and this.
+    const patched = await db.patchChat(
+      scope.chatId,
+      { unreadCount: 0, ...(lastDropId ? { lastReadDropId: lastDropId } : {}) },
+      { generation: scope.generation },
+    );
+    if (!patched) return;
     emit({ type: 'chats-changed' });
   }
   if (!drawn?.size) return;
   try {
-    if (!(await db.getSetting<string[]>(db.arrivalsKey(scopeId)))?.length) return;
-    await db.markArrivalsShown(scopeRefOf(chatScopeOf(record)), drawn, document.hasFocus());
+    if (!(await db.getSetting<string[]>(db.arrivalsKey(scopeIdOf(scope))))?.length) return;
+    await db.markArrivalsShown(scopeRefOf(scope), drawn, document.hasFocus());
   } catch (err) {
     console.debug('[Sync] Could not note the arrivals that were shown:', err);
   }
@@ -1703,15 +1723,19 @@ export async function joinChat(shareToken: string): Promise<ChatRecord> {
  * Guest: leave a chat. Local cleanup is immediate; the remote cleanup
  * (member file, roaming pointer) is queued durably so the leave reaches
  * the account's other devices even if this attempt is throttled or offline.
+ *
+ * Resolves false when the chat is still here because it is no longer the
+ * stay that was being left: left and joined again in another tab meanwhile.
  */
-export async function leaveChat(chatId: string): Promise<void> {
+export async function leaveChat(chatId: string): Promise<boolean> {
   const record = await db.getChat(chatId);
-  if (!record) return;
+  if (!record) return true;
+  const intents: NewRegistryOp[] = [];
   if (record.role === 'guest') {
     if (record.state !== 'gone') {
       const me = await ensureMe();
       if (me) {
-        await enqueueRegistryOp({
+        intents.push({
           op: 'delete-member',
           chatId,
           driveId: record.driveId,
@@ -1720,18 +1744,34 @@ export async function leaveChat(chatId: string): Promise<void> {
         });
       }
     }
-    await enqueueRegistryOp({ op: 'delete-pointer', chatId });
+    intents.push({ op: 'delete-pointer', chatId });
   }
-  await forgetChat(record);
+  const left = await forgetChat(record, intents);
   void drainRegistryOutbox();
+  return left;
 }
 
-/** Drop a chat from this install and tell every listener, this tab's and the others'. */
-async function forgetChat(record: ChatRecord): Promise<void> {
-  dropScopeState(`chat:${record.id}`);
-  await db.clearScopeData(`chat:${record.id}`);
+/**
+ * Drop a chat from this install and tell every listener, this tab's and the
+ * others'. `intents` is what the removal asks of OneDrive.
+ *
+ * Only the stay `record` was read from is dropped. The caller read it and
+ * then waited (for the user's profile, at least): another tab can have left
+ * the chat and joined it again by now, and that later stay is not this
+ * call's to remove — neither its drops nor, on OneDrive, its member file
+ * and pointer. So the clear and the intents are one transaction, which
+ * does nothing unless the record held is still that stay. Resolves false
+ * only when a later stay is held instead.
+ */
+async function forgetChat(record: ChatRecord, intents: readonly NewRegistryOp[]): Promise<boolean> {
+  const scopeId: ScopeId = `chat:${record.id}`;
+  if (!(await db.clearScopeData(scopeId, { generation: record.generation }, registryOpWrites(intents)))) {
+    return !(await db.getChat(record.id));
+  }
+  dropScopeState(scopeId);
   emit({ type: 'chats-changed' });
   postBroadcast({ type: 'chats-changed', removedChatId: record.id });
+  return true;
 }
 
 /** Host: delete the chat for everyone (removes the folder from OneDrive). */
@@ -1754,8 +1794,7 @@ export async function deleteChatHosted(chatId: string): Promise<void> {
 export async function removeChatLocally(chatId: string): Promise<void> {
   const record = await db.getChat(chatId);
   if (!record) return;
-  if (record.role === 'guest') await enqueueRegistryOp({ op: 'delete-pointer', chatId });
-  await forgetChat(record);
+  await forgetChat(record, record.role === 'guest' ? [{ op: 'delete-pointer', chatId }] : []);
   void drainRegistryOutbox();
 }
 

@@ -850,13 +850,18 @@ function scopeSettingsKeys(scopeId: ScopeId): string[] {
  *
  * With `only`, a chat is cleared only while the record held is still the
  * stay `only.generation` names: for a removal decided from an earlier
- * reading (the registry pass lists OneDrive first), which must not take a
- * chat that has been left and joined again since. Resolves false when
- * nothing was cleared for that reason.
+ * reading (the registry pass lists OneDrive first, a leave reads the record
+ * and then waits), which must not take a chat that has been left and joined
+ * again since. Resolves false when nothing was cleared for that reason.
+ *
+ * `alongside` is settings written in the same transaction, and only if the
+ * scope is cleared: what a leave queues for OneDrive, so that a leave which
+ * turns out to be for an earlier stay queues nothing against the later one.
  */
 export async function clearScopeData(
   scopeId: ScopeId,
   only?: { generation: string | undefined },
+  alongside?: { puts: Array<[string, unknown]>; deletes: string[] },
 ): Promise<boolean> {
   const db = await openDb();
   const chatId = scopeId.startsWith('chat:') ? scopeId.slice(5) : null;
@@ -866,7 +871,10 @@ export async function clearScopeData(
       t.objectStore('drops').delete(scopeRange(scopeId));
       t.objectStore('thumbs').delete(mediaRange(scopeId));
       t.objectStore('blobs').delete(mediaRange(scopeId));
-      for (const key of scopeSettingsKeys(scopeId)) t.objectStore('settings').delete(key);
+      const settings = t.objectStore('settings');
+      for (const key of scopeSettingsKeys(scopeId)) settings.delete(key);
+      for (const key of alongside?.deletes ?? []) settings.delete(key);
+      for (const [key, value] of alongside?.puts ?? []) settings.put(value, key);
       if (chatId) t.objectStore('chats').delete(chatId);
       const outboxStore = t.objectStore('outbox');
       const req = outboxStore.getAll() as IDBRequest<OutboxRecord[]>;

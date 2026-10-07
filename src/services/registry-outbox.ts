@@ -114,23 +114,43 @@ export async function getRegistryOutbox(): Promise<RegistryOp[]> {
   return ops.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
 }
 
-type NewRegistryOp =
+export type NewRegistryOp =
   | { op: 'put-pointer'; chatId: string; pointer: JoinedChatPointer }
   | { op: 'delete-pointer'; chatId: string }
   | { op: 'delete-member'; chatId: string; driveId: string; itemId: string; memberId: string };
 
+/** The settings rows to write and to delete that record these intents. */
+export interface RegistryOpWrites {
+  puts: Array<[string, unknown]>;
+  deletes: string[];
+}
+
+/**
+ * What recording these intents writes: each replaces any queued op of the
+ * same kind for its chat and cancels the opposite pointer op. For a caller
+ * that has to record them inside a transaction of its own — a leave, which
+ * queues its intents only if the chat it removes is still the stay it read
+ * (see the coordinator's forgetChat).
+ */
+export function registryOpWrites(entries: readonly NewRegistryOp[]): RegistryOpWrites {
+  const writes: RegistryOpWrites = { puts: [], deletes: [] };
+  for (const entry of entries) {
+    const opposite: RegistryOpKind | null =
+      entry.op === 'put-pointer' ? 'delete-pointer'
+        : entry.op === 'delete-pointer' ? 'put-pointer'
+          : null;
+    const row: RegistryOp = { ...entry, enqueuedAt: Date.now(), attempts: 0, nextAt: 0 };
+    writes.puts.push([keyOf(entry.op, entry.chatId), row]);
+    if (opposite) writes.deletes.push(keyOf(opposite, entry.chatId));
+  }
+  return writes;
+}
+
 /** Record an intent. Replaces any queued op of the same kind for the chat
  *  and cancels the opposite pointer op, atomically. */
 export function enqueueRegistryOp(entry: NewRegistryOp): Promise<void> {
-  const opposite: RegistryOpKind | null =
-    entry.op === 'put-pointer' ? 'delete-pointer'
-      : entry.op === 'delete-pointer' ? 'put-pointer'
-        : null;
-  const row: RegistryOp = { ...entry, enqueuedAt: Date.now(), attempts: 0, nextAt: 0 };
-  return updateSettings(
-    [[keyOf(entry.op, entry.chatId), row]],
-    opposite ? [keyOf(opposite, entry.chatId)] : [],
-  );
+  const { puts, deletes } = registryOpWrites([entry]);
+  return updateSettings(puts, deletes);
 }
 
 export function removeRegistryOp(op: RegistryOpKind, chatId: string): Promise<void> {

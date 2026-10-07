@@ -106,24 +106,29 @@ let activeWrite: IDBTransaction | null = null;
 const REVOKED_KEY = 'milkbox:backup-revoked';
 
 /**
- * Changed every time a sign-out starts clearing the backup, and never taken
- * back. A restore that was waiting on IndexedDB meanwhile reads it before
- * and after: the revoked mark alone would not tell it, because a delete
- * that lands promptly lifts the mark again — after the restore has read the
- * snapshot, and before it has written anything.
+ * Changed by the tab that signs out, every time it starts clearing the
+ * backup, and never taken back: what tells any page, in any tab, that a
+ * sign-out has started since it last looked. The revoked mark alone would
+ * not, because a delete that lands promptly lifts it again.
+ *
+ * - A restore that was waiting on IndexedDB reads it before and after, and
+ *   does not write back a snapshot it read across a sign-out.
+ * - A page that finds it changed since it loaded writes no more snapshots
+ *   (see signOutBegun).
+ * - The mark is only lifted by whoever has seen no sign-out start in the
+ *   meantime (see liftRevoked).
+ *
+ * Only the signing-out tab changes it. A tab that is merely told of the
+ * sign-out may hear of it late — after the next session has signed in —
+ * and a stamp from it then would stop that session's pages backing up.
  */
 const REVOCATION_STAMP_KEY = 'milkbox:backup-revocation';
 
-function setRevoked(revoked: boolean): void {
+function revocationStamp(): string | null {
   try {
-    if (revoked) {
-      localStorage.setItem(REVOKED_KEY, '1');
-      localStorage.setItem(REVOCATION_STAMP_KEY, `${Date.now()}-${Math.random()}`);
-    } else {
-      localStorage.removeItem(REVOKED_KEY);
-    }
+    return localStorage.getItem(REVOCATION_STAMP_KEY);
   } catch {
-    // localStorage unavailable: the bounded delete below is all there is
+    return null;
   }
 }
 
@@ -135,12 +140,60 @@ function isRevoked(): boolean {
   }
 }
 
-function revocationStamp(): string | null {
+/**
+ * A sign-out starts, or reaches its delete: a new stamp, then the mark. In
+ * that order, so that a page which can see the mark can see the stamp too.
+ */
+function markRevoked(): void {
   try {
-    return localStorage.getItem(REVOCATION_STAMP_KEY);
+    localStorage.setItem(REVOCATION_STAMP_KEY, `${Date.now()}-${Math.random()}`);
+    localStorage.setItem(REVOKED_KEY, '1');
   } catch {
-    return null;
+    // localStorage unavailable: the bounded delete below is all there is
   }
+}
+
+/**
+ * Lift the mark — unless a sign-out has started since `stamp` was read. The
+ * caller read it before the work that entitles it to lift: a delete that
+ * has since landed, or a snapshot written by a session that is still good.
+ * A sign-out that started during that work set the mark for a reason this
+ * caller knows nothing about, and its mark stays.
+ *
+ * As far as this page can see, that is. localStorage has no
+ * compare-and-set, and a page sees another tab's writes only between its
+ * own tasks: a sign-out that started in another tab an instant ago may not
+ * show here yet, and looking again within this call would not find it.
+ * What covers that instant is that a sign-out does not rely on one mark:
+ * it marks again, seconds later, just before its delete (see
+ * clearMsalCacheBackup), and by then every page has seen the first stamp.
+ */
+function liftRevoked(stamp: string | null): void {
+  try {
+    if (localStorage.getItem(REVOCATION_STAMP_KEY) !== stamp) return;
+    localStorage.removeItem(REVOKED_KEY);
+  } catch {
+    // localStorage unavailable: there is no mark to lift
+  }
+}
+
+/**
+ * The stamp as this page found it when it loaded. One that differs later
+ * was set by a sign-out that started after this page loaded, so the session
+ * this page loaded with is the one that sign-out ends. (The page of a later
+ * session loads after it, and finds its stamp already there.)
+ */
+const stampAtLoad = revocationStamp();
+
+/**
+ * A sign-out has started since this page loaded: here, or in another tab,
+ * which this one may not have heard from yet (the broadcast comes later
+ * than the stamp, and a page that was suspended gets it later still). The
+ * token cache this page would snapshot is the session being signed out, so
+ * it writes no more snapshots, and none it had under way lifts the mark.
+ */
+function signOutBegun(): boolean {
+  return backupsDisabled || revocationStamp() !== stampAtLoad;
 }
 
 /** How long sign-out lets a snapshot write already under way finish. */
@@ -156,7 +209,7 @@ const DELETE_WAIT_MS = 3000;
  * afterwards, so the last change always lands without stacking writes.
  */
 export function backupMsalCache(): Promise<void> {
-  if (backupsDisabled) return Promise.resolve();
+  if (signOutBegun()) return Promise.resolve();
   if (backupRunning) {
     backupAgain = true;
     return backupRunning;
@@ -166,7 +219,7 @@ export function backupMsalCache(): Promise<void> {
       do {
         backupAgain = false;
         await writeSnapshot();
-      } while (backupAgain && !backupsDisabled);
+      } while (backupAgain && !signOutBegun());
     } finally {
       backupRunning = null;
     }
@@ -196,7 +249,7 @@ async function writeSnapshot(): Promise<void> {
 
     const db = await openBackupDB();
     // Sign-out began while the connection was opening: nothing more is written.
-    if (backupsDisabled) return;
+    if (signOutBegun()) return;
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       activeWrite = tx;
@@ -209,8 +262,11 @@ async function writeSnapshot(): Promise<void> {
         lastSnapshot = serialized;
         counters.backups++;
         // A snapshot of a signed-in session replaces whatever a past sign-out
-        // failed to delete. (Not once this page's own sign-out has begun.)
-        if (!backupsDisabled) setRevoked(false);
+        // failed to delete. Not when a sign-out has started since this page
+        // loaded, in this tab or another: this write was then under way as
+        // it began, the snapshot is of the session it is ending, and the
+        // mark is that sign-out's.
+        if (!backupsDisabled) liftRevoked(stampAtLoad);
         console.debug('[AuthBackup] Saved %d MSAL keys to IndexedDB', Object.keys(snapshot).length);
         resolve();
       };
@@ -301,7 +357,10 @@ export async function restoreMsalCacheIfNeeded(): Promise<boolean> {
 
 /**
  * Delete the snapshot, giving up after `ms`. Resolves true only once the
- * delete has committed, and lifts the revoked mark then. Never rejects.
+ * delete has committed, and lifts the revoked mark then — unless another
+ * sign-out has started since this delete was asked for: what is stored by
+ * then may have been written after the delete, and is that sign-out's to
+ * clear. Never rejects.
  *
  * A delete still waiting its turn at the limit is aborted, so it cannot run
  * later, over a snapshot written since by a session that signed in
@@ -309,6 +368,7 @@ export async function restoreMsalCacheIfNeeded(): Promise<boolean> {
  * have lifted stays set until the next launch retries.)
  */
 function deleteSnapshot(ms: number): Promise<boolean> {
+  const stamp = revocationStamp();
   return new Promise(resolve => {
     let tx: IDBTransaction | null = null;
     let settled = false;
@@ -316,7 +376,7 @@ function deleteSnapshot(ms: number): Promise<boolean> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (deleted) setRevoked(false);
+      if (deleted) liftRevoked(stamp);
       resolve(deleted);
     };
     const timer = setTimeout(() => {
@@ -365,12 +425,13 @@ function deleteSnapshot(ms: number): Promise<boolean> {
  */
 export function revokeMsalCacheBackup(): void {
   backupsDisabled = true;
-  setRevoked(true);
+  markRevoked();
 }
 
 /**
- * Clear the IndexedDB backup (call on explicit sign-out). Never rejects, and
- * never takes longer than WRITE_WAIT_MS + DELETE_WAIT_MS.
+ * Clear the IndexedDB backup: on explicit sign-out, and, with `told`, in a
+ * tab that hears of a sign-out in another. Never rejects, and never takes
+ * longer than WRITE_WAIT_MS + DELETE_WAIT_MS.
  *
  * Ordered so nothing can put the snapshot back: first no new backups from
  * this page (the pagehide hook would otherwise snapshot the cache on the way
@@ -384,9 +445,17 @@ export function revokeMsalCacheBackup(): void {
  * aborted: the delete is ordered after it. And whenever the delete does not
  * land in time, the revoked mark stays set, which is what keeps a snapshot
  * left behind from being restored.
+ *
+ * A tab that is told stops its own backups and helps with the delete, but
+ * starts no revocation of its own: no stamp, no mark. The signing-out tab
+ * set both before it sent word. And it deletes only while that tab's mark
+ * still stands. Told late — it was suspended, and another session has
+ * signed in since — it finds the mark lifted, and what is stored then is
+ * that session's snapshot, not something of this sign-out's to remove.
  */
-export async function clearMsalCacheBackup(): Promise<void> {
-  revokeMsalCacheBackup();
+export async function clearMsalCacheBackup(opts: { told?: boolean } = {}): Promise<void> {
+  if (opts.told) backupsDisabled = true;
+  else revokeMsalCacheBackup();
   const writing = backupRunning;
   if (writing) {
     const finished = await Promise.race([
@@ -409,9 +478,14 @@ export async function clearMsalCacheBackup(): Promise<void> {
     }
   }
   lastSnapshot = '';
+  if (opts.told) {
+    if (isRevoked()) await deleteSnapshot(DELETE_WAIT_MS);
+    return;
+  }
   // Marked again: another tab told of this sign-out may have confirmed its
   // own delete, and lifted the mark, before this page's write had finished.
-  setRevoked(true);
+  // (The new stamp also stops a page that loaded since the first one.)
+  markRevoked();
   await deleteSnapshot(DELETE_WAIT_MS);
 }
 

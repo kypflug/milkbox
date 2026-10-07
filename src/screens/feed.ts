@@ -252,7 +252,7 @@ export async function renderFeed(
       const lastId = feed.length ? feed[feed.length - 1].meta.id : undefined;
       // What was drawn: the page of the feed that is in the list, not all of it.
       void coordinator
-        .markScopeRead(scopeId, lastId, new Set(visible.map(record => record.meta.id)))
+        .markScopeRead(scope, lastId, new Set(visible.map(record => record.meta.id)))
         .catch(err => console.debug('[Chats] Mark read failed:', err));
     }
   }
@@ -517,7 +517,12 @@ export async function renderFeed(
     banner.addEventListener('click', async e => {
       const action = (e.target as HTMLElement).closest<HTMLElement>('[data-banner]')?.dataset.banner;
       if (action === 'remove') {
-        await coordinator.removeChatLocally(scope.chatId);
+        try {
+          await coordinator.removeChatLocally(scope.chatId);
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : 'Could not remove the chat', 'error');
+          return;
+        }
         history.replaceState(null, '', '/');
         window.dispatchEvent(new HashChangeEvent('hashchange'));
       } else if (action === 'reconnect') {
@@ -764,7 +769,14 @@ export async function renderFeed(
     // Access ended, was paused or came back since this screen was drawn:
     // draw it again, so the banner, the composer and the empty-feed copy all
     // follow (an empty chat would otherwise keep saying it is retrying).
-    if ((record.state ?? 'active') !== chatState && listEl.isConnected) {
+    //
+    // The same when the chat held is no longer the stay this screen opened
+    // on: left and joined again in another tab, with the removal's own
+    // broadcast missed (it can arrive before this screen is listening). The
+    // screen would go on drawing the later stay's drops, which are stored
+    // under the same scope, while its sends and its mark-read are refused
+    // as an earlier stay's. Drawn again, it opens on the stay that is held.
+    if (((record.state ?? 'active') !== chatState || record.generation !== scope.generation) && listEl.isConnected) {
       window.dispatchEvent(new HashChangeEvent('hashchange'));
       return;
     }
