@@ -922,6 +922,28 @@ export async function putScopeSetting(ref: ScopeRef, key: string, value: unknown
   });
 }
 
+/**
+ * Read a scope setting and write what `update` makes of it, in the one
+ * transaction (and only for the stay `ref` names, as putScopeSetting). Two
+ * callers moving the same setting at once cannot each read the value from
+ * before the other and write the other's change away. `update` is given
+ * undefined when nothing is stored; returning undefined writes nothing.
+ */
+export async function updateScopeSetting<T>(
+  ref: ScopeRef,
+  key: string,
+  update: (current: T | undefined) => T | undefined,
+): Promise<void> {
+  await writeForScope(ref, ['settings'], t => {
+    const settings = t.objectStore('settings');
+    const current = settings.get(key) as IDBRequest<T | undefined>;
+    current.onsuccess = () => {
+      const next = update(current.result);
+      if (next !== undefined) settings.put(next, key);
+    };
+  });
+}
+
 export function deleteSetting(key: string): Promise<void> {
   return tx('settings', 'readwrite', s => { s.delete(key); });
 }

@@ -1692,6 +1692,11 @@ export function getCachedMembers(scopeId: ScopeId): Promise<import('../types').C
  * only expose link-level grants (everyone who redeemed the link shares one
  * permission) — then there is nothing individual to delete and this throws
  * 'unsupported'; the UI offers "Reset invite link" instead.
+ *
+ * Once the grant is deleted the member is removed, and this resolves
+ * whatever becomes of the roster read that follows. Rejecting there would
+ * tell the host the removal had failed, and a second try could only answer
+ * 'unsupported': there is no grant left for it to find.
  */
 export async function removeMember(chatId: string, memberId: string): Promise<void> {
   const record = await db.getChat(chatId);
@@ -1701,8 +1706,27 @@ export async function removeMember(chatId: string, memberId: string): Promise<vo
   if (!direct) throw new Error('unsupported');
   await chatsApi.deleteChatPermission(record, direct.id);
   await chatsApi.deleteMemberFile(record, memberId).catch(() => {});
-  const members = await chatsApi.listMembers(record);
-  await db.putScopeSetting(scopeRefOf(chatScopeOf(record)), membersKey(`chat:${chatId}`), members);
+  const scopeId: ScopeId = `chat:${chatId}`;
+  const ref = scopeRefOf(chatScopeOf(record));
+  let members: import('../types').ChatMember[] | undefined;
+  try {
+    members = await chatsApi.listMembers(record);
+  } catch (err) {
+    noteThrottle(err);
+    console.debug('[Chats] Roster read after a removal failed; the next pass reads it:', err);
+    // The chat's next pass reads the roster again, whatever that pass moves.
+    stateFor(scopeId).lastMembersFetch = 0;
+    // Until then the cached roster stands in, less the member just removed:
+    // the manage sheet is drawn from it, and left as it was it would offer
+    // them for removal again. Read and written in one transaction, so that
+    // two removals whose roster reads both fail cannot each write the
+    // other's member back; and where no roster is cached none is made up,
+    // since an absent cache is what has the next pass read it.
+    await db.updateScopeSetting<import('../types').ChatMember[]>(ref, membersKey(scopeId), cached =>
+      cached?.filter(member => member.id !== memberId),
+    );
+  }
+  if (members) await db.putScopeSetting(ref, membersKey(scopeId), members);
   emit({ type: 'chats-changed' });
 }
 
