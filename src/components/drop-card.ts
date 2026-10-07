@@ -25,28 +25,17 @@ function linkify(escaped: string): string {
 }
 
 function metaLine(record: DropRecord, attributionLabel: string): string {
-  const { meta, state, op } = record;
+  const { meta, state } = record;
   const time = formatTime(meta.createdAt);
   const label = escapeHtml(attributionLabel);
   const edited = meta.editedAt ? ' · EDITED' : '';
-  // A failed delete is of a drop that was sent long ago: plain "FAILED"
-  // would read as though the drop itself had not gone out.
-  const failed = op === 'delete' ? ' · DELETE FAILED' : ' · FAILED';
-  const status = state === 'sending' ? ' · SENDING' : state === 'failed' ? failed : '';
+  const status =
+    state === 'sending' ? ' · SENDING' : state === 'failed' ? ' · FAILED' : '';
   return `<div class="drop-meta">${time} · ${label}${edited}${status}</div>`;
 }
 
 function actionsRow(record: DropRecord, presentation: DropCardPresentation): string {
-  const { meta, state, op } = record;
-  if (state === 'failed' && op === 'delete') {
-    // Giving up a delete keeps the drop, so it is neither called a discard
-    // nor styled as the destructive choice.
-    return `
-      <div class="drop-actions" role="toolbar" aria-label="Drop actions">
-        <button class="drop-action" data-action="retry" title="Retry delete">${iconRetry()}</button>
-        <button class="drop-action" data-action="discard" title="Keep drop">${iconClose()}</button>
-      </div>`;
-  }
+  const { meta, state } = record;
   if (state === 'failed') {
     return `
       <div class="drop-actions" role="toolbar" aria-label="Drop actions">
@@ -131,10 +120,14 @@ export function renderDropCard(
   record: DropRecord,
   presentation: DropCardPresentation,
 ): string {
-  const { meta, state } = record;
+  const { meta, state, sendToken } = record;
   const stateClass = state ? ` drop-card--${state}` : '';
+  // The send this card shows, for its Retry and Discard (see
+  // DropRecord.sendToken). On the card itself, so that a click acts on what
+  // was drawn and not on whatever the feed describes by then.
+  const tokenAttr = state && sendToken ? ` data-send-token="${escapeAttr(sendToken)}"` : '';
   return `
-    <article class="drop-card drop-card--${meta.kind} drop-card--${presentation.side}${stateClass}" data-drop-id="${escapeAttr(meta.id)}">
+    <article class="drop-card drop-card--${meta.kind} drop-card--${presentation.side}${stateClass}" data-drop-id="${escapeAttr(meta.id)}"${tokenAttr}>
       ${bodyFor(record)}
       ${metaLine(record, presentation.attributionLabel)}
       ${actionsRow(record, presentation)}

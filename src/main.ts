@@ -358,6 +358,9 @@ async function enterApp(app: HTMLElement): Promise<void> {
   // account has elsewhere (hosted folders + roaming pointers).
   void coordinator.ensureMe();
   void coordinator.catchUpRegistry();
+  // A delete the last session left backing off is not made to wait out the
+  // rest of it: the app starting is as good a moment as coming back to it.
+  void coordinator.retryDeferredDeletes();
 
   // A notification tap on an already-open window arrives as a worker
   // message — route to the scope it named.
@@ -532,16 +535,22 @@ function mountChatUi(app: HTMLElement, currentScopeId: ScopeId): () => void {
  * pair of cTag GETs with its own short floor, so it runs on every resume;
  * only the token refresh keeps the longer floor. Coming back online does
  * the same, since a join or leave made offline is waiting to be written.
+ *
+ * So is a delete made offline: it backs off between tries, and a resume or
+ * a reconnect cuts that wait short (see coordinator.retryDeferredDeletes).
  */
 function setupResumeHandler(): void {
   let lastRefresh = Date.now();
   const REFRESH_FLOOR_MS = 30_000;
 
-  const catchUpRegistry = () => void coordinator.catchUpRegistry(true);
+  const catchUp = () => {
+    void coordinator.catchUpRegistry(true);
+    void coordinator.retryDeferredDeletes();
+  };
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
-    catchUpRegistry();
+    catchUp();
 
     const now = Date.now();
     if (now - lastRefresh < REFRESH_FLOOR_MS) return;
@@ -551,7 +560,7 @@ function setupResumeHandler(): void {
       console.debug('[Auth] Resume token refresh failed — next Graph call will handle it');
     });
   });
-  window.addEventListener('online', catchUpRegistry);
+  window.addEventListener('online', catchUp);
 }
 
 /**
