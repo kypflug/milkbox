@@ -770,7 +770,11 @@ export interface DeltaOptions {
    * completes come back in `upserts`, for the caller's final commit.
    */
   onBatch?: (records: DropRecord[]) => Promise<void>;
-  /** How many bodies the pass is about to download. */
+  /**
+   * How many drops the pass is about to download. Called again, with one
+   * fewer, each time a body turns out not to hold a drop: that one is never
+   * handed over, and a caller counting "N of M" would wait for it for good.
+   */
   onEnumerated?: (toDownload: number) => void;
   signal?: AbortSignal;
   /**
@@ -936,7 +940,9 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
     }
   }
   pending.sort((a, b) => (a.id < b.id ? 1 : -1));
-  opts.onEnumerated?.(pending.length);
+  /** Drops still expected out of `pending`: its length, less the bodies found malformed. */
+  let expected = pending.length;
+  opts.onEnumerated?.(expected);
 
   // ── 2. download, newest first ──
   // One slot per `pending` place: undefined while its body is downloading,
@@ -1040,6 +1046,7 @@ export async function runDelta(scope: Scope, opts: DeltaOptions = {}): Promise<D
           console.debug('[Sync] Discarding malformed drop JSON: %s.json', op.id);
           if (stats) stats.malformed++;
           slots[index] = null;
+          opts.onEnumerated?.(--expected);
         }
         // In order while that keeps moving; around a straggler (or a slow
         // connection that hasn't filled a batch) once patience runs out.

@@ -562,8 +562,15 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
     if (!(await db.hasOutboxRecord(record.id))) throw new SendWithdrawnError();
   }
 
+  // An edit is conditional on the version it replaces: the eTag the local
+  // copy holds. Without a local copy the row's own record of that version
+  // stands in (prevETag). A re-sync from scratch keeps the outbox and clears
+  // the drops, and a pass may have removed the drop: an edit sent then with
+  // no condition at all would overwrite a newer version, or bring back a
+  // drop another member deleted, which a chat's edit must never do
+  // (putDropJson). A create has neither, and is not conditional.
   const existing = record.op === 'edit' ? await db.getDrop(scopeId, meta.id) : undefined;
-  const eTag = await graph.putDropJson(scope, meta, existing?.eTag);
+  const eTag = await graph.putDropJson(scope, meta, existing?.eTag ?? (record.op === 'edit' ? record.prevETag : undefined));
   // Stored in the stay the send was queued in. If the chat has been left
   // (and perhaps joined again) while the request was out, the send ends
   // here: what is stored now is not this send's to touch.
@@ -1114,9 +1121,12 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
           known,
           fromScratch,
           signal: controller.signal,
+          // Called again when a body turns out to be malformed, with a total
+          // one smaller: said too, even when that leaves nothing to count.
           onEnumerated: toDownload => {
+            const announced = total > 0;
             total = toDownload;
-            if (total) emit({ type: 'sync-progress', scopeId, received, total });
+            if (total || announced) emit({ type: 'sync-progress', scopeId, received, total });
           },
           // Each batch is committed and shown as it arrives, newest first.
           onBatch: async records => {
@@ -1196,6 +1206,14 @@ async function runScopeSync(scope: Scope, st: ScopeSyncState, knownCTag?: string
         // out or already stored, shows no such moment.
         if (last.landed.size) firstCommitMs ??= performance.now() - t0;
         received += result.upserts.length;
+        // The count for this commit too: the pass has more to do (device
+        // profiles, a chat's roster), and until it ends the label would
+        // stand at the last batch's count with every drop already stored.
+        // (Never past the total: a chat whose delta gave way to a listing
+        // part-way hands some drops over twice.)
+        if (total && result.upserts.length) {
+          emit({ type: 'sync-progress', scopeId, received: Math.min(received, total), total });
+        }
         // Only what this device held when the commit removed it: the
         // tombstone for a drop it deleted itself (already gone locally, before
         // the pass or during it) is not a removal.

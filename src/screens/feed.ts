@@ -963,6 +963,11 @@ export async function renderFeed(
     switch (event.type) {
       case 'sync-start':
         composerApi?.setSyncState('syncing');
+        // A pass that was stopped (a re-sync from scratch) ends without a
+        // word, its count still standing. The pass starting now has none
+        // yet, and an empty first-sync screen must not show the old one.
+        syncProgress = null;
+        if (feed.length === 0) scheduleRefresh();
         break;
       case 'sync-progress':
         syncProgress = { received: event.received, total: event.total };
