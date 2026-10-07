@@ -472,7 +472,7 @@ export class DropConflictError extends Error {
  * body, as the conflict it is, and one landing just after the body leaves
  * the local copy at an eTag already replaced, which the next pass corrects.
  */
-async function landedWrite(scope: Scope, id: string, body: string): Promise<{ eTag?: string } | null> {
+async function landedWrite(scope: Scope, id: string, body: string): Promise<{ eTag: string } | null> {
   const ref = scopeRef(scope);
   const tier = scopeTier(scope);
   const path = dropJsonPath(id);
@@ -485,37 +485,69 @@ async function landedWrite(scope: Scope, id: string, body: string): Promise<{ eT
     if (isGoneError(err)) return null;
     throw err;
   }
+  // An answer without an eTag cannot stand for the write having landed: the
+  // local copy would be stored with none, and the next edit of the drop would
+  // go out with no condition. It is the conflict instead, and the pass that
+  // follows brings the drive's version, which is this one.
+  const eTag = item.eTag;
+  if (typeof eTag !== 'string' || !eTag) return null;
   const held = await downloadItemJson(item, contentUrl(ref, path), tier);
-  return JSON.stringify(held, null, 2) === body ? { eTag: item.eTag } : null;
+  return JSON.stringify(held, null, 2) === body ? { eTag } : null;
+}
+
+/**
+ * Thrown when a private-feed edit finds its drop gone — deleted on another
+ * device while the edit waited to be sent. Terminal, like a chat's conflict:
+ * the delete stands, and the caller drops the queued edit.
+ */
+export class DropGoneError extends Error {
+  constructor(public dropId: string) {
+    super(`Drop ${dropId} was deleted`);
+  }
 }
 
 /**
  * Upload a drop's JSON. Path-based PUT auto-creates the drops/ folder (and
  * the approot itself) on first write. Pass eTag for a conditional write on
  * edits. Conflict handling differs by scope:
- * - private: retry once unconditionally — the data is single-user, conflicts
- *   are self-races, last write wins;
+ * - private: write once more, last write wins — the data is single-user,
+ *   conflicts are self-races — but only over a drop that is still there.
+ *   The second write is conditional too, on the version OneDrive holds by
+ *   then, read for the purpose: sent with no condition it would create the
+ *   file, and an edit must not bring back a drop that has been deleted.
+ *   With no version to write over, the edit ends in DropGoneError.
+ *   `beforeRetry` is awaited before that second write, and calls it off by
+ *   throwing: the write that lost can have been out for a long time, and
+ *   what it lost to may be the caller's own newer write (see performOp),
+ *   which last-write-wins would undo. All of this only with an eTag: with
+ *   none the write is a create, so performOp sends no private edit that
+ *   way, and reads a version for one that has none (currentDropETag);
  * - chat: strictly conditional — 412/404 becomes DropConflictError so a
  *   queued edit can never recreate a drop another member deleted. Except a
  *   412 for a write that turns out to have landed already (landedWrite),
  *   which is that write's success.
  */
-export async function putDropJson(scope: Scope, meta: DropMeta, eTag?: string): Promise<string | undefined> {
+export async function putDropJson(
+  scope: Scope,
+  meta: DropMeta,
+  eTag?: string,
+  beforeRetry?: () => Promise<void>,
+): Promise<string | undefined> {
   const ref = scopeRef(scope);
   const tier = scopeTier(scope);
   const body = JSON.stringify(meta, null, 2);
-  const doPut = (conditional: boolean) =>
+  const doPut = (ifMatch?: string) =>
     graphFetch(contentUrl(ref, dropJsonPath(meta.id)), {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
-        ...(conditional && eTag ? { 'If-Match': eTag } : {}),
+        ...(ifMatch ? { 'If-Match': ifMatch } : {}),
       },
       body,
     }, tier);
 
   try {
-    const res = await doPut(true);
+    const res = await doPut(eTag);
     const item = await res.json();
     return item.eTag as string | undefined;
   } catch (err) {
@@ -527,11 +559,61 @@ export async function putDropJson(scope: Scope, meta: DropMeta, eTag?: string): 
         if (landed) return landed.eTag;
         throw new DropConflictError(meta.id);
       }
+      // A write sent with no condition (a create) has none to lose. Its
+      // failure is an ordinary one, not a reason to look for a version to
+      // write over — or to conclude, finding none, that the drop was deleted.
+      if (eTag === undefined) throw err;
+      const current = await currentDropETag(scope, meta.id);
+      // Asked after the read, not before: the read is a request too, and can
+      // be out as long as the first write was. Whatever the caller sends
+      // from here on lands after the read. If it lands before this write,
+      // the drop has moved on from the version the condition names, and
+      // this write fails rather than replace it.
+      await beforeRetry?.();
+      if (current === null) throw new DropGoneError(meta.id);
       console.debug('[Graph] eTag conflict on %s — retrying last-write-wins', meta.id);
-      const res = await doPut(false);
+      // If this one loses as well, that is the caller's ordinary failure:
+      // its next attempt starts over from the first write.
+      const res = await doPut(current);
       const item = await res.json();
       return item.eTag as string | undefined;
     }
+    throw err;
+  }
+}
+
+/**
+ * Whether the scope holds a JSON for this drop. Only "not found" says it
+ * does not (a 404, or a 410: see isGoneError). Every other failure throws,
+ * so a caller deciding what may be deleted never reads a request that failed
+ * as a drop that is absent.
+ */
+export async function hasDropJson(scope: Scope, id: string): Promise<boolean> {
+  try {
+    await graphFetch(`${itemByPathUrl(scopeRef(scope), dropJsonPath(id))}?$select=id`, undefined, scopeTier(scope));
+    return true;
+  } catch (err) {
+    if (isGoneError(err)) return false;
+    throw err;
+  }
+}
+
+/**
+ * The eTag a drop's JSON is at now, or null when the scope holds none. As
+ * with hasDropJson, only a 404 says that: every other failure throws. What
+ * a private edit is made conditional on when the version it was made on is
+ * no longer the one to name — its condition was lost — or was never known.
+ */
+export async function currentDropETag(scope: Scope, id: string): Promise<string | null> {
+  try {
+    const res = await graphFetch(`${itemByPathUrl(scopeRef(scope), dropJsonPath(id))}?$select=eTag`, undefined, scopeTier(scope));
+    const item = await res.json();
+    // An answer without one must not pass for a condition: sent with none,
+    // the write this is read for would create the file.
+    if (typeof item.eTag !== 'string' || !item.eTag) throw new Error(`No eTag for drop ${id}`);
+    return item.eTag;
+  } catch (err) {
+    if (isGoneError(err)) return null;
     throw err;
   }
 }
@@ -604,7 +686,8 @@ export async function listDeviceProfiles(skipIfCTag?: string, signal?: AbortSign
   }
   if (skipIfCTag && cTag === skipIfCTag) return { cTag };
 
-  let url = `${itemByPathUrl(APPROOT, DEVICES_FOLDER)}:/children?$select=id,name,file,@microsoft.graph.downloadUrl`;
+  const start = `${itemByPathUrl(APPROOT, DEVICES_FOLDER)}:/children?$select=id,name,file,@microsoft.graph.downloadUrl`;
+  let url = start;
   const items: GraphFileItem[] = [];
 
   while (url) {
@@ -613,7 +696,13 @@ export async function listDeviceProfiles(skipIfCTag?: string, signal?: AbortSign
       const res = await graphFetch(url, { timeoutMs: PAGE_TIMEOUT_MS, signal });
       data = await res.json();
     } catch (err) {
-      if (isGoneError(err)) return { profiles: [], cTag };
+      // Only the opening request can say the folder is gone (deleted since
+      // its cTag was read). "Gone" on a later page is a listing that broke
+      // off: reported as no profiles, it would replace every stored profile
+      // with this device's alone and mark the registry clean, and the others
+      // would stay away until the folder next changed. So it fails the
+      // listing instead, as runDelta does for drops.
+      if (url === start && isGoneError(err)) return { profiles: [], cTag };
       throw err;
     }
     items.push(...data.value.filter(item => item.file && item.name?.endsWith('.json')));
