@@ -295,9 +295,17 @@
  * its neighbours — sibling cards are all position: relative at z-index auto
  * and would otherwise paint over it in DOM order. */
 .drop-card:hover,
-.drop-card:focus-within,
-.drop-card--failed {
+.drop-card:focus-within {
   z-index: 1;
+}
+
+/* A failed card's bar is always shown, so it can show beside another failed
+ * card's, or beside a hovered card's. Cards that ranked alike would tie, and
+ * the later card of a tie paints over the bar the earlier one hangs into it
+ * (on touch, where the bar hangs down). So this bar ranks for itself, above
+ * a hovered or focused card, instead of through its card. */
+.drop-card--failed .drop-actions {
+  z-index: 2;
 }
 
 .drop-actions {
