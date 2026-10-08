@@ -394,6 +394,23 @@ export async function deleteJoinedPointer(chatId: string): Promise<void> {
 }
 
 /**
+ * Whether the account's pointer for a chat is on OneDrive now: one small GET
+ * by path, base tier. Present means named in the folder, as it does to
+ * listJoinedPointers: a pointer that cannot be read is still the account
+ * saying it is in the chat. Anything short of an answer rejects, so a
+ * request that failed is never taken for "no pointer".
+ */
+export async function hasJoinedPointer(chatId: string): Promise<boolean> {
+  try {
+    await graphFetch(`${itemByPathUrl(APPROOT, `${JOINED_FOLDER}/${chatId}.json`)}?$select=id`);
+    return true;
+  } catch (err) {
+    if (isGoneError(err)) return false;
+    throw err;
+  }
+}
+
+/**
  * One registry folder as OneDrive currently holds it. `ids` is every entry
  * the listing named — the complete remote registry, which reconciliation
  * compares local records against — while `pointers`/`records` carry only
