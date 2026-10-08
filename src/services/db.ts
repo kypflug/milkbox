@@ -321,6 +321,84 @@ export function putDrop(ref: ScopeRef, record: DropRecord): Promise<boolean> {
   });
 }
 
+/**
+ * What putSentEdit did: 'stored' the edit (or found it held at that very
+ * version already), 'kept' the copy held instead, or was 'refused' because
+ * `ref` is not the stay held (see writeForScope).
+ */
+export type SentEditOutcome = 'stored' | 'kept' | 'refused';
+
+/**
+ * Store what the send of an edit came back with, but only over a copy that
+ * edit is known to come after.
+ *
+ * An answer can be a long time coming, and its send is not the only thing
+ * that stores the drop. By the time it arrives another tab may have sent a
+ * newer edit, queued over this one, and stored that; or sent the drop's
+ * delete; or a pass may have stored a version written elsewhere since.
+ * Stored regardless, the answer puts an older version back over the newer
+ * one, or brings back a drop that has gone. Every tab then shows it, the
+ * next edit of it names an eTag the drive has replaced, and where a pass has
+ * already listed the newer version, no later one lists it again.
+ *
+ * Two eTags are known to be older than the one the send came back with:
+ * - the one the copy was held at when the send read it (`sentFrom`). The
+ *   write named it; or was refused naming it, and what came back is the
+ *   version that refused it or one written over that. A copy still held at
+ *   it has had no version stored since: an edit or a delete queued over
+ *   this one meanwhile changes the copy's text or leaves it be, and a
+ *   discard puts the text back, none of them the eTag. (No copy then and
+ *   none now is the same case.)
+ * - the one the write replaced (`replaced`, see graph.DropWrite), where
+ *   that is another: a second write, made over a version read from the
+ *   drive. That version is often an edit of this device's own, whose answer
+ *   can arrive, and be stored, while the second write is out. What comes
+ *   back is the next version after it.
+ * Held at any other eTag, the copy stays. It is a version stored while the
+ * send was out, and whether this one came before it or after is not known
+ * here. Where nothing else will settle that, the caller asks for a pass
+ * (see the coordinator's processOutboxRecord).
+ *
+ * Whether the outbox row is still this send's own is not what decides. A
+ * row replaced by a newer edit says nothing against this result, and with
+ * it stored that edit goes out naming a version the drive holds. A row that
+ * is gone may have been discarded: the copy was put back as it was before
+ * the edit, and the drive holds the edit. And a row still there does not
+ * rule out a pass having stored a later version.
+ *
+ * Read and written in one transaction: nothing is stored in between.
+ */
+export async function putSentEdit(
+  ref: ScopeRef,
+  record: DropRecord,
+  after: { sentFrom: DropRecord | undefined; replaced: string | undefined },
+): Promise<SentEditOutcome> {
+  const { sentFrom, replaced } = after;
+  let outcome: SentEditOutcome = 'refused';
+  await writeForScope(ref, ['drops'], t => {
+    const drops = t.objectStore('drops');
+    const stored = drops.get([ref.scopeId, record.meta.id]) as IDBRequest<StoredDropRecord | undefined>;
+    stored.onsuccess = () => {
+      const held = stored.result;
+      // Another tab sending the same record, or a pass that listed this
+      // write, got here first.
+      if (held && held.eTag !== undefined && held.eTag === record.eTag) {
+        outcome = 'stored';
+        return;
+      }
+      const asSent = held ? sentFrom !== undefined && held.eTag === sentFrom.eTag : !sentFrom;
+      const asReplaced = held !== undefined && replaced !== undefined && held.eTag === replaced;
+      if (!asSent && !asReplaced) {
+        outcome = 'kept';
+        return;
+      }
+      drops.put({ ...record, scopeId: ref.scopeId } satisfies StoredDropRecord);
+      outcome = 'stored';
+    };
+  });
+  return outcome;
+}
+
 export function getDrop(scopeId: ScopeId, id: string): Promise<DropRecord | undefined> {
   return tx('drops', 'readonly', s => s.get([scopeId, id]) as IDBRequest<DropRecord | undefined>);
 }

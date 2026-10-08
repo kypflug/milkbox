@@ -613,20 +613,32 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       record.attempts = attempts;
       record.state = 'sending';
       if (!(await db.updateOutboxRecord(ref, { ...record }))) return await stop();
+      let stored = true;
       if (isFileSend(record)) {
         // Refused the lock: its upload is being cleared away, which is only
         // done for a send whose row is no longer its own.
-        const sent = await withPublishLock(record.id, 'shared', () => performOp(scope, record));
+        const sent = await withPublishLock(record.id, 'shared', async () => {
+          await performOp(scope, record);
+        });
         if (!sent) throw new SendWithdrawnError();
       } else {
-        await performOp(scope, record);
+        stored = await performOp(scope, record);
       }
       // Sent — and the row goes only if it is still this send's. A request
       // can outlast its record: an edit that stalls, then lands after the
       // drop's delete was queued in its place. That newer row stays: whoever
       // queued it asked for a drain too — this one, which then goes round
       // again, or the other tab's own.
-      await db.removeOutboxRecord(ref, record);
+      const ended = await db.removeOutboxRecord(ref, record);
+      // An edit can land and not be stored: the copy held had moved to a
+      // version it is not known to come after (db.putSentEdit). Where its
+      // row is gone or has been queued over, the drop is another send's by
+      // now, and what that one stores stands. Where the row was still its
+      // own, no other send is coming. The version held is a pass's, or the
+      // late answer to an edit this one was queued over, and whether the
+      // drive holds that version or this edit is not known here. A pass is
+      // asked for to find out, as after a conflict and on the same terms.
+      if (!stored && ended && !isThrottled()) void requestSync(scope, { force: true });
       emit({ type: 'feed-updated', scopeId });
       postBroadcast({
         type: 'drop-mutated',
@@ -771,7 +783,12 @@ async function removeUnsentUpload(scope: Scope, record: OutboxRecord): Promise<v
   }
 }
 
-async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
+/**
+ * Make one attempt at a record's send, and store what it comes back with.
+ * Resolves false when the send went through and that was not stored: an
+ * edit's, with a copy held by then that it is not known to come after.
+ */
+async function performOp(scope: Scope, record: OutboxRecord): Promise<boolean> {
   const scopeId = scopeIdOf(scope);
   const ref = scopeRefOf(scope);
   if (record.op === 'delete') {
@@ -783,7 +800,7 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
     // are the new stay's: its own next pass removes the drop.
     const { written } = await db.commitDropChanges(ref, { deletes: [record.id] });
     if (!written) throw new SendWithdrawnError();
-    return;
+    return true;
   }
 
   const meta = { ...record.meta };
@@ -863,10 +880,29 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
   // response arriving, so that the copy held never moved to its eTag. The
   // row carries those edits (db.queueEdit) for putDropJson to tell that from
   // a change by someone else.
-  const eTag = await graph.putDropJson(scope, meta, ifMatch, stillCurrent, record.queuedOver);
+  const { eTag, replaced } = await graph.putDropJson(scope, meta, ifMatch, stillCurrent, record.queuedOver);
   // Stored in the stay the send was queued in. If the chat has been left
   // (and perhaps joined again) while the request was out, the send ends
   // here: what is stored now is not this send's to touch.
+  if (record.op === 'edit') {
+    // And an edit only over a copy it is known to come after: the one it
+    // was sent from, or the version its write replaced (db.putSentEdit).
+    // The answer can arrive long after the write was applied. By then
+    // another tab may have landed a newer edit of the drop, or its delete,
+    // or a pass may have stored a version from elsewhere, and storing this
+    // one would put the older version back over it.
+    const outcome = await db.putSentEdit(ref, { meta, eTag }, { sentFrom: existing, replaced });
+    if (outcome === 'refused') throw new SendWithdrawnError();
+    if (outcome === 'kept') console.debug('[Outbox] edit %s landed; the copy held has moved on, and is left as it is', meta.id);
+    return outcome === 'stored';
+  }
+  // A create is stored whatever is held, as it always was. Its write names
+  // no version, so the eTag it comes back with has no known place among the
+  // drop's versions: when two tabs send the same queued create, nothing but
+  // the order the two writes were applied in says which eTag is current,
+  // and neither answer carries that. Nor does the row: held back for want
+  // of it, the later answer would be lost in the ordinary order, the one
+  // where the answers arrive as the writes were applied.
   if (!(await db.putDrop(ref, { meta, eTag }))) throw new SendWithdrawnError();
 
   // Cache the local payload as the image blob so the sender gets an
@@ -874,6 +910,7 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
   if (meta.kind === 'image' && record.blob) {
     await db.putCachedBlob(ref, meta.id, record.blob).catch(() => {});
   }
+  return true;
 }
 
 // ─── sync ───
