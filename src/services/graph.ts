@@ -515,6 +515,21 @@ export class DropGoneError extends Error {
   }
 }
 
+/** What a write of a drop's JSON came back with (see putDropJson). */
+export interface DropWrite {
+  /** The eTag the drop is held at with this write on it. */
+  eTag: string | undefined;
+  /**
+   * The eTag this write replaced: the condition the PUT that was accepted
+   * carried, the caller's or the one read here for a second write. So the
+   * version in `eTag` is the very next one after it, whatever has been
+   * written since. None for a write sent with no condition, and for one
+   * found to have landed already (landedWrite): the request that put it
+   * there was never answered, and what it replaced is not known here.
+   */
+  replaced: string | undefined;
+}
+
 /**
  * Upload a drop's JSON. Path-based PUT auto-creates the drops/ folder (and
  * the approot itself) on first write. Pass eTag for a conditional write on
@@ -547,7 +562,7 @@ export async function putDropJson(
   eTag?: string,
   beforeRetry?: () => Promise<void>,
   queuedOver: readonly DropMeta[] = [],
-): Promise<string | undefined> {
+): Promise<DropWrite> {
   const ref = scopeRef(scope);
   const tier = scopeTier(scope);
   const body = dropBody(meta);
@@ -564,7 +579,7 @@ export async function putDropJson(
   try {
     const res = await doPut(eTag);
     const item = await res.json();
-    return item.eTag as string | undefined;
+    return { eTag: item.eTag as string | undefined, replaced: eTag };
   } catch (err) {
     if (err instanceof GraphHttpError && (err.status === 412 || (eTag !== undefined && err.status === 404))) {
       if (scope.kind === 'chat') {
@@ -573,7 +588,7 @@ export async function putDropJson(
         const landed =
           err.status === 412 ? await landedWrite(scope, meta.id, [body, ...queuedOver.map(dropBody)]) : null;
         if (!landed) throw new DropConflictError(meta.id);
-        if (landed.body === body) return landed.eTag;
+        if (landed.body === body) return { eTag: landed.eTag, replaced: undefined };
         // What refused this edit is one it was queued over: applied with
         // its response lost, so the copy held never moved to its eTag, and
         // this one was sent naming the eTag before it. Nobody else has
@@ -587,7 +602,7 @@ export async function putDropJson(
         try {
           const res = await doPut(landed.eTag);
           const item = await res.json();
-          return item.eTag as string | undefined;
+          return { eTag: item.eTag as string | undefined, replaced: landed.eTag };
         } catch (again) {
           // Removed since the read: a conflict, as a 404 always is here. The
           // write carried a condition, so it cannot have brought the drop
@@ -615,7 +630,7 @@ export async function putDropJson(
       // its next attempt starts over from the first write.
       const res = await doPut(current);
       const item = await res.json();
-      return item.eTag as string | undefined;
+      return { eTag: item.eTag as string | undefined, replaced: current };
     }
     throw err;
   }
