@@ -360,7 +360,8 @@ export type SentOutcome = 'stored' | 'kept' | 'refused';
  * the edit, and the drive holds the edit. And a row still there does not
  * rule out a pass having stored a later version.
  *
- * Read and written in one transaction: nothing is stored in between.
+ * Read and written in one transaction: nothing is stored in between. What
+ * is stored is marked as this device's own write (DropRecord.writtenHere).
  */
 export async function putSentEdit(
   ref: ScopeRef,
@@ -375,8 +376,10 @@ export async function putSentEdit(
     stored.onsuccess = () => {
       const held = stored.result;
       // Another tab sending the same record, or a pass that listed this
-      // write, got here first.
+      // write, got here first. A pass does not know whose the version is
+      // (DropRecord.writtenHere); this answer does.
       if (held && held.eTag !== undefined && held.eTag === record.eTag) {
+        if (!held.writtenHere) drops.put({ ...held, writtenHere: true } satisfies StoredDropRecord);
         outcome = 'stored';
         return;
       }
@@ -386,7 +389,7 @@ export async function putSentEdit(
         outcome = 'kept';
         return;
       }
-      drops.put({ ...record, scopeId: ref.scopeId } satisfies StoredDropRecord);
+      drops.put({ ...record, writtenHere: true, scopeId: ref.scopeId } satisfies StoredDropRecord);
       outcome = 'stored';
     };
   });
@@ -420,7 +423,8 @@ export async function putSentEdit(
  * The caller asks for a pass (see the coordinator's processOutboxRecord),
  * which lists whatever has been written since the last one.
  *
- * Row and copy are read and the drop written in one transaction.
+ * Row and copy are read and the drop written in one transaction. What is
+ * stored is marked as this device's own write (DropRecord.writtenHere).
  */
 export async function putSentCreate(ref: ScopeRef, record: DropRecord, queued: OutboxRecord): Promise<SentOutcome> {
   let outcome: SentOutcome = 'refused';
@@ -441,7 +445,7 @@ export async function putSentCreate(ref: ScopeRef, record: DropRecord, queued: O
           outcome = 'kept';
           return;
         }
-        drops.put({ ...record, scopeId: ref.scopeId } satisfies StoredDropRecord);
+        drops.put({ ...record, writtenHere: true, scopeId: ref.scopeId } satisfies StoredDropRecord);
         outcome = 'stored';
       };
     };
@@ -845,10 +849,11 @@ export type QueueEditOutcome = 'queued' | 'refused' | 'missing' | 'unversioned';
  * another, and goes with the row once one is sent, refused or discarded.
  *
  * A chat's edit is sent only as a change to a version this device knows:
- * the eTag of the copy held, or failing that the one the row records (see
- * the coordinator's performOp). An edit with neither would never be sent,
- * so it is not queued either, and the editor hears of it while what was
- * typed is still in it. Neither means no eTag on the copy and none
+ * the one it was made on, which the row records, or the eTag of the copy
+ * held where the row records none or the copy is this device's own write
+ * (see the coordinator's performOp). An edit with neither would never be
+ * sent, so it is not queued either, and the editor hears of it while what
+ * was typed is still in it. Neither means no eTag on the copy and none
  * inherited from an edit already queued, and then:
  * - 'missing': the drop is not stored. It was removed while its editor was
  *   open — a pass found it deleted, or its own delete went through in
