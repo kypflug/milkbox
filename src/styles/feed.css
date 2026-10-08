@@ -19,7 +19,9 @@
 
 /* viewport-fit=cover lets an installed iOS app draw under the status bar,
  * where the system blurs whatever sits there. The inset keeps the header
- * row below it; it is 0 everywhere the status bar doesn't overlap. */
+ * row below it; it is 0 everywhere the status bar doesn't overlap. (Since
+ * iOS 27 the blur reaches past the inset, onto the row itself: see
+ * .status-bar-backdrop in global.css for what keeps it off.) */
 .feed-header {
   flex: none;
   padding-top: env(safe-area-inset-top, 0px);

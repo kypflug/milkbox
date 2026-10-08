@@ -234,6 +234,37 @@ body {
 }
 
 /*
+ * iOS 27 lays a blur over the top of an installed app, reaching well below
+ * the status bar: it smears the header row. There is no switch for it.
+ * WebKit leaves it off when what sits at the top edge of the viewport is an
+ * opaque position: fixed box running the width of the screen, and takes the
+ * status bar's colour from that box. The header does not count: it is in
+ * the page's flow, and the feed scrolls inside its own box under it.
+ *
+ * So this strip is that box, and nothing else. It takes the colour of the
+ * page behind it, which is also the header's (--ground; --desk around the
+ * floating pane), so there is nothing to see. It is as tall as the status
+ * bar inset, which makes it exactly where the page runs under a status bar
+ * and nowhere else: no height at all in a browser tab or on a desktop. It
+ * sits above the header, which would otherwise be what is found at the
+ * edge, and under every overlay.
+ *
+ * None of this is documented by Apple. The measurements others have taken
+ * (at least 6px tall, 80% wide, within 4px of the top) are met with room to
+ * spare.
+ */
+.status-bar-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: env(safe-area-inset-top, 0px);
+  background-color: inherit;
+  z-index: 5;
+  pointer-events: none;
+}
+
+/*
  * Tall, wide viewports: the app becomes a floating pane on the desk rather
  * than a full-height sheet — a milkbox sitting on the porch, not wallpaper.
  * The pane keeps --ground inside; the page behind steps down to --desk.
