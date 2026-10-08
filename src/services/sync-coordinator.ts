@@ -857,6 +857,31 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<boolean> {
   // delete: it cannot create the drop.)
   const existing = record.op === 'edit' ? await db.getDrop(scopeId, meta.id) : undefined;
   let ifMatch = existing?.eTag ?? (record.op === 'edit' ? record.prevETag : undefined);
+  // In a chat the copy's eTag is not always the version to replace. A pass
+  // stores what it lists whether or not an edit of the drop is waiting here,
+  // failed or between tries, and the feed goes on showing the edit over it.
+  // Sent naming that version, the edit would replace a change made
+  // elsewhere that its author has not seen, and nothing would be reported.
+  // So the copy's eTag is named only while it is the version the edit was
+  // made on (prevETag), or one this device wrote itself and has heard of
+  // since: an edit this one was queued over, say (DropRecord.writtenHere).
+  // Held at anything else, the edit names the version it was made on. The
+  // drive refuses that, and putDropJson reads what refused it: the conflict
+  // it is, unless the drive turns out to hold one of this device's own
+  // edits, which a pass can list as well (landedWrite).
+  //
+  // Not in the private feed: the last write wins there by design, and the
+  // other version is this account's own.
+  if (
+    record.op === 'edit' &&
+    scope.kind === 'chat' &&
+    record.prevETag &&
+    existing &&
+    existing.eTag !== record.prevETag &&
+    !existing.writtenHere
+  ) {
+    ifMatch = record.prevETag;
+  }
   const stillCurrent = async () => {
     if (!(await db.hasOutboxRecord(record))) throw new SendWithdrawnError();
   };

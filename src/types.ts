@@ -65,6 +65,14 @@ export interface DropRecord {
   meta: DropMeta;
   /** Graph eTag of the JSON item, for conditional writes. */
   eTag?: string;
+  /**
+   * The version in `eTag` is one this device wrote: the copy was stored from
+   * the answer to one of its own sends, not brought by a pass. A chat edit
+   * still queued may be sent over such a version though it is not the one
+   * the edit was made on (see the coordinator's performOp). A copy a pass
+   * stores carries none, whoever wrote what it lists.
+   */
+  writtenHere?: true;
   /** Pending outbox state overlays: 'sending' | 'failed'. Absent = synced. */
   state?: 'sending' | 'failed';
   /**
