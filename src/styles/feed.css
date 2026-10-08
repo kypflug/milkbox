@@ -337,6 +337,14 @@
   .drop-card--failed { padding-bottom: 23px; }
 }
 
+/* Everywhere else that bar is at the top, where it would lie over the end of
+ * the body's first line, or the corner of an image. The same strip, above
+ * the body. The query is the one above negated, so a card gets one strip or
+ * the other, never both. */
+@media not all and (pointer: coarse) {
+  .drop-card--failed { padding-top: 23px; }
+}
+
 /* ── inline edit ── */
 
 .drop-edit { display: flex; flex-direction: column; gap: 8px; }
