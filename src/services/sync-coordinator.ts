@@ -860,7 +860,12 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<void> {
     if (current === null) throw new graph.DropGoneError(meta.id);
     ifMatch = current;
   }
-  const eTag = await graph.putDropJson(scope, meta, ifMatch, stillCurrent);
+  // A chat's edit can be refused by this device's own earlier edit of the
+  // drop as well: one it was queued over, which OneDrive applied without the
+  // response arriving, so that the copy held never moved to its eTag. The
+  // row carries those edits (db.queueEdit) for putDropJson to tell that from
+  // a change by someone else.
+  const eTag = await graph.putDropJson(scope, meta, ifMatch, stillCurrent, record.queuedOver);
   // Stored in the stay the send was queued in. If the chat has been left
   // (and perhaps joined again) while the request was out, the send ends
   // here: what is stored now is not this send's to touch.

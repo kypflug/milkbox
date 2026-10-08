@@ -120,6 +120,16 @@ export interface OutboxRecord {
    * pass has since brought a newer version, that one stays.
    */
   prevETag?: string;
+  /**
+   * Chat edits only: the edits this one was queued over, oldest first, each
+   * as it was queued. Any of them may be what OneDrive holds: a PUT can be
+   * applied and its response lost, and the copy held here then never moves
+   * to the eTag that edit landed at. This edit names the eTag before it, and
+   * is refused by a version nobody else wrote. With these, the send can tell
+   * that from a change by another member (see graph.putDropJson). Absent
+   * when the edit replaced no queued edit, and on rows from older builds.
+   */
+  queuedOver?: DropMeta[];
 }
 
 // ─── Shared chats ───
