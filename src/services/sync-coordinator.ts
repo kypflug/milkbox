@@ -620,7 +620,7 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
         // Refused the lock: its upload is being cleared away, which is only
         // done for a send whose row is no longer its own.
         const sent = await withPublishLock(record.id, 'shared', async () => {
-          await performOp(scope, record);
+          stored = await performOp(scope, record);
         });
         if (!sent) throw new SendWithdrawnError();
       } else {
@@ -640,7 +640,15 @@ async function processOutboxRecord(scope: Scope, record: OutboxRecord): Promise<
       // late answer to an edit this one was queued over, and whether the
       // drive holds that version or this edit is not known here. A pass is
       // asked for to find out, as after a conflict and on the same terms.
-      if (!stored && ended && !isThrottled()) void requestSync(scope, { force: true });
+      //
+      // A create that is not stored (db.putSentCreate) is owed that pass
+      // whether or not the row was still its own. Its write was not
+      // conditional, so another send having finished says nothing about
+      // which of the two the drive holds: in the ordinary order it is this
+      // one. And with the row cancelled or discarded there is no other
+      // send, and the drop is on the drive with no copy here.
+      const unsettled = !stored && (ended || record.op === 'create');
+      if (unsettled && !isThrottled()) void requestSync(scope, { force: true });
       emit({ type: 'feed-updated', scopeId });
       postBroadcast({
         type: 'drop-mutated',
@@ -788,7 +796,8 @@ async function removeUnsentUpload(scope: Scope, record: OutboxRecord): Promise<v
 /**
  * Make one attempt at a record's send, and store what it comes back with.
  * Resolves false when the send went through and that was not stored: an
- * edit's, with a copy held by then that it is not known to come after.
+ * edit's, with a copy held by then that it is not known to come after, or
+ * a create's, with a copy held at all or its row no longer its own.
  */
 async function performOp(scope: Scope, record: OutboxRecord): Promise<boolean> {
   const scopeId = scopeIdOf(scope);
@@ -898,14 +907,22 @@ async function performOp(scope: Scope, record: OutboxRecord): Promise<boolean> {
     if (outcome === 'kept') console.debug('[Outbox] edit %s landed; the copy held has moved on, and is left as it is', meta.id);
     return outcome === 'stored';
   }
-  // A create is stored whatever is held, as it always was. Its write names
-  // no version, so the eTag it comes back with has no known place among the
-  // drop's versions: when two tabs send the same queued create, nothing but
-  // the order the two writes were applied in says which eTag is current,
-  // and neither answer carries that. Nor does the row: held back for want
-  // of it, the later answer would be lost in the ordinary order, the one
-  // where the answers arrive as the writes were applied.
-  if (!(await db.putDrop(ref, { meta, eTag }))) throw new SendWithdrawnError();
+  // A create's write names no version, so the eTag it comes back with has
+  // no known place among the drop's versions: when two tabs send the same
+  // queued create, nothing but the order the two writes were applied in
+  // says which eTag is current, and neither answer carries that. So it is
+  // stored only where there is nothing to put it over, and nothing to say
+  // the send has been overtaken: no copy held, and the row still this
+  // send's own (db.putSentCreate). An answer that arrives after the other
+  // tab has finished, and the drop has been edited or deleted since, is
+  // kept back; so is the later of two answers that is in fact the current
+  // one, and a pass brings that (see processOutboxRecord).
+  const outcome = await db.putSentCreate(ref, { meta, eTag }, record);
+  if (outcome === 'refused') throw new SendWithdrawnError();
+  if (outcome === 'kept') {
+    console.debug('[Outbox] create %s landed after its send was overtaken: not stored, a pass is asked for', meta.id);
+    return false;
+  }
 
   // Cache the local payload as the image blob so the sender gets an
   // instant render without a round-trip

@@ -314,19 +314,13 @@ export function getScopeDrops(scopeId: ScopeId): Promise<DropRecord[]> {
   return tx('drops', 'readonly', s => s.getAll(scopeRange(scopeId)) as IDBRequest<DropRecord[]>);
 }
 
-/** Store one drop. Resolves false, writing nothing, when `ref` is not the stay held (see writeForScope). */
-export function putDrop(ref: ScopeRef, record: DropRecord): Promise<boolean> {
-  return writeForScope(ref, ['drops'], t => {
-    t.objectStore('drops').put({ ...record, scopeId: ref.scopeId } satisfies StoredDropRecord);
-  });
-}
-
 /**
- * What putSentEdit did: 'stored' the edit (or found it held at that very
- * version already), 'kept' the copy held instead, or was 'refused' because
- * `ref` is not the stay held (see writeForScope).
+ * What putSentEdit or putSentCreate did with a send's result: 'stored' it
+ * (or found the drop held at that very version already), 'kept' what was
+ * held instead, a copy or none, or was 'refused' because `ref` is not the
+ * stay held (see writeForScope).
  */
-export type SentEditOutcome = 'stored' | 'kept' | 'refused';
+export type SentOutcome = 'stored' | 'kept' | 'refused';
 
 /**
  * Store what the send of an edit came back with, but only over a copy that
@@ -372,9 +366,9 @@ export async function putSentEdit(
   ref: ScopeRef,
   record: DropRecord,
   after: { sentFrom: DropRecord | undefined; replaced: string | undefined },
-): Promise<SentEditOutcome> {
+): Promise<SentOutcome> {
   const { sentFrom, replaced } = after;
-  let outcome: SentEditOutcome = 'refused';
+  let outcome: SentOutcome = 'refused';
   await writeForScope(ref, ['drops'], t => {
     const drops = t.objectStore('drops');
     const stored = drops.get([ref.scopeId, record.meta.id]) as IDBRequest<StoredDropRecord | undefined>;
@@ -394,6 +388,62 @@ export async function putSentEdit(
       }
       drops.put({ ...record, scopeId: ref.scopeId } satisfies StoredDropRecord);
       outcome = 'stored';
+    };
+  });
+  return outcome;
+}
+
+/**
+ * Store what the send of a create came back with: only where no copy of the
+ * drop is held, and only while the outbox row is still that send's own
+ * (`queued`).
+ *
+ * A create's write names no version, so unlike an edit's (putSentEdit) what
+ * it comes back with has no known place among the drop's versions, and a
+ * copy held can never be shown to be the older of the two. A copy can be
+ * there all the same. Every tab drains the one outbox, so two can send the
+ * same create: the other may have finished, and the drop been edited since.
+ * Or a pass has listed it. Stored over a copy, a late answer puts the drop
+ * back as it was first sent, at an eTag the drive has replaced; and where a
+ * pass has already listed the version held, no later one lists it again. So
+ * a copy stays, whichever of the two is the newer.
+ *
+ * With none held, the row tells the first answer to arrive from one that
+ * has outlived its send. A row that is gone was cancelled or discarded with
+ * the request out, or another tab finished the send and the drop has been
+ * deleted since: stored then, the answer would put a deleted drop back on
+ * screen, and once a pass has listed its removal no later one takes it off
+ * again.
+ *
+ * Kept, the result may still be what the drive holds: the later of two
+ * writes of the same create, or a drop that was cancelled too late to stop.
+ * The caller asks for a pass (see the coordinator's processOutboxRecord),
+ * which lists whatever has been written since the last one.
+ *
+ * Row and copy are read and the drop written in one transaction.
+ */
+export async function putSentCreate(ref: ScopeRef, record: DropRecord, queued: OutboxRecord): Promise<SentOutcome> {
+  let outcome: SentOutcome = 'refused';
+  await writeForScope(ref, ['outbox', 'drops'], t => {
+    const drops = t.objectStore('drops');
+    const row = t.objectStore('outbox').get(queued.id) as IDBRequest<OutboxRecord | undefined>;
+    row.onsuccess = () => {
+      const stored = drops.get([ref.scopeId, record.meta.id]) as IDBRequest<StoredDropRecord | undefined>;
+      stored.onsuccess = () => {
+        const held = stored.result;
+        if (held) {
+          // At this very version: a pass listed this write, and stored it
+          // before the answer arrived.
+          outcome = held.eTag !== undefined && held.eTag === record.eTag ? 'stored' : 'kept';
+          return;
+        }
+        if (!isSameQueueing(row.result, queued)) {
+          outcome = 'kept';
+          return;
+        }
+        drops.put({ ...record, scopeId: ref.scopeId } satisfies StoredDropRecord);
+        outcome = 'stored';
+      };
     };
   });
   return outcome;
