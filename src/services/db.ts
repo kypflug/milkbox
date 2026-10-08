@@ -838,7 +838,10 @@ export type QueueEditOutcome = 'queued' | 'refused' | 'missing' | 'unversioned';
  * first one's original exactly — including none at all, if an older build
  * queued it. Both are read here, inside the transaction, so they are the
  * versions this edit replaces. In the private feed a drop that is not
- * stored gets no local copy, only the row.
+ * stored gets no local copy, only the row. Nor is the edit written onto a
+ * copy held at another eTag than the one inherited: that copy is a version
+ * stored since the first of these edits was queued, and has to stay whole
+ * for a discard to leave.
  *
  * A chat's edit also keeps the edit it replaces, and the ones that edit
  * kept (OutboxRecord.queuedOver): any of them may have been sent, and may
@@ -894,7 +897,16 @@ export async function queueEdit(ref: ScopeRef, meta: DropMeta): Promise<QueueEdi
             ...(conditional && earlier ? { queuedOver: [...(earlier.queuedOver ?? []), earlier.meta] } : {}),
           }),
         );
-        if (held) drops.put({ ...held, meta } satisfies StoredDropRecord);
+        // Shown at once on the copy, but not on one that has moved on from
+        // the version the edits queued here were made on. A pass, or the
+        // late answer to one of those edits, has stored a version of the
+        // drop under them since, and a discard leaves that version in
+        // place (discardOutboxRecord's 'kept'). With this edit's text put
+        // over it, what the discard left would be text that was never
+        // sent, at an eTag the drive does hold, which no pass would ever
+        // replace. The feed shows the edit from its row either way.
+        const movedOn = earlier !== undefined && held?.eTag !== earlier.prevETag;
+        if (held && !movedOn) drops.put({ ...held, meta } satisfies StoredDropRecord);
         outcome = 'queued';
       };
     };
@@ -938,7 +950,8 @@ export type DiscardOutcome = 'gone' | 'removed' | 'restored' | 'kept' | 'invalid
  *   (prevMeta). That version is put back — unless a newer one has been
  *   stored since (a pass brought it, or an edit this one was queued over
  *   landed after all): the eTag moved on, and that is the server's truth
- *   and stays.
+ *   and stays. It is that version whole, text and all: an edit queued
+ *   after the eTag moved does not write on the copy (queueEdit).
  * - 'invalidated': it kept none (it was queued by an older build). The
  *   drop's eTag is cleared, so it stops matching the server's, and the
  *   setting under `invalidateKey` — the scope's delta token — is deleted,
