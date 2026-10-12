@@ -236,7 +236,7 @@ body {
    * long chat name that cannot be centred that way pushes the pair toward
    * the roomier side, and truncates only once both rails are down to their
    * insets: the same room the left-aligned title has. */
-  :root[data-mac-titlebar] .feed-header-row {
+  :root[data-macos] .feed-header-row {
     display: grid;
     grid-template-columns:
       minmax(var(--wco-inset-left), 1fr)
@@ -248,11 +248,11 @@ body {
     padding: 0;
     gap: 0;
   }
-  :root[data-mac-titlebar] .feed-mark {
+  :root[data-macos] .feed-mark {
     grid-column: 2;
     margin-right: 4px;
   }
-  :root[data-mac-titlebar] .feed-title-btn { grid-column: 3; }
+  :root[data-macos] .feed-title-btn { grid-column: 3; }
 
   .feed-header {
     height: var(--wco-title-strip-height);

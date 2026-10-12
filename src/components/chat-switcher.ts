@@ -68,6 +68,8 @@ export function mountChatMenu(
 
   const listEl = menu.querySelector<HTMLElement>('.chat-list')!;
   const isOpen = () => menu.matches(':popover-open');
+  /** The display mode the title strip rules in global.css sit under. */
+  const overlayMode = window.matchMedia('(display-mode: window-controls-overlay)');
 
   async function paint(): Promise<void> {
     const chats = (await coordinator.loadChats()).sort((a, b) => a.joinedAt - b.joinedAt);
@@ -131,15 +133,15 @@ export function mountChatMenu(
   const repaint = () => void paint().catch(err => console.debug('[Chats] Menu paint failed:', err));
 
   /** Hang from the title's left edge, or centre under it where the title is
-   *  itself centred (the macOS title strip, global.css). Clamped to the
-   *  viewport either way; cap the height to the space below so a long list
-   *  scrolls inside the menu. */
+   *  itself centred: the macOS title strip, on the same two conditions as
+   *  its rule in global.css. Clamped to the viewport either way; cap the
+   *  height to the space below so a long list scrolls inside the menu. */
   function position(): void {
     const anchor = trigger.getBoundingClientRect();
     const header = trigger.closest<HTMLElement>('.feed-header-row')?.getBoundingClientRect();
     const top = Math.max(anchor.bottom, header?.bottom ?? anchor.bottom) + MENU_GAP;
     const width = menu.offsetWidth;
-    const centred = document.documentElement.hasAttribute('data-mac-titlebar');
+    const centred = overlayMode.matches && document.documentElement.hasAttribute('data-macos');
     const wanted = centred ? anchor.left + (anchor.width - width) / 2 : anchor.left;
     const maxLeft = window.innerWidth - VIEWPORT_GUTTER - width;
     const left = Math.max(VIEWPORT_GUTTER, Math.min(wanted, maxLeft));
@@ -188,8 +190,13 @@ export function mountChatMenu(
     if ((e as ToggleEvent).newState === 'closed') trigger.setAttribute('aria-expanded', 'false');
   });
 
-  const onResize = () => { if (isOpen()) position(); };
-  window.addEventListener('resize', onResize);
+  const reposition = () => { if (isOpen()) position(); };
+  window.addEventListener('resize', reposition);
+  // Switching the overlay on or off from the title bar moves the title, out
+  // of the title strip or into it, and need not resize the window. The menu
+  // can be open at the time: a click on the browser's own buttons is not one
+  // the page sees, so it does not dismiss it.
+  overlayMode.addEventListener('change', reposition);
 
   // Escape is handled by the popover itself; this only returns focus to the
   // title, which light dismiss does not do.
@@ -257,7 +264,8 @@ export function mountChatMenu(
     teardown() {
       offCoordinator();
       offBroadcast();
-      window.removeEventListener('resize', onResize);
+      window.removeEventListener('resize', reposition);
+      overlayMode.removeEventListener('change', reposition);
       trigger.removeEventListener('pointerdown', onTriggerPointerDown);
       trigger.removeEventListener('keydown', onTriggerKeyDown);
       trigger.removeEventListener('click', onTriggerClick);

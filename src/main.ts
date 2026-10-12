@@ -89,7 +89,7 @@ function inviteInAddressBar(): string | null {
 
 async function boot(app: HTMLElement): Promise<void> {
   applyTheme();
-  trackMacTitleBar();
+  flagMacOS();
   // Before the first await: a broadcast is not replayed, so a sign-out in
   // another tab while this one restores its token cache or starts MSAL
   // would be missed — and this page would enter the app as the account that
@@ -187,29 +187,25 @@ async function boot(app: HTMLElement): Promise<void> {
 // ─── Auto-redirect helpers (iOS session recovery) ───
 
 /**
- * Flag a macOS install while it shows a window-controls-overlay title strip.
- * The traffic lights sit on the left there, so a title tucked in beside them
- * looks out of place, and the system's own title bars centre theirs: the
- * feed header centres its bottle and title to match, and the chat menu
- * follows (global.css, chat-switcher.ts).
+ * Flag a macOS install. Under window-controls-overlay the traffic lights sit
+ * on the left there, so a title tucked in beside them looks out of place,
+ * and the system's own title bars centre theirs: the feed header centres its
+ * bottle and title to match, and the chat menu follows (global.css,
+ * chat-switcher.ts).
  *
  * The platform is asked for by name, not read off where the controls are: a
  * right-to-left Windows install has them on the left too, and keeps its
- * title on the left. The query is the one the stylesheet's title strip rules
- * sit under, and only a browser that has the overlay ever matches it, so
- * Safari and Firefox on a Mac never get the flag.
+ * title on the left.
+ *
+ * Being a Mac is all the flag says. Whether the overlay is showing is left
+ * to the display-mode query, which the stylesheet and the menu each read for
+ * themselves: the overlay is switched on and off while the app runs, and a
+ * flag that followed it from here would lag the stylesheet by a listener.
+ * Only a browser that has the overlay ever matches that query, so Safari and
+ * Firefox on a Mac are untouched.
  */
-function trackMacTitleBar(): void {
-  if (detectOs() !== 'macOS') return;
-
-  const overlay = matchMedia('(display-mode: window-controls-overlay)');
-  const apply = () => {
-    document.documentElement.toggleAttribute('data-mac-titlebar', overlay.matches);
-  };
-
-  apply();
-  // The overlay is switched on and off from the title bar, while the app runs.
-  overlay.addEventListener('change', apply);
+function flagMacOS(): void {
+  document.documentElement.toggleAttribute('data-macos', detectOs() === 'macOS');
 }
 
 const AUTO_REDIRECT_KEY = 'milkbox:auto-redirect';
