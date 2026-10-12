@@ -197,6 +197,15 @@ export function mountChatMenu(
   // can be open at the time: a click on the browser's own buttons is not one
   // the page sees, so it does not dismiss it.
   overlayMode.addEventListener('change', reposition);
+  // The title changes width under an open menu when the unread badge beside
+  // it comes, goes or gains a digit: main.ts paints the badge from its own
+  // read of the chats, which can land after this menu's. A menu hung from
+  // the title's left edge never noticed. One centred under it does, where
+  // the window is too narrow for the title to sit in the middle: there the
+  // title rests against the controls and grows away from them, and its
+  // centre goes with it.
+  const titleSize = new ResizeObserver(reposition);
+  titleSize.observe(trigger);
 
   // Escape is handled by the popover itself; this only returns focus to the
   // title, which light dismiss does not do.
@@ -266,6 +275,7 @@ export function mountChatMenu(
       offBroadcast();
       window.removeEventListener('resize', reposition);
       overlayMode.removeEventListener('change', reposition);
+      titleSize.disconnect();
       trigger.removeEventListener('pointerdown', onTriggerPointerDown);
       trigger.removeEventListener('keydown', onTriggerKeyDown);
       trigger.removeEventListener('click', onTriggerClick);
