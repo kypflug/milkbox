@@ -60,9 +60,9 @@
 }
 
 /*
- * Window-controls-overlay. The header row's padding keeps the title clear of
- * the window controls on either side (global.css), so it needs no
- * side-aware inset of its own.
+ * Window-controls-overlay. The header row keeps the title clear of the
+ * window controls on either side, with its padding or, on macOS, the rails
+ * that centre it (global.css), so it needs no side-aware inset of its own.
  *
  * The header row is fixed, so it is its own stacking context: a z-index on
  * the title alone can never lift it over the drag overlay (z-50). Instead

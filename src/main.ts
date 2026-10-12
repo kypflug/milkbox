@@ -6,6 +6,7 @@ import * as coordinator from './services/sync-coordinator';
 import { resumePendingAction, startCreateChatFlow, startJoinFlow, startReconnectFlow } from './services/chat-flows';
 import { setPendingAction } from './services/pending-actions';
 import { isValidShareToken } from './services/chats';
+import { detectOs } from './services/device';
 import { renderSignIn } from './screens/sign-in';
 import { renderFeed, applySharePayload, hasUnsentDraft, isReloadAsked, showReloadPrompt, teardownScreenListeners } from './screens/feed';
 import { closeAllModals, showManageSheet } from './screens/chat-sheets';
@@ -88,7 +89,7 @@ function inviteInAddressBar(): string | null {
 
 async function boot(app: HTMLElement): Promise<void> {
   applyTheme();
-  trackWindowControlsSide();
+  flagMacOS();
   // Before the first await: a broadcast is not replayed, so a sign-out in
   // another tab while this one restores its token cache or starts MSAL
   // would be missed — and this page would enter the app as the account that
@@ -186,24 +187,25 @@ async function boot(app: HTMLElement): Promise<void> {
 // ─── Auto-redirect helpers (iOS session recovery) ───
 
 /**
- * Flag which side the window controls occupy in a window-controls-overlay
- * install. The overlay rect starts after the controls, so a non-zero x means
- * they sit on the left — macOS traffic lights, or a right-to-left Windows
- * install — and the feed header moves its bottle to the opposite rail rather
- * than tucking it against them. Asking for the geometry beats sniffing the
- * platform: it answers the question we actually care about.
+ * Flag a macOS install. Under window-controls-overlay the traffic lights sit
+ * on the left there, so a title tucked in beside them looks out of place,
+ * and the system's own title bars centre theirs: the feed header centres its
+ * bottle and title to match, and the chat menu follows (global.css,
+ * chat-switcher.ts).
+ *
+ * The platform is asked for by name, not read off where the controls are: a
+ * right-to-left Windows install has them on the left too, and keeps its
+ * title on the left.
+ *
+ * Being a Mac is all the flag says. Whether the overlay is showing is left
+ * to the display-mode query, which the stylesheet and the menu each read for
+ * themselves: the overlay is switched on and off while the app runs, and a
+ * flag that followed it from here would lag the stylesheet by a listener.
+ * Only a browser that has the overlay ever matches that query, so Safari and
+ * Firefox on a Mac are untouched.
  */
-function trackWindowControlsSide(): void {
-  const overlay = navigator.windowControlsOverlay;
-  if (!overlay) return;
-
-  const apply = () => {
-    const controlsOnLeft = overlay.visible && overlay.getTitlebarAreaRect().x > 0;
-    document.documentElement.toggleAttribute('data-controls-left', controlsOnLeft);
-  };
-
-  apply();
-  overlay.addEventListener('geometrychange', apply);
+function flagMacOS(): void {
+  document.documentElement.toggleAttribute('data-macos', detectOs() === 'macOS');
 }
 
 const AUTO_REDIRECT_KEY = 'milkbox:auto-redirect';

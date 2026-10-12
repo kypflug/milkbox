@@ -204,16 +204,16 @@ body {
    * left-aligned title can shrink up to the controls without ever sliding
    * under them. */
   .feed-header-row {
+    --wco-inset-left: max(20px, calc(env(titlebar-area-x, 0px) + 8px));
+    --wco-inset-right:
+      max(20px, calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw) + 8px));
     position: fixed;
     top: env(titlebar-area-y, 0px);
     left: 0;
     width: 100%;
     height: var(--wco-title-strip-height);
     min-height: var(--wco-title-strip-height);
-    padding: 0
-      max(20px, calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw) + 8px))
-      0
-      max(20px, calc(env(titlebar-area-x, 0px) + 8px));
+    padding: 0 var(--wco-inset-right) 0 var(--wco-inset-left);
     /* Above the drag overlay (z-50) so the title button is reachable: a fixed
      * row is its own stacking context, so nothing inside it could otherwise
      * out-stack the overlay. The row itself ignores the pointer, so drags on
@@ -224,6 +224,36 @@ body {
     -webkit-user-select: none;
     user-select: none;
   }
+
+  /* macOS (main.ts flags it) keeps its window controls on the left, where a
+   * title tucked in beside them looks out of place, and centres the title in
+   * its own title bars. So there the bottle and title sit in the middle.
+   *
+   * Two equal rails either side of the pair do it, each never narrower than
+   * the inset on its side. That centres the pair on the window, in line
+   * with the pane below, not on the strip between the controls, which is
+   * off to one side because the two sets of controls differ in width. A
+   * long chat name that cannot be centred that way pushes the pair toward
+   * the roomier side, and truncates only once both rails are down to their
+   * insets: the same room the left-aligned title has. */
+  :root[data-macos] .feed-header-row {
+    display: grid;
+    grid-template-columns:
+      minmax(var(--wco-inset-left), 1fr)
+      auto
+      minmax(0, auto)
+      minmax(var(--wco-inset-right), 1fr);
+    /* The rails stand in for the padding. A grid gap would fall between
+     * each rail and the pair as well, so the bottle carries it instead. */
+    padding: 0;
+    gap: 0;
+  }
+  :root[data-macos] .feed-mark {
+    grid-column: 2;
+    margin-right: 4px;
+  }
+  :root[data-macos] .feed-title-btn { grid-column: 3; }
+
   .feed-header {
     height: var(--wco-title-strip-height);
     background: transparent;
