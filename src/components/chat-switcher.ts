@@ -130,14 +130,19 @@ export function mountChatMenu(
 
   const repaint = () => void paint().catch(err => console.debug('[Chats] Menu paint failed:', err));
 
-  /** Hang from the title's left edge, clamped to the viewport; cap the
-   *  height to the space below so a long list scrolls inside the menu. */
+  /** Hang from the title's left edge, or centre under it where the title is
+   *  itself centred (the macOS title strip, global.css). Clamped to the
+   *  viewport either way; cap the height to the space below so a long list
+   *  scrolls inside the menu. */
   function position(): void {
     const anchor = trigger.getBoundingClientRect();
     const header = trigger.closest<HTMLElement>('.feed-header-row')?.getBoundingClientRect();
     const top = Math.max(anchor.bottom, header?.bottom ?? anchor.bottom) + MENU_GAP;
-    const maxLeft = window.innerWidth - VIEWPORT_GUTTER - menu.offsetWidth;
-    const left = Math.max(VIEWPORT_GUTTER, Math.min(anchor.left, maxLeft));
+    const width = menu.offsetWidth;
+    const centred = document.documentElement.hasAttribute('data-mac-titlebar');
+    const wanted = centred ? anchor.left + (anchor.width - width) / 2 : anchor.left;
+    const maxLeft = window.innerWidth - VIEWPORT_GUTTER - width;
+    const left = Math.max(VIEWPORT_GUTTER, Math.min(wanted, maxLeft));
     menu.style.top = `${top}px`;
     menu.style.left = `${left}px`;
     menu.style.maxHeight = `${Math.max(160, window.innerHeight - top - VIEWPORT_GUTTER)}px`;

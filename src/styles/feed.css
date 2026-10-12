@@ -33,7 +33,9 @@
 /* The bottle, then the title beside it, both on the left. Nothing sits on
  * the right, so under window-controls-overlay the controls on either side
  * only ever cost the title width, never a collision (global.css). A long
- * chat name truncates inside the title rather than overflowing the row. */
+ * chat name truncates inside the title rather than overflowing the row.
+ * The one exception is the macOS title strip, which centres the pair
+ * (global.css again). */
 .feed-header-row {
   min-height: var(--title-strip-height);
   display: flex;
