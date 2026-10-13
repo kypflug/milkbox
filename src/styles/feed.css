@@ -260,6 +260,22 @@
   padding: 0;
   position: relative;
 }
+/* A card is as wide as its widest content asks for, and until its preview
+ * loads an image asks for nothing. The card was then only as wide as its
+ * meta line, the box was cut to the picture's ratio at that width, and it
+ * grew to several times the size when the preview arrived, moving everything
+ * below it. This asks for the picture's width in its place: --w is the
+ * width on record, set with the ratio in drop-card.ts. The box's own
+ * max-width and max-height cap what it asks for, exactly as they cap the
+ * picture, so the box is the same before the preview and after. An image
+ * with no size on record sets neither, and is sized by its preview when
+ * that comes. It has no height, and where the card is narrower than it the
+ * box's clipping hides the rest. */
+.drop-image::before {
+  content: '';
+  display: block;
+  width: var(--w, 0);
+}
 .drop-image img {
   width: 100%;
   height: 100%;

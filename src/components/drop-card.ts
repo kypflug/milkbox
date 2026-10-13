@@ -85,12 +85,18 @@ function bodyFor(record: DropRecord): string {
 
     case 'image': {
       const f = meta.file;
-      const ratio = f?.width && f?.height ? `aspect-ratio: ${f.width} / ${f.height};` : '';
+      // With the image's size on record, its box is laid out at its final
+      // size before the preview arrives: the ratio gives the height, and --w
+      // is the width the picture itself will ask the card for (feed.css).
+      const sized =
+        f?.width && f.width > 0 && f?.height && f.height > 0
+          ? `aspect-ratio: ${f.width} / ${f.height}; --w: ${f.width}px;`
+          : '';
       const caption = meta.text
         ? `<div class="drop-text drop-caption">${linkify(escapeHtml(meta.text))}</div>`
         : '';
       return `
-        <button class="drop-image" data-action="lightbox" style="${ratio}" title="${escapeAttr(f?.name || 'Image')}">
+        <button class="drop-image" data-action="lightbox" style="${sized}" title="${escapeAttr(f?.name || 'Image')}">
           <img data-thumb-id="${escapeAttr(meta.id)}" alt="${escapeAttr(f?.name || 'Image')}" loading="lazy">
           <span class="drop-image-progress" hidden><span class="drop-image-progress-fill"></span></span>
         </button>
