@@ -344,6 +344,37 @@ export async function renderFeed(
     updateJump();
   }
 
+  /** A card in view, and how far its top is below the top of the feed's viewport. */
+  type ReadingPlace = Array<{ id: string; top: number }>;
+
+  /**
+   * Where the user is reading: the first few cards in view, top one first.
+   * A few, because the first may not be in the list that is drawn next.
+   */
+  function readingPlace(): ReadingPlace {
+    const edge = scrollEl.getBoundingClientRect().top;
+    const place: ReadingPlace = [];
+    for (const card of listEl.querySelectorAll<HTMLElement>('.drop-card')) {
+      const box = card.getBoundingClientRect();
+      if (box.bottom <= edge) continue;
+      place.push({ id: card.dataset.dropId ?? '', top: box.top - edge });
+      if (place.length === 4) break;
+    }
+    return place;
+  }
+
+  /** Scroll the list as now drawn so that the card the user was on is back where it was. */
+  function returnTo(place: ReadingPlace): void {
+    const edge = scrollEl.getBoundingClientRect().top;
+    for (const { id, top } of place) {
+      const card = listEl.querySelector<HTMLElement>(`[data-drop-id="${CSS.escape(id)}"]`);
+      if (!card) continue;
+      scrollEl.scrollTop += card.getBoundingClientRect().top - edge - top;
+      lastScrollTop = scrollEl.scrollTop;
+      return;
+    }
+  }
+
   // The way back to the newest drop, offered once the feed is more than a
   // screen above it, or sooner when drops have arrived down there unseen.
   const jumpEl = document.getElementById('feedJump') as HTMLButtonElement;
@@ -491,6 +522,13 @@ export async function renderFeed(
     // previews on screen would be the ones from before it.
     const prefix = previewPrefix();
     const rebuilt = html !== renderedHtml || prefix !== previewsDrawnFor;
+    // An older page is coming in at the top (the caller asks for the list
+    // not to move): every card in view is about to be a page further down.
+    // The list is replaced whole, so the browser has no node left to hold
+    // the view by, and the scroll position, kept as the number it was, is
+    // the top of the new page: a hundred cards above the one being read.
+    // The cards in view are noted, to scroll back to.
+    const place = rebuilt && opts.stick === false ? readingPlace() : null;
     if (rebuilt) {
       listEl.innerHTML = html;
       renderedHtml = html;
@@ -510,6 +548,7 @@ export async function renderFeed(
       }
       hydrateImages();
       hydrateFavicons();
+      if (place) returnTo(place);
     }
     // A list left untouched stays where the user has it, unless the caller
     // asked for the bottom (a send, the first paint).
@@ -1111,6 +1150,10 @@ export async function renderFeed(
   const observer = new IntersectionObserver(entries => {
     if (entries.some(e => e.isIntersecting) && visibleCount < feed.length) {
       visibleCount += PAGE_SIZE;
+      // Not to the bottom, and not left at the top either: the card being
+      // read stays where it is (see refresh). That also takes the sentinel
+      // out of view, so the page after this one waits for the user to
+      // scroll up to it.
       void refresh({ stick: false });
     }
   });
