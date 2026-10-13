@@ -97,6 +97,36 @@
 }
 .feed-list:has(.feed-empty) { margin: auto 0; }
 
+/* ── jump to latest ── */
+
+/* Offered when the feed is scrolled well above its newest drop, or when
+ * drops have arrived down there unseen (feed.ts). It hangs off the composer
+ * region, not the scroller: it stays put while the feed moves under it, and
+ * rides up with the composer as that grows. A resting surface like the
+ * action bar and the toast: value step and a hairline, no shadow. */
+.feed-jump {
+  position: absolute;
+  right: 20px;
+  bottom: calc(100% + 10px);
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  color: var(--ink-2);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-chip);
+  box-shadow: var(--card-highlight);
+  transition: color var(--ease), border-color var(--ease);
+}
+.feed-jump:hover { color: var(--ink); }
+/* Something new is below: the accent, which means "this goes somewhere". */
+.feed-jump--new,
+.feed-jump--new:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--hairline));
+}
+
 /* ── empty state ── */
 
 .feed-empty {
