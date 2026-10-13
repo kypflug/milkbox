@@ -33,7 +33,7 @@ import { startReconnectFlow } from '../services/chat-flows';
 import { getAccountId } from '../services/auth';
 import { showToast } from '../components/toast';
 import { putShareInbox } from '../services/share-inbox';
-import { iconBottle, iconChevronDown, iconClose } from '../components/icons';
+import { iconArrowDown, iconBottle, iconChevronDown, iconClose } from '../components/icons';
 import { createLimiter } from '../utils/limit';
 
 const PAGE_SIZE = 100;
@@ -224,6 +224,7 @@ export async function renderFeed(
         <div class="feed-list" id="feedList" role="log" aria-label="${escapeAttr(logLabel)}"></div>
       </div>
       <div class="composer-region" id="composerRegion">
+        <button class="feed-jump" id="feedJump" hidden>${iconArrowDown('1.15em')}</button>
         <div class="settings-flyout-mount"></div>
         <div class="composer-mount" id="composerMount"></div>
       </div>
@@ -286,13 +287,140 @@ export async function renderFeed(
     if (pendingDeletes.size === 0) showToast(message);
   };
 
-  function nearBottom(): boolean {
-    return scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 120;
+  /** Within this much of the end, the feed counts as at its newest drop. */
+  const BOTTOM_SLACK = 120;
+
+  function distanceFromBottom(): number {
+    return scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
   }
+
+  /**
+   * The feed is following its newest drop: the user left it at the bottom,
+   * and has not scrolled away since. Kept as a fact about where they put
+   * it, not measured when the next drop arrives, because what is drawn goes
+   * on changing height after it is drawn: an image card grows when its
+   * preview loads, the composer grows a line, the window is resized. A feed
+   * drawn at the bottom was a screen or more above it by the next arrival,
+   * which then left it there, and every arrival after that left it further
+   * behind.
+   */
+  let following = true;
+  /** Drops were drawn below the newest one seen, while the feed was not following. */
+  let arrivedBelow = false;
+  /** The drops in the list as last drawn. */
+  let drawnIds = new Set<string>();
+
+  /**
+   * While the feed follows, where it is scrolled to is kept here (the
+   * observer below), and the browser's own scroll anchoring is switched off.
+   * Anchoring holds the view still by moving the scroll position when what
+   * is above the view changes height, up as well as down. An image above
+   * loses its placeholder text as its preview is set, the position moves up
+   * a line, and with a preview in view growing in the same layout that reads
+   * exactly like the user scrolling away. With anchoring off, the position
+   * of a following feed only goes up when the user moves it, or when the
+   * list gets shorter and it is held at the end. Scrolled away, anchoring is
+   * what keeps the card being read in place, so there it stays on.
+   */
+  function setFollowing(value: boolean): void {
+    following = value;
+    scrollEl.style.overflowAnchor = value ? 'none' : '';
+  }
+  setFollowing(true);
+
+  /** Following, or near enough to the end to be taken up again. */
+  function atBottom(): boolean {
+    return following || distanceFromBottom() < BOTTOM_SLACK;
+  }
+
+  /** Where the feed was scrolled to when last looked at, to tell which way it moves. */
+  let lastScrollTop = 0;
 
   function scrollToBottom(): void {
     scrollEl.scrollTop = scrollEl.scrollHeight;
+    lastScrollTop = scrollEl.scrollTop;
+    setFollowing(true);
+    arrivedBelow = false;
+    updateJump();
   }
+
+  /** A card in view, and how far its top is below the top of the feed's viewport. */
+  type ReadingPlace = Array<{ id: string; top: number }>;
+
+  /**
+   * Where the user is reading: the first few cards in view, top one first.
+   * A few, because the first may not be in the list that is drawn next.
+   */
+  function readingPlace(): ReadingPlace {
+    const edge = scrollEl.getBoundingClientRect().top;
+    const place: ReadingPlace = [];
+    for (const card of listEl.querySelectorAll<HTMLElement>('.drop-card')) {
+      const box = card.getBoundingClientRect();
+      if (box.bottom <= edge) continue;
+      place.push({ id: card.dataset.dropId ?? '', top: box.top - edge });
+      if (place.length === 4) break;
+    }
+    return place;
+  }
+
+  /** Scroll the list as now drawn so that the card the user was on is back where it was. */
+  function returnTo(place: ReadingPlace): void {
+    const edge = scrollEl.getBoundingClientRect().top;
+    for (const { id, top } of place) {
+      const card = listEl.querySelector<HTMLElement>(`[data-drop-id="${CSS.escape(id)}"]`);
+      if (!card) continue;
+      scrollEl.scrollTop += card.getBoundingClientRect().top - edge - top;
+      lastScrollTop = scrollEl.scrollTop;
+      return;
+    }
+  }
+
+  // The way back to the newest drop, offered once the feed is more than a
+  // screen above it, or sooner when drops have arrived down there unseen.
+  const jumpEl = document.getElementById('feedJump') as HTMLButtonElement;
+  let jumpShown = '';
+  function updateJump(): void {
+    const show = !atBottom() && (arrivedBelow || distanceFromBottom() > scrollEl.clientHeight);
+    // Scroll events come many to the second: touch the button only on a change.
+    const state = show ? (arrivedBelow ? 'new' : 'far') : '';
+    if (state === jumpShown) return;
+    jumpShown = state;
+    const label = arrivedBelow ? 'New drops below. Jump to latest' : 'Jump to latest';
+    jumpEl.hidden = !show;
+    jumpEl.classList.toggle('feed-jump--new', show && arrivedBelow);
+    jumpEl.title = label;
+    jumpEl.setAttribute('aria-label', label);
+  }
+  jumpEl.addEventListener('click', scrollToBottom);
+
+  // Where the user leaves the feed decides whether it follows. A feed that
+  // is following stops only by being scrolled up and away: the event for a
+  // scroll to the bottom made here can arrive after the list has grown again
+  // (previews load in bursts), and the distance it would measure then is the
+  // list's doing, not the user's.
+  scrollEl.addEventListener(
+    'scroll',
+    () => {
+      const movedUp = scrollEl.scrollTop < lastScrollTop - 1;
+      lastScrollTop = scrollEl.scrollTop;
+      if (!following || movedUp) setFollowing(distanceFromBottom() < BOTTOM_SLACK);
+      if (following) arrivedBelow = false;
+      updateJump();
+    },
+    { passive: true },
+  );
+
+  // A feed that is following stays on its newest drop when the list changes
+  // height under it, or the room it is shown in does. Neither is a scroll,
+  // so neither is heard above. The observer runs after layout and before
+  // the frame is painted: the list is not seen out of place in between.
+  const sizes = new ResizeObserver(() => {
+    if (atBottom()) scrollToBottom();
+    else updateJump();
+  });
+  sizes.observe(scrollEl);
+  sizes.observe(listEl);
+  teardownFns.push(() => sizes.disconnect());
 
   function permsFor(own: boolean): { canEdit: boolean; canDelete: boolean } {
     if (!isChat) return { canEdit: true, canDelete: true };
@@ -388,15 +516,29 @@ export async function renderFeed(
     }
     // Read now, not before the awaits above — the user may have started
     // scrolling up in the meantime.
-    const stick = opts.stick ?? nearBottom();
+    const stick = opts.stick ?? atBottom();
     // The same list is drawn again all the same after a re-sync from
     // scratch: a quick one has every drop back before this runs, and the
     // previews on screen would be the ones from before it.
     const prefix = previewPrefix();
     const rebuilt = html !== renderedHtml || prefix !== previewsDrawnFor;
+    // An older page is coming in at the top (the caller asks for the list
+    // not to move): every card in view is about to be a page further down.
+    // The list is replaced whole, so the browser has no node left to hold
+    // the view by, and the scroll position, kept as the number it was, is
+    // the top of the new page: a hundred cards above the one being read.
+    // The cards in view are noted, to scroll back to.
+    const place = rebuilt && opts.stick === false ? readingPlace() : null;
     if (rebuilt) {
       listEl.innerHTML = html;
       renderedHtml = html;
+      // The list now ends on a drop it did not hold before, and the user is
+      // somewhere else in the feed: something new is down there, unseen. (A
+      // delete of the last drop ends the list on one it did hold, and an
+      // older page arriving at the top does not change its end.)
+      const newest = visible.length ? visible[visible.length - 1].meta.id : undefined;
+      if (!stick && newest && drawnIds.size > 0 && !drawnIds.has(newest)) arrivedBelow = true;
+      drawnIds = new Set(visible.map(record => record.meta.id));
       if (prefix !== previewsDrawnFor) {
         // The list just replaced was the last to use the earlier previews.
         // They go, and each preview has its one retry again.
@@ -406,10 +548,12 @@ export async function renderFeed(
       }
       hydrateImages();
       hydrateFavicons();
+      if (place) returnTo(place);
     }
     // A list left untouched stays where the user has it, unless the caller
     // asked for the bottom (a send, the first paint).
     if (rebuilt ? stick : opts.stick === true) scrollToBottom();
+    else updateJump();
 
     // Read only while the user is looking at the chat (see `looking`), and
     // not by a screen they have already left: this refresh was under way
@@ -1006,6 +1150,10 @@ export async function renderFeed(
   const observer = new IntersectionObserver(entries => {
     if (entries.some(e => e.isIntersecting) && visibleCount < feed.length) {
       visibleCount += PAGE_SIZE;
+      // Not to the bottom, and not left at the top either: the card being
+      // read stays where it is (see refresh). That also takes the sentinel
+      // out of view, so the page after this one waits for the user to
+      // scroll up to it.
       void refresh({ stick: false });
     }
   });

@@ -97,6 +97,36 @@
 }
 .feed-list:has(.feed-empty) { margin: auto 0; }
 
+/* ── jump to latest ── */
+
+/* Offered when the feed is scrolled well above its newest drop, or when
+ * drops have arrived down there unseen (feed.ts). It hangs off the composer
+ * region, not the scroller: it stays put while the feed moves under it, and
+ * rides up with the composer as that grows. A resting surface like the
+ * action bar and the toast: value step and a hairline, no shadow. */
+.feed-jump {
+  position: absolute;
+  right: 20px;
+  bottom: calc(100% + 10px);
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  color: var(--ink-2);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-chip);
+  box-shadow: var(--card-highlight);
+  transition: color var(--ease), border-color var(--ease);
+}
+.feed-jump:hover { color: var(--ink); }
+/* Something new is below: the accent, which means "this goes somewhere". */
+.feed-jump--new,
+.feed-jump--new:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--hairline));
+}
+
 /* ── empty state ── */
 
 .feed-empty {
@@ -229,6 +259,22 @@
   background: var(--surface-sunk);
   padding: 0;
   position: relative;
+}
+/* A card is as wide as its widest content asks for, and until its preview
+ * loads an image asks for nothing. The card was then only as wide as its
+ * meta line, the box was cut to the picture's ratio at that width, and it
+ * grew to several times the size when the preview arrived, moving everything
+ * below it. This asks for the picture's width in its place: --w is the
+ * width on record, set with the ratio in drop-card.ts. The box's own
+ * max-width and max-height cap what it asks for, exactly as they cap the
+ * picture, so the box is the same before the preview and after. An image
+ * with no size on record sets neither, and is sized by its preview when
+ * that comes. It has no height, and where the card is narrower than it the
+ * box's clipping hides the rest. */
+.drop-image::before {
+  content: '';
+  display: block;
+  width: var(--w, 0);
 }
 .drop-image img {
   width: 100%;

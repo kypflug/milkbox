@@ -56,6 +56,10 @@ export const iconSignOut = (size = '1em') =>
 export const iconChevronDown = (size = '1em') =>
   svg('<path d="m6.5 9.5 5.5 5.5 5.5-5.5"/>', size);
 
+/** Downward arrow — back to the newest drop. */
+export const iconArrowDown = (size = '1em') =>
+  svg('<path d="M12 5v14M6.5 13.5 12 19l5.5-5.5"/>', size);
+
 export const iconPlus = (size = '1em') =>
   svg('<path d="M12 5v14M5 12h14"/>', size);
 
