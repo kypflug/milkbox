@@ -197,10 +197,15 @@ body {
   /* The row spans the window, and its padding grows to cover whichever
    * side the window controls occupy, plus an 8px breath: the overlay rect
    * starts after them when they sit on the left (macOS, right-to-left
-   * Windows) and stops before them on the right. The bottle keeps its usual
-   * 20px corner unless the controls push it further in, and the
-   * left-aligned title can shrink up to the controls without ever sliding
-   * under them. */
+   * Windows) and stops before them on the right.
+   *
+   * As it stands this is the title strip with the controls on the right
+   * (Windows, Linux, ChromeOS): the pair keeps to the left there, across
+   * from them, where those put a window's title. The bottle keeps its usual
+   * 20px corner unless the controls push it further in, and the title can
+   * shrink up to the controls without ever sliding under them. With the
+   * controls on the left the padding gives way to the rails below, which
+   * centre the pair. */
   .feed-header-row {
     --wco-inset-left: max(20px, calc(env(titlebar-area-x, 0px) + 8px));
     --wco-inset-right:
@@ -212,6 +217,7 @@ body {
     height: var(--wco-title-strip-height);
     min-height: var(--wco-title-strip-height);
     padding: 0 var(--wco-inset-right) 0 var(--wco-inset-left);
+    justify-content: flex-start;
     /* Above the drag overlay (z-50) so the title button is reachable: a fixed
      * row is its own stacking context, so nothing inside it could otherwise
      * out-stack the overlay. The row itself ignores the pointer, so drags on
@@ -223,9 +229,11 @@ body {
     user-select: none;
   }
 
-  /* macOS (main.ts flags it) keeps its window controls on the left, where a
-   * title tucked in beside them looks out of place, and centres the title in
-   * its own title bars. So there the bottle and title sit in the middle.
+  /* With the window controls on the left (macOS's traffic lights, or a
+   * right-to-left install; main.ts reads the side off the overlay) the
+   * bottle and title sit in the middle of the title strip, as they do in
+   * the header everywhere (feed.css), rather than tucked in beside the
+   * controls, where a title looks out of place.
    *
    * Two equal rails either side of the pair do it, each never narrower than
    * the inset on its side. That centres the pair on the window, in line
@@ -234,7 +242,7 @@ body {
    * long chat name that cannot be centred that way pushes the pair toward
    * the roomier side, and truncates only once both rails are down to their
    * insets: the same room the left-aligned title has. */
-  :root[data-macos] .feed-header-row {
+  :root[data-controls-left] .feed-header-row {
     display: grid;
     grid-template-columns:
       minmax(var(--wco-inset-left), 1fr)
@@ -246,11 +254,11 @@ body {
     padding: 0;
     gap: 0;
   }
-  :root[data-macos] .feed-mark {
+  :root[data-controls-left] .feed-mark {
     grid-column: 2;
     margin-right: 4px;
   }
-  :root[data-macos] .feed-title-btn { grid-column: 3; }
+  :root[data-controls-left] .feed-title-btn { grid-column: 3; }
 
   .feed-header {
     height: var(--wco-title-strip-height);

@@ -132,19 +132,19 @@ export function mountChatMenu(
 
   const repaint = () => void paint().catch(err => console.debug('[Chats] Menu paint failed:', err));
 
-  /** Hang from the title's left edge, or centre under it where the title is
-   *  itself centred: the macOS title strip, on the same two conditions as
-   *  its rule in global.css, and iOS, on the one its rule in feed.css has.
-   *  Clamped to the viewport either way; cap the height to the space below
-   *  so a long list scrolls inside the menu. */
+  /** Centre under the title, as the title is itself centred, except in a
+   *  title strip with the window controls on the right, where the title
+   *  keeps to the left and the menu hangs from its left edge (on the same
+   *  two conditions as the rule in global.css). Clamped to the viewport
+   *  either way; cap the height to the space below so a long list scrolls
+   *  inside the menu. */
   function position(): void {
     const anchor = trigger.getBoundingClientRect();
     const header = trigger.closest<HTMLElement>('.feed-header-row')?.getBoundingClientRect();
     const top = Math.max(anchor.bottom, header?.bottom ?? anchor.bottom) + MENU_GAP;
     const width = menu.offsetWidth;
-    const root = document.documentElement;
-    const centred = (overlayMode.matches && root.hasAttribute('data-macos')) || root.hasAttribute('data-ios');
-    const wanted = centred ? anchor.left + (anchor.width - width) / 2 : anchor.left;
+    const leftAligned = overlayMode.matches && !document.documentElement.hasAttribute('data-controls-left');
+    const wanted = leftAligned ? anchor.left : anchor.left + (anchor.width - width) / 2;
     const maxLeft = window.innerWidth - VIEWPORT_GUTTER - width;
     const left = Math.max(VIEWPORT_GUTTER, Math.min(wanted, maxLeft));
     menu.style.top = `${top}px`;
@@ -199,6 +199,12 @@ export function mountChatMenu(
   // can be open at the time: a click on the browser's own buttons is not one
   // the page sees, so it does not dismiss it.
   overlayMode.addEventListener('change', reposition);
+  // Which side the controls are on is only known once the overlay shows, and
+  // a geometry change reports it after the display mode has changed: the
+  // title moves again then. main.ts listened first, so its flag is current
+  // by the time this runs.
+  const overlay = navigator.windowControlsOverlay;
+  overlay?.addEventListener('geometrychange', reposition);
   // The title changes width under an open menu when the unread badge beside
   // it comes, goes or gains a digit: main.ts paints the badge from its own
   // read of the chats, which can land after this menu's. A menu hung from
@@ -277,6 +283,7 @@ export function mountChatMenu(
       offBroadcast();
       window.removeEventListener('resize', reposition);
       overlayMode.removeEventListener('change', reposition);
+      overlay?.removeEventListener('geometrychange', reposition);
       titleSize.disconnect();
       trigger.removeEventListener('pointerdown', onTriggerPointerDown);
       trigger.removeEventListener('keydown', onTriggerKeyDown);

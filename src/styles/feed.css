@@ -29,23 +29,19 @@
   z-index: 2;
 }
 
-/* The bottle, then the title beside it, both on the left. Nothing sits on
- * the right, so under window-controls-overlay the controls on either side
- * only ever cost the title width, never a collision (global.css). A long
- * chat name truncates inside the title rather than overflowing the row.
- * The exceptions are the two places whose own title bars centre a title:
- * the macOS title strip (global.css again), and iOS, below. */
+/* The bottle, then the title beside it, centred in the row. A long chat
+ * name truncates inside the title rather than overflowing the row. The one
+ * place the pair keeps to the left is an installed app's title strip with
+ * the window controls on the right, which is where Windows, Linux and
+ * ChromeOS put a window's title (global.css). */
 .feed-header-row {
   min-height: var(--title-strip-height);
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
   padding: 0 20px;
 }
-/* iOS and iPadOS centre the title of a screen, so the pair sits in the
- * middle of the row there, installed or in a tab (main.ts flags the
- * platform). The title still gives way first when a chat name is long. */
-:root[data-ios] .feed-header-row { justify-content: center; }
 
 .feed-mark {
   flex: none;
