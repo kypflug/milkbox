@@ -10,9 +10,7 @@ let runtimeDeviceId = '';
 let runtimeCreatedAt = 0;
 let runtimeUpdatedAt = 0;
 
-/** Best-effort OS label from the UA. It is attribution, plus one choice of
- *  layout (the macOS title strip, main.ts) where a wrong guess costs nothing
- *  but where the title sits. Not for anything that has to be right. */
+/** Best-effort OS label from the UA — used as attribution, not detection. */
 export function detectOs(): string {
   const ua = navigator.userAgent;
   if (/iPad|iPhone|iPod/.test(ua)) return 'iOS';
