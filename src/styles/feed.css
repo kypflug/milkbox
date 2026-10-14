@@ -5,8 +5,7 @@
  * never a shadow.
  */
 
-/* Edge-to-edge by default; the floating-pane media query in global.css
- * takes over sizing on tall viewports. */
+/* Edge to edge at every size: the screen is the window. */
 .feed-screen {
   height: 100%;
   height: 100dvh;
@@ -17,11 +16,11 @@
 
 /* ── header ── */
 
-/* viewport-fit=cover lets an installed iOS app draw under the status bar,
- * where the system blurs whatever sits there. The inset keeps the header
- * row below it; it is 0 everywhere the status bar doesn't overlap. (Since
- * iOS 27 the blur reaches past the inset, onto the row itself: see
- * .status-bar-backdrop in global.css for what keeps it off.) */
+/* viewport-fit=cover lets a page draw under the status bar where the system
+ * lays it over the page. The inset keeps the header row below it; it is 0
+ * wherever the status bar doesn't overlap, which includes the installed iOS
+ * app as Milkbox asks for it. (The blur iOS 27 puts over the top of that
+ * app is another matter: see .status-bar-backdrop in global.css.) */
 .feed-header {
   flex: none;
   padding-top: env(safe-area-inset-top, 0px);
@@ -34,8 +33,8 @@
  * the right, so under window-controls-overlay the controls on either side
  * only ever cost the title width, never a collision (global.css). A long
  * chat name truncates inside the title rather than overflowing the row.
- * The one exception is the macOS title strip, which centres the pair
- * (global.css again). */
+ * The exceptions are the two places whose own title bars centre a title:
+ * the macOS title strip (global.css again), and iOS, below. */
 .feed-header-row {
   min-height: var(--title-strip-height);
   display: flex;
@@ -43,6 +42,10 @@
   gap: 4px;
   padding: 0 20px;
 }
+/* iOS and iPadOS centre the title of a screen, so the pair sits in the
+ * middle of the row there, installed or in a tab (main.ts flags the
+ * platform). The title still gives way first when a chat name is long. */
+:root[data-ios] .feed-header-row { justify-content: center; }
 
 .feed-mark {
   flex: none;
@@ -68,8 +71,8 @@
   overscroll-behavior: contain;
   padding: 0 20px;
   /* Reserve the scrollbar on both edges so the feed's content box stays
-   * centred on the pane — otherwise the day dividers sit half a scrollbar
-   * off the pane's centre line, and the column shifts when the feed
+   * centred in the window — otherwise the day dividers sit half a scrollbar
+   * off its centre line, and the column shifts when the feed
    * becomes scrollable. No-op where scrollbars overlay (macOS, touch). */
   scrollbar-gutter: stable both-edges;
   /* Quiet scrollbar: no track paint, hairline thumb, only when needed. */

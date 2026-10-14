@@ -89,7 +89,7 @@ function inviteInAddressBar(): string | null {
 
 async function boot(app: HTMLElement): Promise<void> {
   applyTheme();
-  flagMacOS();
+  flagPlatform();
   // Before the first await: a broadcast is not replayed, so a sign-out in
   // another tab while this one restores its token cache or starts MSAL
   // would be missed — and this page would enter the app as the account that
@@ -187,25 +187,29 @@ async function boot(app: HTMLElement): Promise<void> {
 // ─── Auto-redirect helpers (iOS session recovery) ───
 
 /**
- * Flag a macOS install. Under window-controls-overlay the traffic lights sit
- * on the left there, so a title tucked in beside them looks out of place,
- * and the system's own title bars centre theirs: the feed header centres its
- * bottle and title to match, and the chat menu follows (global.css,
- * chat-switcher.ts).
+ * Flag the platforms whose own title bars centre a title, so the feed header
+ * centres its bottle and title there, and the chat menu follows (feed.css,
+ * global.css, chat-switcher.ts).
  *
- * The platform is asked for by name, not read off where the controls are: a
- * right-to-left Windows install has them on the left too, and keeps its
- * title on the left.
+ * macOS: under window-controls-overlay the traffic lights sit on the left,
+ * so a title tucked in beside them looks out of place. The platform is asked
+ * for by name, not read off where the controls are: a right-to-left Windows
+ * install has them on the left too, and keeps its title on the left.
  *
- * Being a Mac is all the flag says. Whether the overlay is showing is left
+ * Being a Mac is all that flag says. Whether the overlay is showing is left
  * to the display-mode query, which the stylesheet and the menu each read for
  * themselves: the overlay is switched on and off while the app runs, and a
  * flag that followed it from here would lag the stylesheet by a listener.
  * Only a browser that has the overlay ever matches that query, so Safari and
  * Firefox on a Mac are untouched.
+ *
+ * iOS and iPadOS: a screen's title is centred there as a matter of course,
+ * installed or in a tab, so that flag is all its rule waits on.
  */
-function flagMacOS(): void {
-  document.documentElement.toggleAttribute('data-macos', detectOs() === 'macOS');
+function flagPlatform(): void {
+  const os = detectOs();
+  document.documentElement.toggleAttribute('data-macos', os === 'macOS');
+  document.documentElement.toggleAttribute('data-ios', os === 'iOS' || os === 'iPadOS');
 }
 
 const AUTO_REDIRECT_KEY = 'milkbox:auto-redirect';

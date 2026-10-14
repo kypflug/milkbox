@@ -20,12 +20,12 @@
   follow-up drain rather than waiting for the polling interval.
 - Use strict TypeScript without `any` casts or swallowed errors. Follow the
   repository's targeted error handling and existing IndexedDB/Graph helpers.
-- Maintain both full-bleed and floating-pane layouts at the 800px by 600px
-  breakpoint. In Window Controls Overlay mode, keep window dragging isolated
-  to the empty `.window-drag-region`; do not compose nested drag/no-drag
-  regions. The full visible titlebar must stay draggable, interactive content
-  must remain outside that overlay, and chrome colors must match the active
-  background.
+- The app is full-bleed at every size: there is no floating-pane layout, so
+  check a narrow and a wide window rather than a breakpoint. In Window
+  Controls Overlay mode, keep window dragging isolated to the empty
+  `.window-drag-region`; do not compose nested drag/no-drag regions. The full
+  visible titlebar must stay draggable, interactive content must remain
+  outside that overlay, and chrome colors must match the active background.
 - Keep service-worker changes compatible with the custom `injectManifest`
   build and Web Share Target flow.
 - Treat `src/styles/global.css` as the only source of truth for colour, and

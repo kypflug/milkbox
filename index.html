@@ -31,11 +31,7 @@
           : t;
         document.documentElement.setAttribute('data-theme', resolved);
         var meta = document.querySelector('meta[name="theme-color"]');
-        var pane = matchMedia('(min-height: 600px) and (min-width: 800px)').matches;
-        var colors = resolved === 'dark'
-          ? { full: '#0f1319', pane: '#080a0e' }
-          : { full: '#e3e8ee', pane: '#d2d8e0' };
-        if (meta) meta.setAttribute('content', pane ? colors.pane : colors.full);
+        if (meta) meta.setAttribute('content', resolved === 'dark' ? '#0f1319' : '#e3e8ee');
       } catch (e) { /* storage unavailable — default to light */ }
     })();
   </script>

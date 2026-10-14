@@ -70,12 +70,32 @@ function diagnosticsRows(d: Diagnostics): Array<[string, string]> {
   ];
 }
 
+/**
+ * What the top of the page measures here, in CSS pixels: the status bar
+ * inset, and the strip that keeps iOS's top blur off (.status-bar-backdrop
+ * in global.css). Whether that strip has any height in the installed iOS
+ * app is the one thing about it that cannot be seen from a desk.
+ */
+function topOfPage(): { safeAreaTop: number; strip: number } {
+  const probe = document.createElement('div');
+  probe.style.cssText = 'position:fixed;top:0;left:0;width:0;height:env(safe-area-inset-top,0px);visibility:hidden';
+  document.body.appendChild(probe);
+  const safeAreaTop = probe.getBoundingClientRect().height;
+  probe.remove();
+  const strip = document.querySelector('.status-bar-backdrop')?.getBoundingClientRect().height ?? 0;
+  return { safeAreaTop, strip };
+}
+
 /** Everything the panel shows, plus enough context to read it elsewhere. */
 function diagnosticsReport(d: Diagnostics): string {
   const standalone =
     window.matchMedia('(display-mode: standalone)').matches ||
     (navigator as unknown as { standalone?: boolean }).standalone === true;
-  return JSON.stringify({ at: new Date().toISOString(), userAgent: navigator.userAgent, standalone, ...d }, null, 2);
+  return JSON.stringify(
+    { at: new Date().toISOString(), userAgent: navigator.userAgent, standalone, topOfPage: topOfPage(), ...d },
+    null,
+    2,
+  );
 }
 
 export interface SettingsFlyoutApi {

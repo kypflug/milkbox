@@ -1,8 +1,7 @@
 /**
  * Shared-chat overlays: create, consent interstitial, invite (QR + link),
- * manage members, and join progress. Portaled to document.body (the pane
- * layout clips overflow, and fixed children of body escape it — the same
- * trick the lightbox uses).
+ * manage members, and join progress. Portaled to document.body, as the
+ * lightbox is.
  */
 
 import QRCode from 'qrcode';

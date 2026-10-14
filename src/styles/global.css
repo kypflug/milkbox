@@ -12,10 +12,10 @@
  * Family law: resting surfaces earn separation from the ground → surface
  * value step plus a 1px hairline, never a shadow. Only things that have
  * actually been lifted cast one, and there are exactly two tiers:
- * --shadow-sheet (the pane the app sits on) and --shadow-pop (the settings
- * flyout — the milkbox door swung open). Dark mode keeps the pane flat and
- * leans on the inset top highlight, because a drop shadow under a resting
- * dark surface reads as a stain, not a lift.
+ * --shadow-sheet (the sign-in sheet on the doorstep) and --shadow-pop (the
+ * settings flyout — the milkbox door swung open). Dark mode keeps the sheet
+ * flat and leans on the inset top highlight, because a drop shadow under a
+ * resting dark surface reads as a stain, not a lift.
  *
  * The dark palette is designed, not inverted: the porch after the light
  * goes off. Every ink step and the accent were checked against --surface,
@@ -53,8 +53,7 @@
 :root {
   color-scheme: light;
 
-  /* ── surfaces: desk → ground → surface → hairline ── */
-  --desk:         #d2d8e0;  /* weathered porch board behind the pane */
+  /* ── surfaces: ground → surface → hairline ── */
   --ground:       #e3e8ee;  /* cool eggshell step */
   --surface:      #fafbfd;  /* the milk-white sheet */
   --surface-sunk: #eef1f6;  /* composer well, chips, sunk fields */
@@ -75,7 +74,7 @@
 
   /* ── elevation: two lifted tiers, everything else is a hairline ── */
   --card-highlight: none;
-  --shadow-sheet: 0 18px 50px rgba(23, 29, 38, 0.14);   /* the app pane */
+  --shadow-sheet: 0 18px 50px rgba(23, 29, 38, 0.14);   /* the sign-in sheet */
   --shadow-pop:                                          /* the settings flyout */
     0 14px 32px rgba(23, 29, 38, 0.18),
     0 2px 6px rgba(23, 29, 38, 0.09);
@@ -120,7 +119,6 @@
 :root[data-theme='dark'] {
   color-scheme: dark;
 
-  --desk:         #080a0e;
   --ground:       #0f1319;
   --surface:      #171c24;
   --surface-sunk: #1f252e;
@@ -231,7 +229,7 @@ body {
    *
    * Two equal rails either side of the pair do it, each never narrower than
    * the inset on its side. That centres the pair on the window, in line
-   * with the pane below, not on the strip between the controls, which is
+   * with the feed below, not on the strip between the controls, which is
    * off to one side because the two sets of controls differ in width. A
    * long chat name that cannot be centred that way pushes the pair toward
    * the roomier side, and truncates only once both rails are down to their
@@ -266,22 +264,43 @@ body {
 /*
  * iOS 27 lays a blur over the top of an installed app, reaching well below
  * the status bar: it smears the header row. There is no switch for it.
- * WebKit leaves it off when what sits at the top edge of the viewport is an
- * opaque position: fixed box running the width of the screen, and takes the
- * status bar's colour from that box. The header does not count: it is in
- * the page's flow, and the feed scrolls inside its own box under it.
+ * WebKit leaves it off when a position: fixed (or sticky) box with a
+ * background sits at the top edge of the page, and takes the status bar's
+ * colour from that box. The header does not count: it is in the page's
+ * flow, and the feed scrolls inside its own box under it.
  *
- * So this strip is that box, and nothing else. It takes the colour of the
- * page behind it, which is also the header's (--ground; --desk around the
- * floating pane), so there is nothing to see. It is as tall as the status
- * bar inset, which makes it exactly where the page runs under a status bar
- * and nowhere else: no height at all in a browser tab or on a desktop. It
- * sits above the header, which would otherwise be what is found at the
- * edge, and under every overlay.
+ * So this strip is that box, and nothing else. It carries the colour of the
+ * page behind it, which is also the header's (--ground). It sits above the
+ * header, which would otherwise be what is found at the edge, and under
+ * every overlay.
  *
- * None of this is documented by Apple. The measurements others have taken
- * (at least 6px tall, 80% wide, within 4px of the top) are met with room to
- * spare.
+ * Its height is what the first attempt got wrong. It was as tall as the
+ * status bar inset and no taller, on the reading that the installed app
+ * draws under the status bar. It changed nothing on a phone, and the likely
+ * reason is that the app does not draw there: with the status bar style
+ * Milkbox asks for, the page starts below the status bar, the inset is 0,
+ * and a strip of that height is no strip. (Settings' diagnostics report
+ * says what the inset and the strip measure on the device.) What WebKit
+ * looks for is at the top of the page, wherever that is. Read from its
+ * source (fixedContainerEdges in LocalFrameView.cpp, October 2026): it
+ * looks at what is in the middle of the top edge, 4px down, whether or not
+ * it takes the pointer; that has to be fixed or sticky, at least nine
+ * tenths of the page's width, and have a background; and it has to be over
+ * 10px in each direction for its colour to be read from its style and not
+ * guessed from the pixels. Hence 11px.
+ *
+ * At that height it overlaps the top of the title's button. So its
+ * background is clipped to text it does not have: nothing is painted, and
+ * what WebKit reads is the style, not the paint.
+ *
+ * All of that is for the installed app on iOS and iPadOS only, which is
+ * where the blur is and where the projects below tested it. In a Safari tab,
+ * and everywhere else, the strip stays as tall as the inset, which in a
+ * browser tab or on a desktop is nothing.
+ *
+ * None of this is documented by Apple, and it has not been seen on a
+ * device from here: the height, the clipping and the conditions are what
+ * two other projects shipped after testing on an iPhone and an iPad.
  */
 .status-bar-backdrop {
   position: fixed;
@@ -293,32 +312,15 @@ body {
   z-index: 5;
   pointer-events: none;
 }
-
-/*
- * Tall, wide viewports: the app becomes a floating pane on the desk rather
- * than a full-height sheet — a milkbox sitting on the porch, not wallpaper.
- * The pane keeps --ground inside; the page behind steps down to --desk.
- */
-@media (min-height: 600px) and (min-width: 800px) {
-  body { background: var(--desk); }
-  .feed-screen {
-    height: min(800px, calc(100dvh - 96px));
-    width: min(720px, calc(100vw - 48px));
-    margin: auto;
-    background: var(--ground);
-    border: 1px solid var(--hairline);
-    border-radius: 14px;
-    box-shadow: var(--shadow-sheet), var(--card-highlight);
-    overflow: hidden;
-  }
-  /* The pane floats clear of the status bar, so no inset inside it. */
-  .feed-header { padding-top: 0; }
-}
-
-@media (display-mode: window-controls-overlay) and (min-height: 600px) and (min-width: 800px) {
-  .feed-header { height: 0; }
-  .feed-screen {
-    max-height: calc(100dvh - 2 * var(--wco-title-strip-height));
+/* Only WebKit on iOS and iPadOS knows this property; standalone is the app
+ * opened from the Home Screen. */
+@supports (-webkit-touch-callout: none) {
+  @media (display-mode: standalone) {
+    .status-bar-backdrop {
+      height: max(env(safe-area-inset-top, 0px), 11px);
+      -webkit-background-clip: text;
+      background-clip: text;
+    }
   }
 }
 
