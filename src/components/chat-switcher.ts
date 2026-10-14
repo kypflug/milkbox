@@ -134,14 +134,16 @@ export function mountChatMenu(
 
   /** Hang from the title's left edge, or centre under it where the title is
    *  itself centred: the macOS title strip, on the same two conditions as
-   *  its rule in global.css. Clamped to the viewport either way; cap the
-   *  height to the space below so a long list scrolls inside the menu. */
+   *  its rule in global.css, and iOS, on the one its rule in feed.css has.
+   *  Clamped to the viewport either way; cap the height to the space below
+   *  so a long list scrolls inside the menu. */
   function position(): void {
     const anchor = trigger.getBoundingClientRect();
     const header = trigger.closest<HTMLElement>('.feed-header-row')?.getBoundingClientRect();
     const top = Math.max(anchor.bottom, header?.bottom ?? anchor.bottom) + MENU_GAP;
     const width = menu.offsetWidth;
-    const centred = overlayMode.matches && document.documentElement.hasAttribute('data-macos');
+    const root = document.documentElement;
+    const centred = (overlayMode.matches && root.hasAttribute('data-macos')) || root.hasAttribute('data-ios');
     const wanted = centred ? anchor.left + (anchor.width - width) / 2 : anchor.left;
     const maxLeft = window.innerWidth - VIEWPORT_GUTTER - width;
     const left = Math.max(VIEWPORT_GUTTER, Math.min(wanted, maxLeft));

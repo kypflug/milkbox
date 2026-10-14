@@ -2,7 +2,6 @@ import type { Theme } from './types';
 import { safeGetItem, safeSetItem } from './utils/storage';
 
 const THEME_KEY = 'milkbox:theme';
-const PANE_QUERY = '(min-height: 600px) and (min-width: 800px)';
 
 export function getTheme(): Theme {
   const t = safeGetItem(THEME_KEY);
@@ -41,4 +40,3 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   if (getTheme() === 'system') applyTheme();
 });
 
-matchMedia(PANE_QUERY).addEventListener('change', updateChromeColor);

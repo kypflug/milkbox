@@ -101,7 +101,7 @@ out, so it only ever reaches the sign-in screen.
 from it and drift silently, so a palette change has to update all of them:
 
 - `index.html` — `<meta name="theme-color">` and the pre-CSS theme stamp
-  (`full` = `--ground`, `pane` = `--desk`, per theme)
+  (`--ground`, per theme)
 - `vite.config.ts` — manifest `theme_color` (`--ground`) and
   `background_color` (`--surface`)
 - `src/styles/feed.css` — the lightbox scrim and caption, which stay dark in
