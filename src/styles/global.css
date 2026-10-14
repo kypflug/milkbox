@@ -332,6 +332,20 @@ body {
   }
 }
 
+/* iOS zooms the page in on a field whose text is under 16px as it takes
+ * focus, and leaves it zoomed. Every field here is set smaller (body text
+ * at 15.5px, the invite link at 12px), so on iOS they are all held at 16px.
+ * The rules that set their fonts are more specific than this, hence the
+ * !important. A maximum-scale in the viewport tag would stop the zoom as
+ * well, by stopping every zoom: pinch too, on other platforms. */
+@supports (-webkit-touch-callout: none) {
+  input,
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}
+
 /* Read by screen readers, never painted. */
 .visually-hidden {
   position: absolute;
