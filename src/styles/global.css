@@ -289,14 +289,18 @@ body {
  * 10px in each direction for its colour to be read from its style and not
  * guessed from the pixels. Hence 11px.
  *
- * At that height it overlaps the top of the title's button. So on iOS its
+ * At that height it overlaps the top of the title's button. So its
  * background is clipped to text it does not have: nothing is painted, and
- * what WebKit reads is the style, not the paint. Everywhere else it stays
- * as tall as the inset, which is nothing in a browser tab or on a desktop.
+ * what WebKit reads is the style, not the paint.
+ *
+ * All of that is for the installed app on iOS and iPadOS only, which is
+ * where the blur is and where the projects below tested it. In a Safari tab,
+ * and everywhere else, the strip stays as tall as the inset, which in a
+ * browser tab or on a desktop is nothing.
  *
  * None of this is documented by Apple, and it has not been seen on a
- * device from here: the height and the clipping are what two other projects
- * shipped after testing on an iPhone and an iPad.
+ * device from here: the height, the clipping and the conditions are what
+ * two other projects shipped after testing on an iPhone and an iPad.
  */
 .status-bar-backdrop {
   position: fixed;
@@ -308,12 +312,15 @@ body {
   z-index: 5;
   pointer-events: none;
 }
-/* Only WebKit on iOS and iPadOS knows this property. */
+/* Only WebKit on iOS and iPadOS knows this property; standalone is the app
+ * opened from the Home Screen. */
 @supports (-webkit-touch-callout: none) {
-  .status-bar-backdrop {
-    height: max(env(safe-area-inset-top, 0px), 11px);
-    -webkit-background-clip: text;
-    background-clip: text;
+  @media (display-mode: standalone) {
+    .status-bar-backdrop {
+      height: max(env(safe-area-inset-top, 0px), 11px);
+      -webkit-background-clip: text;
+      background-clip: text;
+    }
   }
 }
 
